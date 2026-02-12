@@ -174,6 +174,10 @@ struct RunSummary {
     h_below_50_slots: u64,
     /// Number of slots where h < 0.1
     h_below_10_slots: u64,
+    /// Minimum true h (signed residual / pnl_pos_tot, can go negative)
+    min_true_h: f64,
+    /// Minimum true signed residual in USDC (vault - c_tot - insurance)
+    min_residual: i128,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -256,6 +260,16 @@ struct ScenarioSummary {
     h_below_10_frac: f64,
     /// Median slot where min_h occurred
     min_h_slot_p50: f64,
+
+    /// True h (signed, can go negative) — bypasses saturating_sub
+    min_true_h_p01: f64,
+    min_true_h_p05: f64,
+    min_true_h_p50: f64,
+    /// Minimum true residual (vault - c_tot - insurance) in atomic USDC, p01
+    min_residual_p01: f64,
+    min_residual_p50: f64,
+    /// Fraction of runs where true h went negative
+    negative_h_frac: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -392,6 +406,26 @@ fn haircut_f64(engine: &RiskEngine) -> f64 {
     } else {
         hn as f64 / hd as f64
     }
+}
+
+/// True signed residual: vault - c_tot - insurance.
+/// The engine's haircut_ratio uses saturating_sub which clamps at 0,
+/// hiding actual insolvency depth.  This computes the real value.
+fn true_residual(engine: &RiskEngine) -> i128 {
+    let v = engine.vault.get() as i128;
+    let c = engine.c_tot.get() as i128;
+    let i = engine.insurance_fund.balance.get() as i128;
+    v - c - i
+}
+
+/// True h: residual / pnl_pos_tot, can go negative.
+fn true_h(engine: &RiskEngine) -> f64 {
+    let pnl_pos_tot = engine.pnl_pos_tot.get();
+    if pnl_pos_tot == 0 {
+        return 1.0;
+    }
+    let res = true_residual(engine);
+    res as f64 / pnl_pos_tot as f64
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -601,6 +635,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut h_zero_first_slot: u64 = u64::MAX;
     let mut h_below_50_slots: u64 = 0;
     let mut h_below_10_slots: u64 = 0;
+    let mut min_true_h: f64 = f64::MAX;
+    let mut min_residual: i128 = i128::MAX;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
     let crank_every = cfg.crank_interval.max(1);
@@ -636,6 +672,14 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         }
         if h < 0.1 {
             h_below_10_slots += 1;
+        }
+        let th = true_h(&engine);
+        if th < min_true_h {
+            min_true_h = th;
+        }
+        let res = true_residual(&engine);
+        if res < min_residual {
+            min_residual = res;
         }
 
         if cfg.snapshots && slot_offset % SNAPSHOT_INTERVAL == 0 {
@@ -727,6 +771,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         h_zero_first_slot,
         h_below_50_slots,
         h_below_10_slots,
+        min_true_h,
+        min_residual,
     };
 
     (summary, snapshots)
@@ -767,6 +813,10 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
     let h_below_10_frac =
         runs.iter().filter(|r| r.h_below_10_slots > 0).count() as f64 / runs.len().max(1) as f64;
     let min_h_slots = sorted(runs.iter().map(|r| r.min_h_slot as f64));
+    let min_true_hs = sorted(runs.iter().map(|r| r.min_true_h));
+    let min_residuals = sorted(runs.iter().map(|r| r.min_residual as f64));
+    let negative_h_frac =
+        runs.iter().filter(|r| r.min_true_h < 0.0).count() as f64 / runs.len().max(1) as f64;
 
     ScenarioSummary {
         label: label.to_string(),
@@ -825,6 +875,13 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         h_below_50_frac,
         h_below_10_frac,
         min_h_slot_p50: quantile(&min_h_slots, 0.50),
+
+        min_true_h_p01: quantile(&min_true_hs, 0.01),
+        min_true_h_p05: quantile(&min_true_hs, 0.05),
+        min_true_h_p50: quantile(&min_true_hs, 0.50),
+        min_residual_p01: quantile(&min_residuals, 0.01),
+        min_residual_p50: quantile(&min_residuals, 0.50),
+        negative_h_frac,
     }
 }
 
@@ -854,11 +911,12 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
     let mut csv = String::from(
         "seed,min_h,min_h_slot,final_h,liquidations,force_closes,\
          users_liquidated,users_with_positions,insurance_end,c_tot_end,pnl_pos_tot_end,\
-         h_zero_slots,h_zero_first_slot,h_below_50_slots,h_below_10_slots\n",
+         h_zero_slots,h_zero_first_slot,h_below_50_slots,h_below_10_slots,\
+         min_true_h,min_residual\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.6},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
@@ -874,6 +932,8 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             if r.h_zero_first_slot == u64::MAX { "never".to_string() } else { r.h_zero_first_slot.to_string() },
             r.h_below_50_slots,
             r.h_below_10_slots,
+            r.min_true_h,
+            r.min_residual,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
