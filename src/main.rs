@@ -164,6 +164,16 @@ struct RunSummary {
     principal_ratios: Vec<f64>,
     /// (capital + haircutted warmed PnL) / initial_capital — what's withdrawable now
     withdrawable_ratios: Vec<f64>,
+    /// Slot offset where min_h first occurred
+    min_h_slot: u64,
+    /// Number of slots where h == 0.0 (complete insolvency)
+    h_zero_slots: u64,
+    /// First slot where h == 0.0 (or u64::MAX if never)
+    h_zero_first_slot: u64,
+    /// Number of slots where h < 0.5
+    h_below_50_slots: u64,
+    /// Number of slots where h < 0.1
+    h_below_10_slots: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -233,6 +243,19 @@ struct ScenarioSummary {
 
     insurance_end_mean: f64,
     insurance_end_p10: f64,
+
+    /// Fraction of runs where h hit exactly 0.0 at any point
+    insolvency_frac: f64,
+    /// Among insolvent runs: median slots spent at h=0
+    h_zero_slots_p50: f64,
+    /// Among insolvent runs: median first slot where h=0
+    h_zero_first_slot_p50: f64,
+    /// Fraction of runs where h dipped below 0.5
+    h_below_50_frac: f64,
+    /// Fraction of runs where h dipped below 0.1
+    h_below_10_frac: f64,
+    /// Median slot where min_h occurred
+    min_h_slot_p50: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -573,6 +596,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Crash simulation ────────────────────────────────────────────────
     let crash_start = SETUP_SLOTS + 33;
     let mut min_h: f64 = f64::MAX;
+    let mut min_h_slot: u64 = 0;
+    let mut h_zero_slots: u64 = 0;
+    let mut h_zero_first_slot: u64 = u64::MAX;
+    let mut h_below_50_slots: u64 = 0;
+    let mut h_below_10_slots: u64 = 0;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
     let crank_every = cfg.crank_interval.max(1);
@@ -595,6 +623,19 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         let h = haircut_f64(&engine);
         if h < min_h {
             min_h = h;
+            min_h_slot = slot_offset;
+        }
+        if h == 0.0 {
+            h_zero_slots += 1;
+            if h_zero_first_slot == u64::MAX {
+                h_zero_first_slot = slot_offset;
+            }
+        }
+        if h < 0.5 {
+            h_below_50_slots += 1;
+        }
+        if h < 0.1 {
+            h_below_10_slots += 1;
         }
 
         if cfg.snapshots && slot_offset % SNAPSHOT_INTERVAL == 0 {
@@ -681,6 +722,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         capital_ratios,
         principal_ratios,
         withdrawable_ratios,
+        min_h_slot,
+        h_zero_slots,
+        h_zero_first_slot,
+        h_below_50_slots,
+        h_below_10_slots,
     };
 
     (summary, snapshots)
@@ -706,6 +752,21 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
     let all_principal = sorted(runs.iter().flat_map(|r| r.principal_ratios.iter().copied()));
     let all_withdrawable = sorted(runs.iter().flat_map(|r| r.withdrawable_ratios.iter().copied()));
     let ins_ends = sorted(runs.iter().map(|r| r.insurance_end as f64));
+
+    // Insolvency tracking
+    let insolvent_runs: Vec<&RunSummary> = runs.iter().filter(|r| r.h_zero_slots > 0).collect();
+    let insolvency_frac = insolvent_runs.len() as f64 / runs.len().max(1) as f64;
+    let h_zero_slots_sorted = sorted(insolvent_runs.iter().map(|r| r.h_zero_slots as f64));
+    let h_zero_first_sorted = sorted(
+        insolvent_runs
+            .iter()
+            .map(|r| r.h_zero_first_slot as f64),
+    );
+    let h_below_50_frac =
+        runs.iter().filter(|r| r.h_below_50_slots > 0).count() as f64 / runs.len().max(1) as f64;
+    let h_below_10_frac =
+        runs.iter().filter(|r| r.h_below_10_slots > 0).count() as f64 / runs.len().max(1) as f64;
+    let min_h_slots = sorted(runs.iter().map(|r| r.min_h_slot as f64));
 
     ScenarioSummary {
         label: label.to_string(),
@@ -757,6 +818,13 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
 
         insurance_end_mean: mean(&ins_ends),
         insurance_end_p10: quantile(&ins_ends, 0.10),
+
+        insolvency_frac,
+        h_zero_slots_p50: quantile(&h_zero_slots_sorted, 0.50),
+        h_zero_first_slot_p50: quantile(&h_zero_first_sorted, 0.50),
+        h_below_50_frac,
+        h_below_10_frac,
+        min_h_slot_p50: quantile(&min_h_slots, 0.50),
     }
 }
 
@@ -784,14 +852,16 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
 
     // runs.csv
     let mut csv = String::from(
-        "seed,min_h,final_h,liquidations,force_closes,\
-         users_liquidated,users_with_positions,insurance_end,c_tot_end,pnl_pos_tot_end\n",
+        "seed,min_h,min_h_slot,final_h,liquidations,force_closes,\
+         users_liquidated,users_with_positions,insurance_end,c_tot_end,pnl_pos_tot_end,\
+         h_zero_slots,h_zero_first_slot,h_below_50_slots,h_below_10_slots\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{:.6},{},{},{},{},{},{},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
+            r.min_h_slot,
             r.final_h,
             r.liquidations,
             r.force_closes,
@@ -800,6 +870,10 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             r.insurance_end,
             r.c_tot_end,
             r.pnl_pos_tot_end,
+            r.h_zero_slots,
+            if r.h_zero_first_slot == u64::MAX { "never".to_string() } else { r.h_zero_first_slot.to_string() },
+            r.h_below_50_slots,
+            r.h_below_10_slots,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
