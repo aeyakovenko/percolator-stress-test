@@ -166,9 +166,9 @@ struct RunSummary {
     withdrawable_ratios: Vec<f64>,
     /// Slot offset where min_h first occurred
     min_h_slot: u64,
-    /// Number of slots where h == 0.0 (complete insolvency)
+    /// Number of slots where h <= 0.0 (complete insolvency)
     h_zero_slots: u64,
-    /// First slot where h == 0.0 (or u64::MAX if never)
+    /// First slot where h <= 0.0 (or u64::MAX if never)
     h_zero_first_slot: u64,
     /// Number of slots where h < 0.5
     h_below_50_slots: u64,
@@ -625,7 +625,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             min_h = h;
             min_h_slot = slot_offset;
         }
-        if h == 0.0 {
+        if h <= 0.0 {
             h_zero_slots += 1;
             if h_zero_first_slot == u64::MAX {
                 h_zero_first_slot = slot_offset;
