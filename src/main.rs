@@ -408,14 +408,13 @@ fn haircut_f64(engine: &RiskEngine) -> f64 {
     }
 }
 
-/// True signed residual: vault - c_tot - insurance.
-/// The engine's haircut_ratio uses saturating_sub which clamps at 0,
-/// hiding actual insolvency depth.  This computes the real value.
+/// True signed residual using the engine's own signed_residual().
 fn true_residual(engine: &RiskEngine) -> i128 {
-    let v = engine.vault.get() as i128;
-    let c = engine.c_tot.get() as i128;
-    let i = engine.insurance_fund.balance.get() as i128;
-    v - c - i
+    RiskEngine::signed_residual(
+        engine.vault.get(),
+        engine.c_tot.get(),
+        engine.insurance_fund.balance.get(),
+    )
 }
 
 /// True h: residual / pnl_pos_tot, can go negative.
