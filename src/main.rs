@@ -156,6 +156,10 @@ struct RunSummary {
     users_liquidated: usize,
     users_with_positions: usize,
     capital_ratios: Vec<f64>,
+    /// capital / initial_capital — what's already protected principal
+    principal_ratios: Vec<f64>,
+    /// (capital + haircutted warmed PnL) / initial_capital — what's withdrawable now
+    withdrawable_ratios: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -208,6 +212,20 @@ struct ScenarioSummary {
     capital_ratio_p50: f64,
     capital_ratio_p90: f64,
     capital_ratio_p99: f64,
+
+    /// Protected principal / deposit — what's safe regardless of PnL
+    principal_ratio_p01: f64,
+    principal_ratio_p10: f64,
+    principal_ratio_p50: f64,
+    principal_ratio_p90: f64,
+    principal_ratio_p99: f64,
+
+    /// (capital + haircutted warmed PnL) / deposit — what's withdrawable now
+    withdrawable_ratio_p01: f64,
+    withdrawable_ratio_p10: f64,
+    withdrawable_ratio_p50: f64,
+    withdrawable_ratio_p90: f64,
+    withdrawable_ratio_p99: f64,
 
     insurance_end_mean: f64,
     insurance_end_p10: f64,
@@ -525,13 +543,19 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         let k = rng.gen_range(0..users.len());
         let idx = users[k].idx as usize;
 
-        // Add positive realized PnL
+        // Add positive realized PnL to zombie. Model zero-sum: the LP
+        // was the counterparty and lost capital. Reduce LP capital so that
+        // C_tot drops and Residual (V - C_tot - I) rises to back the PnL.
+        // Any zombie PnL exceeding LP's remaining capital is unbacked gap
+        // loss, which naturally collapses h.
         let add_pnl = usdc(cfg.zombie_pnl_usdc) as i128;
         let old_pnl = engine.accounts[idx].pnl.get();
         engine.set_pnl(idx, old_pnl.saturating_add(add_pnl));
 
-        // Back injected PnL with vault so conservation holds
-        engine.vault = U128::new(engine.vault.get().saturating_add(add_pnl as u128));
+        // LP counterparty loss (zero-sum backing)
+        let lp_cap = engine.accounts[lp_idx as usize].capital.get();
+        let loss = (add_pnl as u128).min(lp_cap);
+        engine.set_capital(lp_idx as usize, lp_cap.saturating_sub(loss));
 
         // Create fee debt (push fee_credits negative)
         let debt = usdc(cfg.zombie_fee_debt_usdc) as i128;
@@ -585,8 +609,13 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
 
     let mut capital_ratios: Vec<f64> = Vec::new();
+    let mut principal_ratios: Vec<f64> = Vec::new();
+    let mut withdrawable_ratios: Vec<f64> = Vec::new();
     let mut users_liquidated = 0usize;
     let mut users_with_positions = 0usize;
+
+    // Haircut ratio for withdrawable calculation
+    let (h_num, h_den) = engine.haircut_ratio();
 
     for user in &users {
         if !user.had_position {
@@ -595,16 +624,31 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         users_with_positions += 1;
 
         let acct = &engine.accounts[user.idx as usize];
+        let init = user.initial_capital as f64;
+
+        // MTM equity (paper PnL — includes unrealized mark)
         let final_eq = engine.account_equity_mtm_at_oracle(acct, final_oracle) as f64;
-        let ratio = if user.initial_capital > 0 {
-            final_eq / user.initial_capital as f64
+        let mtm_ratio = if init > 0.0 { final_eq / init } else { 0.0 };
+        capital_ratios.push(mtm_ratio);
+
+        // Protected principal only (already safe, no warmup gate)
+        let capital = acct.capital.get() as f64;
+        let prin_ratio = if init > 0.0 { capital / init } else { 0.0 };
+        principal_ratios.push(prin_ratio);
+
+        // Withdrawable = capital + haircutted warmed-up PnL
+        let warmed_pnl = engine.withdrawable_pnl(acct);
+        let haircutted_pnl = if h_den > 0 {
+            warmed_pnl.saturating_mul(h_num) / h_den
         } else {
-            0.0
+            0
         };
-        capital_ratios.push(ratio);
+        let withdrawable = acct.capital.get().saturating_add(haircutted_pnl) as f64;
+        let wd_ratio = if init > 0.0 { withdrawable / init } else { 0.0 };
+        withdrawable_ratios.push(wd_ratio);
 
         // Liquidated = had position, now closed, equity < 10% of initial
-        if acct.position_size.get() == 0 && ratio < 0.1 {
+        if acct.position_size.get() == 0 && mtm_ratio < 0.1 {
             users_liquidated += 1;
         }
     }
@@ -626,6 +670,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         users_liquidated,
         users_with_positions,
         capital_ratios,
+        principal_ratios,
+        withdrawable_ratios,
     };
 
     (summary, snapshots)
@@ -648,6 +694,8 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         }
     }));
     let all_ratios = sorted(runs.iter().flat_map(|r| r.capital_ratios.iter().copied()));
+    let all_principal = sorted(runs.iter().flat_map(|r| r.principal_ratios.iter().copied()));
+    let all_withdrawable = sorted(runs.iter().flat_map(|r| r.withdrawable_ratios.iter().copied()));
     let ins_ends = sorted(runs.iter().map(|r| r.insurance_end as f64));
 
     ScenarioSummary {
@@ -685,6 +733,18 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         capital_ratio_p50: quantile(&all_ratios, 0.50),
         capital_ratio_p90: quantile(&all_ratios, 0.90),
         capital_ratio_p99: quantile(&all_ratios, 0.99),
+
+        principal_ratio_p01: quantile(&all_principal, 0.01),
+        principal_ratio_p10: quantile(&all_principal, 0.10),
+        principal_ratio_p50: quantile(&all_principal, 0.50),
+        principal_ratio_p90: quantile(&all_principal, 0.90),
+        principal_ratio_p99: quantile(&all_principal, 0.99),
+
+        withdrawable_ratio_p01: quantile(&all_withdrawable, 0.01),
+        withdrawable_ratio_p10: quantile(&all_withdrawable, 0.10),
+        withdrawable_ratio_p50: quantile(&all_withdrawable, 0.50),
+        withdrawable_ratio_p90: quantile(&all_withdrawable, 0.90),
+        withdrawable_ratio_p99: quantile(&all_withdrawable, 0.99),
 
         insurance_end_mean: mean(&ins_ends),
         insurance_end_p10: quantile(&ins_ends, 0.10),
