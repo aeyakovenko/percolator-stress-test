@@ -79,6 +79,9 @@ struct Config {
     // Directional skew (0.0 = all short, 0.5 = balanced, 1.0 = all long)
     long_bias: f64,
 
+    // Crank lag (1 = every slot, 5 = every 5th slot, etc.)
+    crank_interval: u64,
+
     // Whale account
     whale_enabled: bool,
     whale_capital_usdc: u64,
@@ -126,6 +129,7 @@ impl Default for Config {
             distortion_start_slot: 30,
             distortion_len: 5,
             long_bias: 0.5,
+            crank_interval: 1,
             whale_enabled: false,
             whale_capital_usdc: 25_000_000,
             whale_leverage: 10.0,
@@ -571,17 +575,22 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut min_h: f64 = f64::MAX;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
+    let crank_every = cfg.crank_interval.max(1);
+
     for slot_offset in 0..cfg.total_slots {
         let slot = crash_start + slot_offset;
         let oracle = price_path(cfg, slot_offset);
 
-        let _ = engine.keeper_crank(
-            lp_idx,
-            slot,
-            oracle,
-            cfg.funding_rate_bps_per_slot,
-            false,
-        );
+        // Only crank every N slots to simulate keeper lag
+        if slot_offset % crank_every == 0 {
+            let _ = engine.keeper_crank(
+                lp_idx,
+                slot,
+                oracle,
+                cfg.funding_rate_bps_per_slot,
+                false,
+            );
+        }
 
         let h = haircut_f64(&engine);
         if h < min_h {
@@ -898,6 +907,7 @@ fn parse_args() -> Config {
             "distortion_start" => cfg.distortion_start_slot = val.parse().unwrap(),
             "distortion_len" => cfg.distortion_len = val.parse().unwrap(),
             "long_bias" => cfg.long_bias = val.parse().unwrap(),
+            "crank_interval" => cfg.crank_interval = val.parse().unwrap(),
             "whale" => cfg.whale_enabled = val.parse().unwrap(),
             "whale_capital" => cfg.whale_capital_usdc = val.parse().unwrap(),
             "whale_leverage" => cfg.whale_leverage = val.parse().unwrap(),
