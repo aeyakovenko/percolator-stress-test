@@ -409,12 +409,18 @@ fn haircut_f64(engine: &RiskEngine) -> f64 {
 }
 
 /// True signed residual using the engine's own signed_residual().
+/// Returns positive value when solvent, negative when in deficit.
 fn true_residual(engine: &RiskEngine) -> i128 {
-    RiskEngine::signed_residual(
+    let (solvent, abs_val) = RiskEngine::signed_residual(
         engine.vault.get(),
         engine.c_tot.get(),
         engine.insurance_fund.balance.get(),
-    )
+    );
+    if solvent {
+        abs_val as i128
+    } else {
+        -(abs_val as i128)
+    }
 }
 
 /// True h: residual / pnl_pos_tot, can go negative.
