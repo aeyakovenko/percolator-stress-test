@@ -68,6 +68,22 @@ struct Config {
     zombie_pnl_usdc: u64,
     zombie_fee_debt_usdc: u64,
 
+    // Price path mode: "crash_bounce", "staircase", "oracle_distortion"
+    price_path_type: String,
+    staircase_steps: u64,
+    staircase_flat_len: u64,
+    distortion_pct_bps: u64,
+    distortion_start_slot: u64,
+    distortion_len: u64,
+
+    // Directional skew (0.0 = all short, 0.5 = balanced, 1.0 = all long)
+    long_bias: f64,
+
+    // Whale account
+    whale_enabled: bool,
+    whale_capital_usdc: u64,
+    whale_leverage: f64,
+
     // Grid (empty = single scenario)
     grid_crash_pcts: Vec<u64>,
     grid_warmup_slots: Vec<u64>,
@@ -103,6 +119,16 @@ impl Default for Config {
             funding_rate_bps_per_slot: 0,
             zombie_pnl_usdc: 50_000,
             zombie_fee_debt_usdc: 200,
+            price_path_type: "crash_bounce".into(),
+            staircase_steps: 2,
+            staircase_flat_len: 30,
+            distortion_pct_bps: 2000,
+            distortion_start_slot: 30,
+            distortion_len: 5,
+            long_bias: 0.5,
+            whale_enabled: false,
+            whale_capital_usdc: 25_000_000,
+            whale_leverage: 10.0,
             grid_crash_pcts: vec![],
             grid_warmup_slots: vec![],
             grid_insurance: vec![],
@@ -201,9 +227,17 @@ fn price_e6(dollars: u64) -> u64 {
     dollars.saturating_mul(1_000_000)
 }
 
-/// Compute oracle price at a given crash-slot offset.
-/// Templates: linear crash → optional bounce → flat
+/// Dispatch to the configured price path generator
 fn price_path(cfg: &Config, slot: u64) -> u64 {
+    match cfg.price_path_type.as_str() {
+        "staircase" => staircase_path(cfg, slot),
+        "oracle_distortion" => distortion_path(cfg, slot),
+        _ => crash_bounce_path(cfg, slot),
+    }
+}
+
+/// Linear crash → optional bounce → flat
+fn crash_bounce_path(cfg: &Config, slot: u64) -> u64 {
     let p0 = price_e6(cfg.p0) as u128;
     let crash_len = cfg.crash_len.max(1);
     let bounce_len = cfg.bounce_len.max(1);
@@ -221,8 +255,59 @@ fn price_path(cfg: &Config, slot: u64) -> u64 {
         return (p_bottom * (10_000 + frac) / 10_000) as u64;
     }
 
-    // Flat after bounce
     (p_bottom * (10_000 + cfg.bounce_pct_bps as u128) / 10_000) as u64
+}
+
+/// Multi-leg staircase: N steps of (crash → flat → crash → flat → ...)
+fn staircase_path(cfg: &Config, slot: u64) -> u64 {
+    let p0 = price_e6(cfg.p0) as u128;
+    let steps = cfg.staircase_steps.max(1);
+    let crash_len = cfg.crash_len.max(1);
+    let flat_len = cfg.staircase_flat_len;
+
+    let mut price = p0;
+    let mut remaining = slot;
+
+    for _ in 0..steps {
+        if remaining == 0 {
+            break;
+        }
+
+        // Crash phase
+        let progress = remaining.min(crash_len);
+        let frac = (cfg.crash_pct_bps as u128) * (progress as u128) / (crash_len as u128);
+        let mid_price = price * 10_000u128.saturating_sub(frac) / 10_000;
+
+        if remaining <= crash_len {
+            return mid_price as u64;
+        }
+
+        // Completed this crash leg
+        price = price * (10_000 - cfg.crash_pct_bps as u128) / 10_000;
+        remaining -= crash_len;
+
+        // Flat phase
+        if remaining <= flat_len {
+            return price as u64;
+        }
+        remaining -= flat_len;
+    }
+
+    price as u64
+}
+
+/// Oracle distortion: flat → spike up → return to flat
+/// Tests whether warmup prevents extraction of manipulated profits
+fn distortion_path(cfg: &Config, slot: u64) -> u64 {
+    let p0 = price_e6(cfg.p0) as u128;
+    let start = cfg.distortion_start_slot;
+    let end = start + cfg.distortion_len;
+
+    if slot >= start && slot < end {
+        (p0 * (10_000 + cfg.distortion_pct_bps as u128) / 10_000) as u64
+    } else {
+        p0 as u64
+    }
 }
 
 fn quantile(sorted: &[f64], p: f64) -> f64 {
@@ -287,6 +372,7 @@ struct UserInfo {
     idx: u16,
     initial_capital: u128,
     had_position: bool,
+    is_whale: bool,
 }
 
 fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
@@ -327,8 +413,20 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let pro = LogNormal::new(50_000f64.ln(), 0.8).unwrap();
     let whale = LogNormal::new(1_000_000f64.ln(), 0.7).unwrap();
 
+    // ── Add whale account if enabled ────────────────────────────────────
+    let mut users: Vec<UserInfo> = Vec::with_capacity(cfg.n_users + 1);
+    if cfg.whale_enabled {
+        let whale_idx = engine.add_user(0).unwrap();
+        engine.deposit(whale_idx, usdc(cfg.whale_capital_usdc), 0).unwrap();
+        users.push(UserInfo {
+            idx: whale_idx,
+            initial_capital: usdc(cfg.whale_capital_usdc),
+            had_position: false,
+            is_whale: true,
+        });
+    }
+
     // ── Add users + deposit capital ─────────────────────────────────────
-    let mut users: Vec<UserInfo> = Vec::with_capacity(cfg.n_users);
     for _ in 0..cfg.n_users {
         let roll: f64 = rng.gen();
         let cap_f = if roll < 0.80 {
@@ -352,6 +450,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             idx: user_idx,
             initial_capital: usdc(cap_usdc),
             had_position: false,
+            is_whale: false,
         });
     }
 
@@ -365,16 +464,23 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let trade_slot = SETUP_SLOTS;
 
     for user in &mut users {
-        let roll: f64 = rng.gen();
-        let lev = if roll < 0.80 {
-            rng.gen_range(2.0..8.0f64)
-        } else if roll < 0.99 {
-            rng.gen_range(1.0..5.0f64)
+        let (lev, util, long) = if user.is_whale {
+            // Whale: fixed leverage, always long (worst case for crash)
+            (cfg.whale_leverage, 0.9, true)
         } else {
-            rng.gen_range(2.0..max_lev.min(30.0).max(2.1))
+            let roll: f64 = rng.gen();
+            let l = if roll < 0.80 {
+                rng.gen_range(2.0..8.0f64)
+            } else if roll < 0.99 {
+                rng.gen_range(1.0..5.0f64)
+            } else {
+                rng.gen_range(2.0..max_lev.min(30.0).max(2.1))
+            };
+            let u = rng.gen_range(0.4..0.95f64);
+            let dir = rng.gen::<f64>() < cfg.long_bias;
+            (l, u, dir)
         };
 
-        let util = rng.gen_range(0.4..0.95f64);
         let cap_f = user.initial_capital as f64;
         let notional_atomic = (cap_f * lev * util) as u128;
 
@@ -385,7 +491,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             .unwrap_or(1)
             .max(1);
 
-        let long: bool = rng.gen();
         let size = if long {
             pos_abs as i128
         } else {
@@ -726,6 +831,16 @@ fn parse_args() -> Config {
             "funding_rate" => cfg.funding_rate_bps_per_slot = val.parse().unwrap(),
             "zombie_pnl" => cfg.zombie_pnl_usdc = val.parse().unwrap(),
             "zombie_fee_debt" => cfg.zombie_fee_debt_usdc = val.parse().unwrap(),
+            "price_path" => cfg.price_path_type = val.to_string(),
+            "staircase_steps" => cfg.staircase_steps = val.parse().unwrap(),
+            "staircase_flat" => cfg.staircase_flat_len = val.parse().unwrap(),
+            "distortion_pct" => cfg.distortion_pct_bps = val.parse().unwrap(),
+            "distortion_start" => cfg.distortion_start_slot = val.parse().unwrap(),
+            "distortion_len" => cfg.distortion_len = val.parse().unwrap(),
+            "long_bias" => cfg.long_bias = val.parse().unwrap(),
+            "whale" => cfg.whale_enabled = val.parse().unwrap(),
+            "whale_capital" => cfg.whale_capital_usdc = val.parse().unwrap(),
+            "whale_leverage" => cfg.whale_leverage = val.parse().unwrap(),
             "out" => cfg.out_dir = val.to_string(),
             "snapshots" => cfg.snapshots = val.parse().unwrap(),
             "grid_crash" => {
