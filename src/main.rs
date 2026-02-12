@@ -2,6 +2,18 @@
 //!
 //! Runs crash scenarios through the real engine implementation and
 //! aggregates outcome distributions across many RNG seeds.
+//!
+//! # Known coverage gaps (TODO)
+//!
+//! - [FIXED] SlippageMatcher: use --slippage=N (bps) to deviate exec_price
+//!   from oracle, generating non-zero trade_pnl that exercises warmup restart.
+//! - Constant funding_rate_bps_per_slot: no anti-retroactivity testing.
+//!   Need rate changes across long dt intervals to test stored-rate semantics.
+//! - reserved_pnl always 0: pending withdrawal interactions untested.
+//! - maintenance_fee_per_slot = 0 by default: fee debt accumulation untested.
+//!   Run scenarios with non-zero maintenance_fee to exercise fee drain paths.
+//! - min_liquidation_abs = 1: dust close/GC behavior effectively disabled.
+//!   Use realistic threshold + small-position accounts to test dust handling.
 
 use std::{
     alloc::{self, Layout},
@@ -10,12 +22,60 @@ use std::{
     time::Instant,
 };
 
-use percolator::{NoOpMatcher, RiskEngine, RiskParams, I128, U128};
+use percolator::{MatchingEngine, RiskEngine, RiskParams, TradeExecution, I128, U128};
+use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, LogNormal};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Slippage matcher — exec_price deviates from oracle by bounded amount
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Matching engine that returns exec_price = oracle ± slippage.
+/// Direction alternates per call (buy below oracle, sell above oracle, etc.)
+/// generating non-zero trade_pnl that exercises warmup restart logic.
+struct SlippageMatcher {
+    slippage_bps: u64,
+    counter: AtomicU64,
+}
+
+impl SlippageMatcher {
+    fn new(slippage_bps: u64) -> Self {
+        Self {
+            slippage_bps,
+            counter: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MatchingEngine for SlippageMatcher {
+    fn execute_match(
+        &self,
+        _lp_program: &[u8; 32],
+        _lp_context: &[u8; 32],
+        _lp_account_id: u64,
+        oracle_price: u64,
+        size: i128,
+    ) -> percolator::Result<TradeExecution> {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        // Alternate: even calls get favorable price, odd get unfavorable.
+        // Favorable for buyer = below oracle; favorable for seller = above oracle.
+        let delta = (oracle_price as u128 * self.slippage_bps as u128 / 10_000) as u64;
+        let is_buy = size > 0;
+        let favorable = n % 2 == 0;
+        let price = if (is_buy && favorable) || (!is_buy && !favorable) {
+            oracle_price.saturating_sub(delta)
+        } else {
+            oracle_price.saturating_add(delta)
+        };
+        // Clamp to valid range
+        let price = price.max(1);
+        Ok(TradeExecution { price, size })
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -82,6 +142,9 @@ struct Config {
     // Crank lag (1 = every slot, 5 = every 5th slot, etc.)
     crank_interval: u64,
 
+    // Matcher slippage (0 = NoOp, >0 = exec_price deviates from oracle by up to N bps)
+    slippage_bps: u64,
+
     // Whale account
     whale_enabled: bool,
     whale_capital_usdc: u64,
@@ -130,6 +193,7 @@ impl Default for Config {
             distortion_len: 5,
             long_bias: 0.5,
             crank_interval: 1,
+            slippage_bps: 0,
             whale_enabled: false,
             whale_capital_usdc: 25_000_000,
             whale_leverage: 10.0,
@@ -166,7 +230,7 @@ struct RunSummary {
     withdrawable_ratios: Vec<f64>,
     /// Slot offset where min_h first occurred
     min_h_slot: u64,
-    /// Number of slots where h <= 0.0 (complete insolvency)
+    /// Number of slots where h <= 0.0 (junior profits fully haircutted)
     h_zero_slots: u64,
     /// First slot where h <= 0.0 (or u64::MAX if never)
     h_zero_first_slot: u64,
@@ -178,6 +242,11 @@ struct RunSummary {
     min_true_h: f64,
     /// Minimum true signed residual in USDC (vault - c_tot - insurance)
     min_residual: i128,
+    /// Withdraw/close path exercise counts
+    withdraw_attempts: u64,
+    withdraw_successes: u64,
+    close_attempts: u64,
+    close_successes: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -248,11 +317,11 @@ struct ScenarioSummary {
     insurance_end_mean: f64,
     insurance_end_p10: f64,
 
-    /// Fraction of runs where h hit exactly 0.0 at any point
-    insolvency_frac: f64,
-    /// Among insolvent runs: median slots spent at h=0
+    /// Fraction of runs where h hit 0.0 (junior profits fully haircutted, NOT vault deficit)
+    h_zero_frac: f64,
+    /// Among h=0 runs: median slots spent at h=0
     h_zero_slots_p50: f64,
-    /// Among insolvent runs: median first slot where h=0
+    /// Among h=0 runs: median first slot where h=0
     h_zero_first_slot_p50: f64,
     /// Fraction of runs where h dipped below 0.5
     h_below_50_frac: f64,
@@ -270,6 +339,13 @@ struct ScenarioSummary {
     min_residual_p50: f64,
     /// Fraction of runs where true h went negative
     negative_h_frac: f64,
+    /// Fraction of runs where vault < c_tot + insurance (true insolvency)
+    deficit_frac: f64,
+    /// Withdraw/close path exercise metrics (means across runs)
+    withdraw_attempts_mean: f64,
+    withdraw_successes_mean: f64,
+    close_attempts_mean: f64,
+    close_successes_mean: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -461,7 +537,7 @@ struct UserInfo {
 
 fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let matcher = NoOpMatcher;
+    let matcher = SlippageMatcher::new(cfg.slippage_bps);
     let p0 = price_e6(cfg.p0);
 
     // ── Build engine ────────────────────────────────────────────────────
@@ -581,20 +657,31 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             -(pos_abs as i128)
         };
 
-        // Retry with halved size on failure
+        // Retry with halved size on failure.
+        // Snapshot/restore models Solana TX atomicity: execute_trade mutates
+        // state (funding, mark settlement, maintenance fees) before the final
+        // margin check. On-chain, Err reverts everything; we must do the same.
+        let snapshot = engine.clone();
         let mut s = size;
+        let mut ok = false;
         for _ in 0..5 {
             if engine
                 .execute_trade(&matcher, lp_idx, user.idx, trade_slot, p0, s)
                 .is_ok()
             {
                 user.had_position = true;
+                ok = true;
                 break;
             }
+            // Restore between each retry — failed attempt mutated state
+            *engine = snapshot.as_ref().clone();
             s /= 2;
             if s == 0 {
                 break;
             }
+        }
+        if !ok {
+            *engine = *snapshot;
         }
     }
 
@@ -605,8 +692,9 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
     // ── Inject zombies: positive PnL + fee debt ─────────────────────────
     let zombie_count = cfg.n_zombies.min(users.len());
-    for _ in 0..zombie_count {
-        let k = rng.gen_range(0..users.len());
+    let zombie_indices: Vec<usize> =
+        rand::seq::index::sample(&mut rng, users.len(), zombie_count).into_vec();
+    for &k in &zombie_indices {
         let idx = users[k].idx as usize;
 
         // Add positive realized PnL to zombie. Model zero-sum: the LP
@@ -642,6 +730,10 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut h_below_10_slots: u64 = 0;
     let mut min_true_h: f64 = f64::MAX;
     let mut min_residual: i128 = i128::MAX;
+    let mut withdraw_attempts: u64 = 0;
+    let mut withdraw_successes: u64 = 0;
+    let mut close_attempts: u64 = 0;
+    let mut close_successes: u64 = 0;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
     let crank_every = cfg.crank_interval.max(1);
@@ -659,6 +751,56 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                 cfg.funding_rate_bps_per_slot,
                 false,
             );
+
+            // Hard invariant checks — fail fast on conservation violation
+            let vault_val = engine.vault.get();
+            let c_tot_val = engine.c_tot.get();
+            let ins_val = engine.insurance_fund.balance.get();
+            assert!(
+                vault_val >= c_tot_val.saturating_add(ins_val),
+                "SOLVENCY VIOLATION seed={} slot_offset={}: vault={} < c_tot={} + insurance={}",
+                seed, slot_offset, vault_val, c_tot_val, ins_val
+            );
+            // Note: check_conservation(oracle) is too strict here — it verifies
+            // the extended identity vault >= sum(capital) + sum(pnl) + insurance,
+            // which the zombie injection (direct set_pnl/set_capital) violates.
+            // The primary solvency invariant above is what signed_residual depends on.
+
+            // Exercise withdraw/close paths on ~5 users every 10th crank.
+            // Always revert to avoid altering crash dynamics.
+            if slot_offset % (crank_every * 10) == 0 {
+                let sample_n = 5.min(users.len());
+                for _ in 0..sample_n {
+                    let ui = rng.gen_range(0..users.len());
+                    let user = &users[ui];
+                    if !user.had_position { continue; }
+
+                    let acct = &engine.accounts[user.idx as usize];
+                    let pos = acct.position_size.get();
+
+                    if pos != 0 {
+                        // Try withdrawing 10% of capital
+                        let cap = acct.capital.get();
+                        let amt = cap / 10;
+                        if amt > 0 {
+                            withdraw_attempts += 1;
+                            let snap = engine.clone();
+                            if engine.withdraw(user.idx, amt, slot, oracle).is_ok() {
+                                withdraw_successes += 1;
+                            }
+                            *engine = *snap;
+                        }
+                    } else {
+                        // Position liquidated — try closing account
+                        close_attempts += 1;
+                        let snap = engine.clone();
+                        if engine.close_account(user.idx, slot, oracle).is_ok() {
+                            close_successes += 1;
+                        }
+                        *engine = *snap;
+                    }
+                }
+            }
         }
 
         let h = haircut_f64(&engine);
@@ -703,9 +845,24 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         }
     }
 
+    // ── Final crank to settle all state (especially important with crank lag) ──
+    let final_slot = crash_start + cfg.total_slots;
+    let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
+    let _ = engine.keeper_crank(lp_idx, final_slot, final_oracle, cfg.funding_rate_bps_per_slot, false);
+    {
+        let vault_val = engine.vault.get();
+        let c_tot_val = engine.c_tot.get();
+        let ins_val = engine.insurance_fund.balance.get();
+        assert!(
+            vault_val >= c_tot_val.saturating_add(ins_val),
+            "FINAL SOLVENCY VIOLATION seed={}: vault={} < c_tot={} + insurance={}",
+            seed, vault_val, c_tot_val, ins_val
+        );
+        // Note: check_conservation too strict with zombie PnL injection (see crash loop comment)
+    }
+
     // ── End-of-run metrics ──────────────────────────────────────────────
     let final_h = haircut_f64(&engine);
-    let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
 
     let mut capital_ratios: Vec<f64> = Vec::new();
     let mut principal_ratios: Vec<f64> = Vec::new();
@@ -778,6 +935,10 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         h_below_10_slots,
         min_true_h,
         min_residual,
+        withdraw_attempts,
+        withdraw_successes,
+        close_attempts,
+        close_successes,
     };
 
     (summary, snapshots)
@@ -804,9 +965,9 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
     let all_withdrawable = sorted(runs.iter().flat_map(|r| r.withdrawable_ratios.iter().copied()));
     let ins_ends = sorted(runs.iter().map(|r| r.insurance_end as f64));
 
-    // Insolvency tracking
+    // h=0 tracking (junior profits fully haircutted)
     let insolvent_runs: Vec<&RunSummary> = runs.iter().filter(|r| r.h_zero_slots > 0).collect();
-    let insolvency_frac = insolvent_runs.len() as f64 / runs.len().max(1) as f64;
+    let h_zero_frac = insolvent_runs.len() as f64 / runs.len().max(1) as f64;
     let h_zero_slots_sorted = sorted(insolvent_runs.iter().map(|r| r.h_zero_slots as f64));
     let h_zero_first_sorted = sorted(
         insolvent_runs
@@ -874,7 +1035,7 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         insurance_end_mean: mean(&ins_ends),
         insurance_end_p10: quantile(&ins_ends, 0.10),
 
-        insolvency_frac,
+        h_zero_frac,
         h_zero_slots_p50: quantile(&h_zero_slots_sorted, 0.50),
         h_zero_first_slot_p50: quantile(&h_zero_first_sorted, 0.50),
         h_below_50_frac,
@@ -887,6 +1048,12 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         min_residual_p01: quantile(&min_residuals, 0.01),
         min_residual_p50: quantile(&min_residuals, 0.50),
         negative_h_frac,
+        deficit_frac: runs.iter().filter(|r| r.min_residual < 0).count() as f64
+            / runs.len().max(1) as f64,
+        withdraw_attempts_mean: mean(&sorted(runs.iter().map(|r| r.withdraw_attempts as f64))),
+        withdraw_successes_mean: mean(&sorted(runs.iter().map(|r| r.withdraw_successes as f64))),
+        close_attempts_mean: mean(&sorted(runs.iter().map(|r| r.close_attempts as f64))),
+        close_successes_mean: mean(&sorted(runs.iter().map(|r| r.close_successes as f64))),
     }
 }
 
@@ -917,11 +1084,12 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
         "seed,min_h,min_h_slot,final_h,liquidations,force_closes,\
          users_liquidated,users_with_positions,insurance_end,c_tot_end,pnl_pos_tot_end,\
          h_zero_slots,h_zero_first_slot,h_below_50_slots,h_below_10_slots,\
-         min_true_h,min_residual\n",
+         min_true_h,min_residual,\
+         withdraw_attempts,withdraw_successes,close_attempts,close_successes\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.6},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
@@ -939,6 +1107,10 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             r.h_below_10_slots,
             r.min_true_h,
             r.min_residual,
+            r.withdraw_attempts,
+            r.withdraw_successes,
+            r.close_attempts,
+            r.close_successes,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
@@ -1047,6 +1219,7 @@ fn parse_args() -> Config {
             "distortion_len" => cfg.distortion_len = val.parse().unwrap(),
             "long_bias" => cfg.long_bias = val.parse().unwrap(),
             "crank_interval" => cfg.crank_interval = val.parse().unwrap(),
+            "slippage" => cfg.slippage_bps = val.parse().unwrap(),
             "whale" => cfg.whale_enabled = val.parse().unwrap(),
             "whale_capital" => cfg.whale_capital_usdc = val.parse().unwrap(),
             "whale_leverage" => cfg.whale_leverage = val.parse().unwrap(),
@@ -1106,6 +1279,15 @@ fn main() {
     }
 
     let cfg = parse_args();
+
+    // Config validation: prevent price underflow from bps > 100%
+    assert!(cfg.crash_pct_bps <= 9999,
+        "crash_pct_bps={} exceeds 9999 (99.99%); price would underflow", cfg.crash_pct_bps);
+    assert!(cfg.bounce_pct_bps <= 9999,
+        "bounce_pct_bps={} exceeds 9999 (99.99%)", cfg.bounce_pct_bps);
+    assert!(cfg.distortion_pct_bps <= 9999,
+        "distortion_pct_bps={} exceeds 9999 (99.99%)", cfg.distortion_pct_bps);
+
     let out_dir = PathBuf::from(&cfg.out_dir);
     fs::create_dir_all(&out_dir).unwrap();
 
