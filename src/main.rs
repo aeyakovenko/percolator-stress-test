@@ -22,7 +22,7 @@ use std::{
     time::Instant,
 };
 
-use percolator::{MatchingEngine, RiskEngine, RiskParams, TradeExecution, I128, U128};
+use percolator::{RiskEngine, RiskParams, I128, U128, POS_SCALE, wide_math::I256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 // Slippage matcher — exec_price deviates from oracle by bounded amount
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Matching engine that returns exec_price = oracle ± slippage.
+/// Computes exec_price = oracle ± slippage.
 /// Direction alternates per call (buy below oracle, sell above oracle, etc.)
 /// generating non-zero trade_pnl that exercises warmup restart logic.
 struct SlippageMatcher {
@@ -49,17 +49,8 @@ impl SlippageMatcher {
             counter: AtomicU64::new(0),
         }
     }
-}
 
-impl MatchingEngine for SlippageMatcher {
-    fn execute_match(
-        &self,
-        _lp_program: &[u8; 32],
-        _lp_context: &[u8; 32],
-        _lp_account_id: u64,
-        oracle_price: u64,
-        size: i128,
-    ) -> percolator::Result<TradeExecution> {
+    fn exec_price(&self, oracle_price: u64, size: i128) -> u64 {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         // Alternate: even calls get favorable price, odd get unfavorable.
         // Favorable for buyer = below oracle; favorable for seller = above oracle.
@@ -72,8 +63,7 @@ impl MatchingEngine for SlippageMatcher {
             oracle_price.saturating_add(delta)
         };
         // Clamp to valid range
-        let price = price.max(1);
-        Ok(TradeExecution { price, size })
+        price.max(1)
     }
 }
 
@@ -477,31 +467,27 @@ fn sorted(vals: impl Iterator<Item = f64>) -> Vec<f64> {
 
 fn haircut_f64(engine: &RiskEngine) -> f64 {
     let (hn, hd) = engine.haircut_ratio();
-    if hd == 0 {
+    if hd.is_zero() {
         1.0
     } else {
-        hn as f64 / hd as f64
+        let n = hn.try_into_u128().unwrap_or(u128::MAX) as f64;
+        let d = hd.try_into_u128().unwrap_or(u128::MAX) as f64;
+        (n / d).min(1.0)
     }
 }
 
-/// True signed residual using the engine's own signed_residual().
+/// True signed residual: vault - c_tot - insurance.
 /// Returns positive value when solvent, negative when in deficit.
 fn true_residual(engine: &RiskEngine) -> i128 {
-    let (solvent, abs_val) = RiskEngine::signed_residual(
-        engine.vault.get(),
-        engine.c_tot.get(),
-        engine.insurance_fund.balance.get(),
-    );
-    if solvent {
-        abs_val as i128
-    } else {
-        -(abs_val as i128)
-    }
+    let vault = engine.vault.get() as i128;
+    let c_tot = engine.c_tot.get() as i128;
+    let ins = engine.insurance_fund.balance.get() as i128;
+    vault - c_tot - ins
 }
 
 /// True h: residual / pnl_pos_tot, can go negative.
 fn true_h(engine: &RiskEngine) -> f64 {
-    let pnl_pos_tot = engine.pnl_pos_tot.get();
+    let pnl_pos_tot = engine.pnl_pos_tot.try_into_u128().unwrap_or(u128::MAX);
     if pnl_pos_tot == 0 {
         return 1.0;
     }
@@ -548,7 +534,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         trading_fee_bps: cfg.trading_fee_bps,
         max_accounts: 4096,
         new_account_fee: U128::new(0),
-        risk_reduction_threshold: U128::new(0),
         maintenance_fee_per_slot: U128::new(cfg.maintenance_fee_per_slot),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: cfg.liquidation_fee_bps,
@@ -563,10 +548,10 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let _ = engine.top_up_insurance_fund(usdc(cfg.insurance_topup_usdc));
 
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp_idx, usdc(cfg.lp_capital_usdc), 0).unwrap();
+    engine.deposit(lp_idx, usdc(cfg.lp_capital_usdc), p0, 0).unwrap();
 
     // Initial crank at slot 0
-    let _ = engine.keeper_crank(lp_idx, 0, p0, 0, false);
+    let _ = engine.keeper_crank(lp_idx, 0, p0, 0);
 
     // ── Capital distributions (lognormal mixtures) ──────────────────────
     let retail = LogNormal::new(2_000f64.ln(), 1.0).unwrap();
@@ -577,7 +562,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut users: Vec<UserInfo> = Vec::with_capacity(cfg.n_users + 1);
     if cfg.whale_enabled {
         let whale_idx = engine.add_user(0).unwrap();
-        engine.deposit(whale_idx, usdc(cfg.whale_capital_usdc), 0).unwrap();
+        engine.deposit(whale_idx, usdc(cfg.whale_capital_usdc), p0, 0).unwrap();
         users.push(UserInfo {
             idx: whale_idx,
             initial_capital: usdc(cfg.whale_capital_usdc),
@@ -602,7 +587,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             Ok(i) => i,
             Err(_) => break, // slab full
         };
-        if engine.deposit(user_idx, usdc(cap_usdc), 0).is_err() {
+        if engine.deposit(user_idx, usdc(cap_usdc), p0, 0).is_err() {
             continue;
         }
 
@@ -616,7 +601,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
     // ── Run cranks through setup phase for full sweep ───────────────────
     for s in 1..=SETUP_SLOTS {
-        let _ = engine.keeper_crank(lp_idx, s, p0, 0, false);
+        let _ = engine.keeper_crank(lp_idx, s, p0, 0);
     }
 
     // ── Open positions via execute_trade ────────────────────────────────
@@ -644,29 +629,32 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         let cap_f = user.initial_capital as f64;
         let notional_atomic = (cap_f * lev * util) as u128;
 
-        // position = notional * 1e6 / price
-        let pos_abs = notional_atomic
-            .saturating_mul(1_000_000)
+        // size_q = notional * POS_SCALE / oracle_price (Q-scaled position)
+        let pos_q = notional_atomic
+            .saturating_mul(POS_SCALE)
             .checked_div(p0 as u128)
-            .unwrap_or(1)
-            .max(1);
+            .unwrap_or(POS_SCALE)
+            .max(POS_SCALE);
 
-        let size = if long {
-            pos_abs as i128
-        } else {
-            -(pos_abs as i128)
-        };
+        let sign: i128 = if long { 1 } else { -1 };
 
         // Retry with halved size on failure.
         // Snapshot/restore models Solana TX atomicity: execute_trade mutates
         // state (funding, mark settlement, maintenance fees) before the final
         // margin check. On-chain, Err reverts everything; we must do the same.
         let snapshot = engine.clone();
-        let mut s = size;
+        let mut q = pos_q;
         let mut ok = false;
         for _ in 0..5 {
+            let size_q = if sign > 0 {
+                I256::from_u128(q)
+            } else {
+                I256::from_u128(q).checked_neg().unwrap()
+            };
+            let raw_size = (q / POS_SCALE) as i128 * sign;
+            let ep = matcher.exec_price(p0, raw_size);
             if engine
-                .execute_trade(&matcher, lp_idx, user.idx, trade_slot, p0, s)
+                .execute_trade(lp_idx, user.idx, p0, trade_slot, size_q, ep)
                 .is_ok()
             {
                 user.had_position = true;
@@ -675,8 +663,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             }
             // Restore between each retry — failed attempt mutated state
             *engine = snapshot.as_ref().clone();
-            s /= 2;
-            if s == 0 {
+            q /= 2;
+            if q < POS_SCALE {
                 break;
             }
         }
@@ -687,7 +675,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
     // ── Post-trade sweep ────────────────────────────────────────────────
     for s in (SETUP_SLOTS + 1)..=(SETUP_SLOTS + 32) {
-        let _ = engine.keeper_crank(lp_idx, s, p0, 0, false);
+        let _ = engine.keeper_crank(lp_idx, s, p0, 0);
     }
 
     // ── Inject zombies: positive PnL + fee debt ─────────────────────────
@@ -702,13 +690,13 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         // C_tot drops and Residual (V - C_tot - I) rises to back the PnL.
         // Any zombie PnL exceeding LP's remaining capital is unbacked gap
         // loss, which naturally collapses h.
-        let add_pnl = usdc(cfg.zombie_pnl_usdc) as i128;
-        let old_pnl = engine.accounts[idx].pnl.get();
-        engine.set_pnl(idx, old_pnl.saturating_add(add_pnl));
+        let add_pnl = I256::from_i128(usdc(cfg.zombie_pnl_usdc) as i128);
+        let old_pnl = engine.accounts[idx].pnl;
+        engine.set_pnl(idx, old_pnl.checked_add(add_pnl).unwrap_or(old_pnl));
 
         // LP counterparty loss (zero-sum backing)
         let lp_cap = engine.accounts[lp_idx as usize].capital.get();
-        let loss = (add_pnl as u128).min(lp_cap);
+        let loss = usdc(cfg.zombie_pnl_usdc).min(lp_cap);
         engine.set_capital(lp_idx as usize, lp_cap.saturating_sub(loss));
 
         // Create fee debt (push fee_credits negative)
@@ -717,7 +705,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         engine.accounts[idx].fee_credits = I128::new(old_credits.saturating_sub(debt));
 
         // Set warmup slope so crank can convert over time
-        let _ = engine.update_warmup_slope(users[k].idx);
+        engine.update_warmup_slope(users[k].idx as usize);
     }
 
     // ── Crash simulation ────────────────────────────────────────────────
@@ -749,7 +737,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                 slot,
                 oracle,
                 cfg.funding_rate_bps_per_slot,
-                false,
             );
 
             // Hard invariant checks — fail fast on conservation violation
@@ -776,16 +763,16 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                     if !user.had_position { continue; }
 
                     let acct = &engine.accounts[user.idx as usize];
-                    let pos = acct.position_size.get();
+                    let has_position = !acct.position_basis_q.is_zero();
 
-                    if pos != 0 {
+                    if has_position {
                         // Try withdrawing 10% of capital
                         let cap = acct.capital.get();
                         let amt = cap / 10;
                         if amt > 0 {
                             withdraw_attempts += 1;
                             let snap = engine.clone();
-                            if engine.withdraw(user.idx, amt, slot, oracle).is_ok() {
+                            if engine.withdraw(user.idx, amt, oracle, slot).is_ok() {
                                 withdraw_successes += 1;
                             }
                             *engine = *snap;
@@ -836,11 +823,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                 oracle_price: oracle,
                 h,
                 c_tot: engine.c_tot.get(),
-                pnl_pos_tot: engine.pnl_pos_tot.get(),
+                pnl_pos_tot: engine.pnl_pos_tot.try_into_u128().unwrap_or(u128::MAX),
                 insurance: engine.insurance_fund.balance.get(),
-                open_interest: engine.total_open_interest.get(),
+                open_interest: engine.oi_eff_long_q.try_into_u128().unwrap_or(0),
                 cum_liquidations: engine.lifetime_liquidations,
-                cum_force_closes: engine.lifetime_force_realize_closes,
+                cum_force_closes: 0,
             });
         }
     }
@@ -848,7 +835,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Final crank to settle all state (especially important with crank lag) ──
     let final_slot = crash_start + cfg.total_slots;
     let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
-    let _ = engine.keeper_crank(lp_idx, final_slot, final_oracle, cfg.funding_rate_bps_per_slot, false);
+    let _ = engine.keeper_crank(lp_idx, final_slot, final_oracle, cfg.funding_rate_bps_per_slot);
     {
         let vault_val = engine.vault.get();
         let c_tot_val = engine.c_tot.get();
@@ -881,21 +868,25 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
         let acct = &engine.accounts[user.idx as usize];
         let init = user.initial_capital as f64;
+        let capital = acct.capital.get() as f64;
 
-        // MTM equity (paper PnL — includes unrealized mark)
-        let final_eq = engine.account_equity_mtm_at_oracle(acct, final_oracle) as f64;
-        let mtm_ratio = if init > 0.0 { final_eq / init } else { 0.0 };
+        // Approximate MTM equity: capital + pnl (signed)
+        let pnl_i128 = acct.pnl.try_into_i128().unwrap_or(0);
+        let equity = (capital as i128 + pnl_i128).max(0) as f64;
+        let mtm_ratio = if init > 0.0 { equity / init } else { 0.0 };
         capital_ratios.push(mtm_ratio);
 
         // Protected principal only (already safe, no warmup gate)
-        let capital = acct.capital.get() as f64;
         let prin_ratio = if init > 0.0 { capital / init } else { 0.0 };
         principal_ratios.push(prin_ratio);
 
         // Withdrawable = capital + haircutted warmed-up PnL
-        let warmed_pnl = engine.withdrawable_pnl(acct);
-        let haircutted_pnl = if h_den > 0 {
-            warmed_pnl.saturating_mul(h_num) / h_den
+        let warmed_pnl = engine.warmable_gross(user.idx as usize);
+        let warmed_pnl_u128 = warmed_pnl.try_into_u128().unwrap_or(0);
+        let haircutted_pnl = if !h_den.is_zero() {
+            let n = h_num.try_into_u128().unwrap_or(0);
+            let d = h_den.try_into_u128().unwrap_or(1);
+            warmed_pnl_u128.saturating_mul(n) / d
         } else {
             0
         };
@@ -904,7 +895,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         withdrawable_ratios.push(wd_ratio);
 
         // Liquidated = had position, now closed, equity < 10% of initial
-        if acct.position_size.get() == 0 && mtm_ratio < 0.1 {
+        if acct.position_basis_q.is_zero() && mtm_ratio < 0.1 {
             users_liquidated += 1;
         }
     }
@@ -919,10 +910,10 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         final_h,
         insurance_end: engine.insurance_fund.balance.get(),
         c_tot_end: engine.c_tot.get(),
-        pnl_pos_tot_end: engine.pnl_pos_tot.get(),
+        pnl_pos_tot_end: engine.pnl_pos_tot.try_into_u128().unwrap_or(u128::MAX),
         vault_end: engine.vault.get(),
         liquidations: engine.lifetime_liquidations,
-        force_closes: engine.lifetime_force_realize_closes,
+        force_closes: 0,
         users_liquidated,
         users_with_positions,
         capital_ratios,
