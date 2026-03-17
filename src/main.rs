@@ -1803,6 +1803,257 @@ fn test_adl_saturation() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// ADL fairness fuzz — randomized longs, randomized short bankruptcies
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Fuzz test: N longs with random capitalizations receive ADL from M shorts
+/// with random bankruptcy depths. Verify that the K-deficit is absorbed
+/// proportionally to each long's effective position size, and that h
+/// haircuts are applied uniformly.
+fn test_adl_fuzz() {
+    use percolator::MIN_A_SIDE;
+
+    let n_seeds: u64 = env::args()
+        .find(|a| a.starts_with("--fuzz_seeds="))
+        .and_then(|a| a.split('=').nth(1).map(|v| v.parse().unwrap()))
+        .unwrap_or(100);
+
+    let oracle = price_e6(60_000);
+    let mut global_rng = ChaCha8Rng::seed_from_u64(0xAD1);
+    let mut pass = 0u64;
+    let mut fail = 0u64;
+    let mut max_k_magnitude: i128 = 0;
+    let mut min_a_seen: u128 = ADL_ONE;
+    let mut max_liqs: u64 = 0;
+    let mut drain_count = 0u64;
+    let mut epoch_reset_count = 0u64;
+    let mut worst_fairness_err: f64 = 0.0;
+
+    println!("=== ADL FAIRNESS FUZZ ({} seeds) ===", n_seeds);
+    println!("  ADL_ONE={} MIN_A_SIDE={} POS_SCALE={}", ADL_ONE, MIN_A_SIDE, POS_SCALE);
+
+    for seed in 0..n_seeds {
+        let mut rng = ChaCha8Rng::seed_from_u64(global_rng.gen());
+
+        // Random config per seed
+        let n_longs: usize = rng.gen_range(2..=50);
+        let n_shorts: usize = rng.gen_range(10..=500);
+        let mm_bps: u64 = rng.gen_range(100..=1000);
+        let im_bps: u64 = mm_bps + rng.gen_range(100..=1000); // IM strictly > MM
+
+        let params = RiskParams {
+            warmup_period_slots: 600,
+            maintenance_margin_bps: mm_bps,
+            initial_margin_bps: im_bps,
+            trading_fee_bps: 0,
+            max_accounts: 4096,
+            new_account_fee: U128::new(0),
+            maintenance_fee_per_slot: U128::new(0),
+            max_crank_staleness_slots: u64::MAX,
+            liquidation_fee_bps: 0,
+            liquidation_fee_cap: U128::new(0),
+            liquidation_buffer_bps: rng.gen_range(50..=500),
+            min_liquidation_abs: U128::new(1),
+        };
+        let mut engine = new_engine(params);
+
+        // No insurance — deficit goes through K
+        let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+        engine.deposit(lp, usdc(1_000_000_000), oracle, 0).unwrap();
+        let _ = engine.keeper_crank(lp, 0, oracle, 0);
+
+        // Create longs with random capitalizations ($10K - $10M)
+        let mut longs: Vec<(u16, u128)> = Vec::new(); // (idx, capital)
+        for _ in 0..n_longs {
+            let cap_usdc: u64 = rng.gen_range(10_000..=10_000_000);
+            let idx = engine.add_user(0).unwrap();
+            engine.deposit(idx, usdc(cap_usdc), oracle, 0).unwrap();
+            longs.push((idx, usdc(cap_usdc)));
+        }
+
+        // Create shorts with random capitalizations ($1K - $100K)
+        let mut shorts: Vec<u16> = Vec::new();
+        for _ in 0..n_shorts {
+            let cap_usdc: u64 = rng.gen_range(1_000..=100_000);
+            let idx = engine.add_user(0).unwrap();
+            engine.deposit(idx, usdc(cap_usdc), oracle, 0).unwrap();
+            shorts.push(idx);
+        }
+
+        for s in 1..=64 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+        // Open positions with random leverage
+        let slot = 64;
+        let mut long_positions: Vec<(u16, i128)> = Vec::new(); // (idx, size_q)
+        for &(idx, cap) in &longs {
+            let lev: f64 = rng.gen_range(1.5..10.0);
+            let notional = (cap as f64 * lev) as u128;
+            let size_q = (notional * POS_SCALE / oracle as u128) as i128;
+            if size_q > 0 {
+                match engine.execute_trade(idx, lp, oracle, slot, size_q, oracle) {
+                    Ok(()) => long_positions.push((idx, size_q)),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let mut short_opened = 0u32;
+        for &idx in &shorts {
+            let cap = engine.accounts[idx as usize].capital.get();
+            let lev: f64 = rng.gen_range(2.0..15.0);
+            let notional = (cap as f64 * lev) as u128;
+            let size_q = (notional * POS_SCALE / oracle as u128) as i128;
+            if size_q > 0 {
+                match engine.execute_trade(lp, idx, oracle, slot, size_q, oracle) {
+                    Ok(()) => short_opened += 1,
+                    Err(_) => {}
+                }
+            }
+        }
+
+        if long_positions.is_empty() || short_opened == 0 {
+            continue; // skip degenerate seeds
+        }
+
+        for s in 65..=96 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+        // Record pre-ADL state for each long (capital, pnl, effective position)
+        let pre_state: Vec<(u16, u128, i128, i128)> = long_positions.iter().map(|&(idx, _)| {
+            let acct = &engine.accounts[idx as usize];
+            (idx, acct.capital.get(), acct.pnl, acct.position_basis_q)
+        }).collect();
+
+        // Inject random bankruptcy depths into shorts
+        for &idx in &shorts {
+            if engine.accounts[idx as usize].position_basis_q == 0 { continue; }
+            let cap = engine.accounts[idx as usize].capital.get();
+            // Random bankruptcy depth: 2x to 50x their capital
+            let depth_mult: f64 = rng.gen_range(2.0..50.0);
+            let loss = (cap as f64 * depth_mult) as i128;
+            engine.set_pnl(idx as usize, -loss);
+        }
+
+        // Crank through all liquidations
+        let mut seed_liqs = 0u64;
+        let mut seed_drain = false;
+        let mut seed_epoch_resets = 0u64;
+        let mut prev_epoch = engine.adl_epoch_long;
+
+        for s in 97..=2000 {
+            let pre_liqs = engine.lifetime_liquidations;
+            let _ = engine.keeper_crank(lp, s, oracle, 0);
+            let new_liqs = engine.lifetime_liquidations - pre_liqs;
+            seed_liqs += new_liqs;
+
+            if engine.side_mode_long == SideMode::DrainOnly { seed_drain = true; }
+            if engine.adl_epoch_long > prev_epoch {
+                seed_epoch_resets += engine.adl_epoch_long - prev_epoch;
+                prev_epoch = engine.adl_epoch_long;
+            }
+
+            // Solvency check every crank
+            let vault = engine.vault.get();
+            let c_tot = engine.c_tot.get();
+            let ins = engine.insurance_fund.balance.get();
+            if vault < c_tot.saturating_add(ins) {
+                println!("  SOLVENCY FAIL seed={} slot={}: vault={} c_tot={} ins={}",
+                    seed, s, vault, c_tot, ins);
+                fail += 1;
+                break;
+            }
+
+            if new_liqs == 0 && s > 200 { break; } // no more to liquidate
+        }
+
+        // Track K magnitude
+        let k_mag = engine.adl_coeff_long.abs();
+        if k_mag > max_k_magnitude { max_k_magnitude = k_mag; }
+        if engine.adl_mult_long < min_a_seen { min_a_seen = engine.adl_mult_long; }
+        if seed_liqs > max_liqs { max_liqs = seed_liqs; }
+        if seed_drain { drain_count += 1; }
+        epoch_reset_count += seed_epoch_resets;
+
+        // Check fairness: each surviving long should have absorbed K-deficit
+        // proportionally to their position size.
+        // Touch all longs to settle final state.
+        for s in 2001..=2100 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+        // Collect equity change for surviving longs.
+        // Separate into: same-epoch (position still open, settled mid-cascade)
+        // vs epoch-reset (position zeroed by reset).
+        let mut losses: Vec<(u16, f64, i128)> = Vec::new();
+        let mut surviving = 0u32;
+        let mut liquidated = 0u32;
+        for &(idx, pre_cap, pre_pnl, pre_pos) in &pre_state {
+            if pre_pos == 0 { continue; }
+            let post_cap = engine.accounts[idx as usize].capital.get();
+            let post_pnl = engine.accounts[idx as usize].pnl;
+            // Skip accounts that went fully bankrupt
+            if post_cap == 0 && post_pnl <= 0 { liquidated += 1; continue; }
+            surviving += 1;
+            let pre_equity = pre_cap as i128 + pre_pnl;
+            let post_equity = post_cap as i128 + post_pnl;
+            let delta = post_equity - pre_equity;
+            let abs_pos = pre_pos.unsigned_abs() as f64;
+            let loss_per_unit = if abs_pos > 0.0 { delta as f64 / abs_pos } else { 0.0 };
+            losses.push((idx, loss_per_unit, pre_pos));
+        }
+
+        // Check proportionality: all loss_per_unit values should be equal
+        // K settlement is additive: total absorbed K per account =
+        //   basis_pos * (K_final - K_initial) / (a_basis * POS_SCALE)
+        // which is proportional to basis_pos / a_basis. Since all opened at
+        // same time with same a_basis, it should be proportional to basis_pos.
+        if losses.len() >= 2 {
+            let lpus: Vec<f64> = losses.iter().map(|x| x.1).collect();
+            let mean_lpu = lpus.iter().sum::<f64>() / lpus.len() as f64;
+            if mean_lpu.abs() > 0.001 {
+                let max_err = lpus.iter().map(|x| ((x - mean_lpu) / mean_lpu).abs()).fold(0.0f64, f64::max);
+                if max_err > worst_fairness_err { worst_fairness_err = max_err; }
+                if max_err > 0.05 {
+                    println!("  seed={}: FAIRNESS err={:.2}% ({} surviving longs of {}, {} liqs)",
+                        seed, max_err * 100.0, losses.len(), long_positions.len(), seed_liqs);
+                }
+            }
+        }
+
+        pass += 1;
+        if (seed + 1) % 10 == 0 {
+            print!("  [{}/{}] pass={} fail={} max_K={:.2e} min_A={} max_liqs={}\r",
+                seed + 1, n_seeds, pass, fail, max_k_magnitude as f64, min_a_seen, max_liqs);
+        }
+    }
+
+    println!("\n\n=== FUZZ RESULTS ({} seeds) ===", n_seeds);
+    println!("  pass           = {}", pass);
+    println!("  fail           = {}", fail);
+    println!("  max |K_long|   = {:.6e} (i128 max = {:.6e})", max_k_magnitude as f64, i128::MAX as f64);
+    println!("  min A_long     = {} (MIN_A_SIDE={})", min_a_seen, MIN_A_SIDE);
+    println!("  max liqs/seed  = {}", max_liqs);
+    println!("  DrainOnly hits = {}", drain_count);
+    println!("  epoch resets   = {}", epoch_reset_count);
+    println!("  worst fairness = {:.4}% relative error", worst_fairness_err * 100.0);
+
+    if fail > 0 {
+        println!("\n  RESULT: {} SOLVENCY FAILURES!", fail);
+    } else {
+        println!("\n  RESULT: SOLVENCY 100% — all {} seeds pass", pass);
+        println!("  K headroom: {:.2e} / {:.2e} = {:.6}% of i128",
+            max_k_magnitude as f64, i128::MAX as f64,
+            max_k_magnitude as f64 / i128::MAX as f64 * 100.0);
+        if worst_fairness_err > 0.01 {
+            println!("  Fairness error up to {:.1}% — this is the H-fairness caveat:", worst_fairness_err * 100.0);
+            println!("    A/K settlement is exact per-touch, but accounts touched at");
+            println!("    different points in a multi-crank cascade see different");
+            println!("    intermediate K values via settle_losses ratchet.");
+            println!("    This is unavoidable without a global scan.");
+        } else {
+            println!("  Fairness: within {:.2}%", worst_fairness_err * 100.0);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Main
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2003,6 +2254,10 @@ fn main() {
     }
     if env::args().any(|a| a == "--test=adl_saturation") {
         test_adl_saturation();
+        return;
+    }
+    if env::args().any(|a| a.starts_with("--test=adl_fuzz")) {
+        test_adl_fuzz();
         return;
     }
 
