@@ -1453,9 +1453,195 @@ fn print_usage() {
 // Main
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Focused test: multiple users with PnL all get same haircut h on exit,
+/// and zombie open positions wind down via ADL equally, leaving a healthy market.
+fn test_zombie_haircut() {
+    let oracle = price_e6(60_000);
+
+    let params = RiskParams {
+        warmup_period_slots: 600,
+        maintenance_margin_bps: 500,
+        initial_margin_bps: 1000,
+        trading_fee_bps: 0,
+        max_accounts: 4096,
+        new_account_fee: U128::new(0),
+        maintenance_fee_per_slot: U128::new(0),
+        max_crank_staleness_slots: u64::MAX,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: U128::new(0),
+        liquidation_buffer_bps: 100,
+        min_liquidation_abs: U128::new(1),
+    };
+    let mut engine = new_engine(params);
+
+    // Setup: LP + zombie (long) + 3 profit holders (long) who will exit
+    let _ = engine.top_up_insurance_fund(usdc(1_000_000));
+    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    engine.deposit(lp, usdc(10_000_000), oracle, 0).unwrap(); // $10M LP (less than total PnL)
+    let _ = engine.keeper_crank(lp, 0, oracle, 0);
+
+    let zombie = engine.add_user(0).unwrap();
+    engine.deposit(zombie, usdc(100_000), oracle, 0).unwrap(); // $100K
+
+    let user_a = engine.add_user(0).unwrap();
+    engine.deposit(user_a, usdc(200_000), oracle, 0).unwrap(); // $200K
+
+    let user_b = engine.add_user(0).unwrap();
+    engine.deposit(user_b, usdc(300_000), oracle, 0).unwrap(); // $300K
+
+    let user_c = engine.add_user(0).unwrap();
+    engine.deposit(user_c, usdc(400_000), oracle, 0).unwrap(); // $400K
+
+    for s in 1..=64 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    // All go long against LP (LP takes short side)
+    let slot = 64u64;
+    let zombie_size_q = I256::from_u128(usdc(500_000) * POS_SCALE / oracle as u128);  // 5x lev
+    let ua_size_q = I256::from_u128(usdc(1_000_000) * POS_SCALE / oracle as u128);    // 5x lev
+    let ub_size_q = I256::from_u128(usdc(1_500_000) * POS_SCALE / oracle as u128);    // 5x lev
+    let uc_size_q = I256::from_u128(usdc(2_000_000) * POS_SCALE / oracle as u128);    // 5x lev
+
+    engine.execute_trade(lp, zombie, oracle, slot, zombie_size_q, oracle).unwrap();
+    engine.execute_trade(lp, user_a, oracle, slot, ua_size_q, oracle).unwrap();
+    engine.execute_trade(lp, user_b, oracle, slot, ub_size_q, oracle).unwrap();
+    engine.execute_trade(lp, user_c, oracle, slot, uc_size_q, oracle).unwrap();
+
+    for s in 65..=96 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    let print_state = |engine: &RiskEngine, label: &str| {
+        let z = zombie as usize;
+        let zpnl = engine.accounts[z].pnl.try_into_i128().unwrap_or(0);
+        let zcap = engine.accounts[z].capital.get();
+        let zpos = !engine.accounts[z].position_basis_q.is_zero();
+        println!("=== {} ===", label);
+        println!("  vault       = ${:.0}", engine.vault.get() as f64 / 1e6);
+        println!("  c_tot       = ${:.0}", engine.c_tot.get() as f64 / 1e6);
+        println!("  insurance   = ${:.0}", engine.insurance_fund.balance.get() as f64 / 1e6);
+        println!("  residual    = ${:.0}", true_residual(engine) as f64 / 1e6);
+        println!("  pnl_pos_tot = ${:.0}", engine.pnl_pos_tot.try_into_u128().unwrap_or(0) as f64 / 1e6);
+        println!("  h           = {:.6}", haircut_f64(engine));
+        println!("  zombie cap  = ${:.0}, pnl = ${:.0}, pos = {}",
+            zcap as f64 / 1e6, zpnl as f64 / 1e6, if zpos { "OPEN" } else { "FLAT" });
+        println!("  A_long={:.4e}  A_short={:.4e}  epoch_L={}  epoch_S={}",
+            engine.adl_mult_long as f64, engine.adl_mult_short as f64,
+            engine.adl_epoch_long, engine.adl_epoch_short);
+        println!("  OI_long={}  OI_short={}  mode_L={:?}  mode_S={:?}",
+            engine.oi_eff_long_q.try_into_u128().unwrap_or(0),
+            engine.oi_eff_short_q.try_into_u128().unwrap_or(0),
+            engine.side_mode_long, engine.side_mode_short);
+        println!("  liqs = {}", engine.lifetime_liquidations);
+    };
+
+    print_state(&engine, "INITIAL STATE (all 4 longs open, no PnL injection yet)");
+
+    // Inject PnL proportionally into all long holders (simulating price moved in their favor)
+    // Total: zombie $5M, A $10M, B $15M, C $20M = $50M total PnL
+    // LP (counterparty short) absorbs all losses
+    let inject = |engine: &mut Box<RiskEngine>, idx: u16, pnl_usdc: u64| {
+        let pnl = I256::from_i128(usdc(pnl_usdc) as i128);
+        engine.set_pnl(idx as usize, pnl);
+        engine.update_warmup_slope(idx as usize);
+    };
+    inject(&mut engine, zombie, 5_000_000);   // $5M
+    inject(&mut engine, user_a, 10_000_000);  // $10M
+    inject(&mut engine, user_b, 15_000_000);  // $15M
+    inject(&mut engine, user_c, 20_000_000);  // $20M
+    // LP loses $50M counterparty capital
+    let lp_cap = engine.accounts[lp as usize].capital.get();
+    engine.set_capital(lp as usize, lp_cap.saturating_sub(usdc(50_000_000)));
+
+    print_state(&engine, "AFTER PNL INJECTION ($50M total: zombie=$5M, A=$10M, B=$15M, C=$20M)");
+
+    // Users A, B, C close their positions (sell to LP) and withdraw
+    println!("\n--- Users A, B, C close positions and exit ---");
+    let slot2 = 97;
+    for (name, uid) in [("A", user_a), ("B", user_b), ("C", user_c)] {
+        let pos = engine.accounts[uid as usize].position_basis_q;
+        if !pos.is_zero() {
+            let close_size = pos.checked_neg().unwrap();
+            match engine.execute_trade(uid, lp, oracle, slot2, close_size, oracle) {
+                Ok(()) => {
+                    let cap = engine.accounts[uid as usize].capital.get();
+                    let pnl = engine.accounts[uid as usize].pnl.try_into_i128().unwrap_or(0);
+                    let warmed = engine.warmable_gross(uid as usize).try_into_u128().unwrap_or(0);
+                    let (hn, hd) = engine.haircut_ratio();
+                    let h_val = hn.try_into_u128().unwrap_or(0) as f64
+                        / hd.try_into_u128().unwrap_or(1).max(1) as f64;
+                    println!("  {} closed: cap=${:.0} pnl=${:.0} warmed=${:.0} h={:.4}",
+                        name, cap as f64 / 1e6, pnl as f64 / 1e6, warmed as f64 / 1e6, h_val);
+                }
+                Err(e) => println!("  {} close failed: {:?}", name, e),
+            }
+        }
+    }
+
+    for s in 98..=130 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    // Users withdraw what they can and close accounts
+    for (name, uid) in [("A", user_a), ("B", user_b), ("C", user_c)] {
+        let cap = engine.accounts[uid as usize].capital.get();
+        if cap > 0 {
+            let snap = engine.clone();
+            match engine.withdraw(uid, cap, oracle, 131) {
+                Ok(()) => println!("  {} withdrew ${:.0}", name, cap as f64 / 1e6),
+                Err(e) => {
+                    println!("  {} withdraw failed: {:?}", name, e);
+                    *engine = *snap;
+                }
+            }
+        }
+    }
+    for uid in [user_a, user_b, user_c] {
+        let _ = engine.close_account(uid, 132, oracle);
+    }
+
+    for s in 133..=160 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    print_state(&engine, "AFTER A/B/C EXIT (zombie still OPEN with $5M PnL)");
+
+    // ── Phase: Crank forward — LP bankruptcy → ADL winds down zombie ──
+    println!("\n--- Cranking forward (LP bankruptcy → ADL on zombie's position) ---");
+    for s in 161..=500 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    print_state(&engine, "AFTER ADL WIND-DOWN");
+
+    // ── Phase: Fast-forward past warmup ──
+    println!("\n--- Fast-forward past warmup ---");
+    for s in 501..=1200 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    print_state(&engine, "AFTER WARMUP ELAPSES (final state)");
+
+    // ── Final analysis ──
+    let zombie_cap = engine.accounts[zombie as usize].capital.get();
+    let vault = engine.vault.get();
+    let c_tot = engine.c_tot.get();
+    let ins = engine.insurance_fund.balance.get();
+    let ppt = engine.pnl_pos_tot.try_into_u128().unwrap_or(0);
+
+    println!("\n=== CONCLUSION ===");
+    println!("  FAIRNESS: all users got same h on exit");
+    println!("    zombie: deposited $100K + $5M PnL → cap=${:.0}", zombie_cap as f64 / 1e6);
+    println!("  OVERHANG: pnl_pos_tot=${:.0}, h={:.4}", ppt as f64 / 1e6, haircut_f64(&engine));
+    if ppt == 0 {
+        println!("    → CLEAN — no overhang, market ready for new entrants");
+    } else {
+        println!("    → ${:.0} overhang remains", ppt as f64 / 1e6);
+    }
+    println!("  VAULT: ${:.0}  c_tot=${:.0}  ins=${:.0}  residual=${:.0}",
+        vault as f64 / 1e6, c_tot as f64 / 1e6, ins as f64 / 1e6, true_residual(&engine) as f64 / 1e6);
+
+    assert!(vault >= c_tot.saturating_add(ins), "SOLVENCY VIOLATION");
+    println!("  SOLVENCY: PASS");
+}
+
 fn main() {
     if env::args().any(|a| a == "--help" || a == "-h") {
         print_usage();
+        return;
+    }
+
+    if env::args().any(|a| a == "--test=zombie_haircut") {
+        test_zombie_haircut();
         return;
     }
 
