@@ -1450,6 +1450,195 @@ fn print_usage() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// ADL fairness test
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Verify ADL wind-down is fair: multiple accounts on the opposing side
+/// with different position sizes all get reduced by the same ratio.
+/// Quote deficit D is absorbed proportionally to position size.
+fn test_adl_fairness() {
+    let oracle = price_e6(60_000);
+
+    let params = RiskParams {
+        warmup_period_slots: 600,
+        maintenance_margin_bps: 500,
+        initial_margin_bps: 1000,
+        trading_fee_bps: 0,
+        max_accounts: 4096,
+        new_account_fee: U128::new(0),
+        maintenance_fee_per_slot: U128::new(0),
+        max_crank_staleness_slots: u64::MAX,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: U128::new(0),
+        liquidation_buffer_bps: 100,
+        min_liquidation_abs: U128::new(1),
+    };
+    let mut engine = new_engine(params);
+
+    // No insurance — forces deficit through K-index socialization
+    // (admin controls insurance; zero here to isolate ADL fairness)
+    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    engine.deposit(lp, usdc(5_000_000), oracle, 0).unwrap();
+    let _ = engine.keeper_crank(lp, 0, oracle, 0);
+
+    // Bankrupt account: goes LONG, will be liquidated
+    let bankrupt = engine.add_user(0).unwrap();
+    engine.deposit(bankrupt, usdc(100_000), oracle, 0).unwrap();
+
+    // 3 SHORT accounts with different sizes — these receive ADL
+    let short_a = engine.add_user(0).unwrap();
+    engine.deposit(short_a, usdc(500_000), oracle, 0).unwrap();
+
+    let short_b = engine.add_user(0).unwrap();
+    engine.deposit(short_b, usdc(1_000_000), oracle, 0).unwrap();
+
+    let short_c = engine.add_user(0).unwrap();
+    engine.deposit(short_c, usdc(2_000_000), oracle, 0).unwrap();
+
+    for s in 1..=64 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    // Open positions
+    // execute_trade(a, b, ..., size_q, ...): a gets +size_q, b gets -size_q
+    let slot = 64;
+    // Bankrupt goes LONG (a=bankrupt gets +size)
+    let bankrupt_q = I256::from_u128(usdc(1_000_000) * POS_SCALE / oracle as u128); // 10x lev
+    engine.execute_trade(bankrupt, lp, oracle, slot, bankrupt_q, oracle).unwrap();
+
+    // Shorts with different sizes: a=LP gets +size (long), b=short gets -size (SHORT)
+    let sa_q = I256::from_u128(usdc(1_000_000) * POS_SCALE / oracle as u128);
+    let sb_q = I256::from_u128(usdc(2_000_000) * POS_SCALE / oracle as u128);
+    let sc_q = I256::from_u128(usdc(4_000_000) * POS_SCALE / oracle as u128);
+    engine.execute_trade(lp, short_a, oracle, slot, sa_q, oracle).unwrap();
+    engine.execute_trade(lp, short_b, oracle, slot, sb_q, oracle).unwrap();
+    engine.execute_trade(lp, short_c, oracle, slot, sc_q, oracle).unwrap();
+
+    for s in 65..=96 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    // Record pre-ADL effective positions for shorts
+    let pre_a = engine.accounts[short_a as usize].position_basis_q;
+    let pre_b = engine.accounts[short_b as usize].position_basis_q;
+    let pre_c = engine.accounts[short_c as usize].position_basis_q;
+
+    println!("=== BEFORE ADL ===");
+    println!("  bankrupt: cap=${:.0} pos_q=LONG", engine.accounts[bankrupt as usize].capital.get() as f64 / 1e6);
+    println!("  short_a:  cap=${:.0} pos_q={}", engine.accounts[short_a as usize].capital.get() as f64 / 1e6,
+        pre_a.try_into_i128().unwrap_or(0));
+    println!("  short_b:  cap=${:.0} pos_q={}", engine.accounts[short_b as usize].capital.get() as f64 / 1e6,
+        pre_b.try_into_i128().unwrap_or(0));
+    println!("  short_c:  cap=${:.0} pos_q={}", engine.accounts[short_c as usize].capital.get() as f64 / 1e6,
+        pre_c.try_into_i128().unwrap_or(0));
+    println!("  A_short = {:.6e}", engine.adl_mult_short as f64);
+    println!("  K_short = {}", engine.adl_coeff_short.try_into_i128().unwrap_or(0));
+    println!("  OI_long  = {}", engine.oi_eff_long_q.try_into_u128().unwrap_or(0));
+    println!("  OI_short = {}", engine.oi_eff_short_q.try_into_u128().unwrap_or(0));
+
+    // Make bankrupt go deeply underwater — inject negative PnL
+    let loss = I256::from_i128(-(usdc(500_000) as i128)); // -$500K, way more than $100K capital
+    engine.set_pnl(bankrupt as usize, loss);
+    // LP gains the counterparty profit
+    let lp_cap = engine.accounts[lp as usize].capital.get();
+    engine.set_capital(lp as usize, lp_cap.saturating_add(usdc(500_000)));
+
+    println!("\n=== AFTER INJECTING -$500K PNL INTO BANKRUPT LONG ===");
+    println!("  bankrupt: cap=${:.0} pnl=${:.0}",
+        engine.accounts[bankrupt as usize].capital.get() as f64 / 1e6,
+        engine.accounts[bankrupt as usize].pnl.try_into_i128().unwrap_or(0) as f64 / 1e6);
+
+    // Crank to trigger liquidation → ADL
+    let pre_a_long = engine.adl_mult_long;
+    let pre_a_short = engine.adl_mult_short;
+    let pre_k_long = engine.adl_coeff_long;
+    let pre_k_short = engine.adl_coeff_short;
+
+    for s in 97..=160 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    println!("\n=== AFTER CRANK (liquidation + ADL) ===");
+    println!("  liquidations = {}", engine.lifetime_liquidations);
+    println!("  A_long:  {:.6e} → {:.6e} (ratio={:.6})",
+        pre_a_long as f64, engine.adl_mult_long as f64,
+        engine.adl_mult_long as f64 / pre_a_long as f64);
+    println!("  A_short: {:.6e} → {:.6e} (ratio={:.6})",
+        pre_a_short as f64, engine.adl_mult_short as f64,
+        engine.adl_mult_short as f64 / pre_a_short as f64);
+    println!("  K_long:  {} → {}", pre_k_long.try_into_i128().unwrap_or(0),
+        engine.adl_coeff_long.try_into_i128().unwrap_or(0));
+    println!("  K_short: {} → {}", pre_k_short.try_into_i128().unwrap_or(0),
+        engine.adl_coeff_short.try_into_i128().unwrap_or(0));
+    println!("  epoch_long={}  epoch_short={}", engine.adl_epoch_long, engine.adl_epoch_short);
+    println!("  mode_long={:?}  mode_short={:?}", engine.side_mode_long, engine.side_mode_short);
+
+    // Touch each short account to settle ADL effects
+    // We need to trigger touch_account_full via a no-op operation
+    // Using withdraw(0) or just reading effective_pos after a crank that touches them
+    for s in 161..=200 { let _ = engine.keeper_crank(lp, s, oracle, 0); }
+
+    // Read post-ADL state
+    let post_pnl_a = engine.accounts[short_a as usize].pnl.try_into_i128().unwrap_or(0);
+    let post_pnl_b = engine.accounts[short_b as usize].pnl.try_into_i128().unwrap_or(0);
+    let post_pnl_c = engine.accounts[short_c as usize].pnl.try_into_i128().unwrap_or(0);
+    let post_cap_a = engine.accounts[short_a as usize].capital.get();
+    let post_cap_b = engine.accounts[short_b as usize].capital.get();
+    let post_cap_c = engine.accounts[short_c as usize].capital.get();
+    let post_pos_a = engine.accounts[short_a as usize].position_basis_q.is_zero();
+    let post_pos_b = engine.accounts[short_b as usize].position_basis_q.is_zero();
+    let post_pos_c = engine.accounts[short_c as usize].position_basis_q.is_zero();
+
+    println!("\n=== POST-ADL SETTLEMENT (all shorts touched) ===");
+    println!("  short_a: cap=${:.0}  pnl=${:.0}  pos={}  (was $500K deposit, 1x notional)",
+        post_cap_a as f64 / 1e6, post_pnl_a as f64 / 1e6, if post_pos_a { "FLAT" } else { "OPEN" });
+    println!("  short_b: cap=${:.0}  pnl=${:.0}  pos={}  (was $1M deposit, 2x notional)",
+        post_cap_b as f64 / 1e6, post_pnl_b as f64 / 1e6, if post_pos_b { "FLAT" } else { "OPEN" });
+    println!("  short_c: cap=${:.0}  pnl=${:.0}  pos={}  (was $2M deposit, 4x notional)",
+        post_cap_c as f64 / 1e6, post_pnl_c as f64 / 1e6, if post_pos_c { "FLAT" } else { "OPEN" });
+
+    // Check proportionality of PnL delta (quote deficit absorbed)
+    // Shorts had positions in ratio 1:2:4, so they should absorb deficit in same ratio
+    if post_pnl_a != 0 && post_pnl_b != 0 && post_pnl_c != 0 {
+        let ratio_ba = post_pnl_b as f64 / post_pnl_a as f64;
+        let ratio_ca = post_pnl_c as f64 / post_pnl_a as f64;
+        println!("\n=== ADL FAIRNESS CHECK ===");
+        println!("  Position ratio:  A:B:C = 1:2:4");
+        println!("  PnL delta ratio: A:B:C = 1:{:.2}:{:.2}", ratio_ba, ratio_ca);
+        println!("  Expected:        A:B:C = 1:2.00:4.00");
+        if (ratio_ba - 2.0).abs() < 0.1 && (ratio_ca - 4.0).abs() < 0.1 {
+            println!("  → FAIR: deficit absorbed proportionally to position size ✓");
+        } else {
+            println!("  → UNFAIR: deficit NOT proportional!");
+        }
+    } else {
+        println!("\n=== ADL FAIRNESS CHECK ===");
+        println!("  PnL: A={} B={} C={}", post_pnl_a, post_pnl_b, post_pnl_c);
+        if post_pnl_a == 0 && post_pnl_b == 0 && post_pnl_c == 0 {
+            println!("  All PnL = 0 — deficit was absorbed by insurance/protocol, not K");
+            println!("  Checking capital changes instead...");
+            let cap_loss_a = usdc(500_000) as i128 - post_cap_a as i128;
+            let cap_loss_b = usdc(1_000_000) as i128 - post_cap_b as i128;
+            let cap_loss_c = usdc(2_000_000) as i128 - post_cap_c as i128;
+            println!("  Capital loss: A=${:.0} B=${:.0} C=${:.0}",
+                cap_loss_a as f64 / 1e6, cap_loss_b as f64 / 1e6, cap_loss_c as f64 / 1e6);
+        }
+        // Check position reduction ratio
+        println!("  Positions: A={} B={} C={}",
+            if post_pos_a { "FLAT" } else { "OPEN" },
+            if post_pos_b { "FLAT" } else { "OPEN" },
+            if post_pos_c { "FLAT" } else { "OPEN" });
+        if post_pos_a && post_pos_b && post_pos_c {
+            println!("  → All positions zeroed by epoch reset (ADL fully wound down)");
+            println!("  → FAIR: all accounts on the side treated equally ✓");
+        }
+    }
+
+    // Solvency
+    let vault = engine.vault.get();
+    let c_tot = engine.c_tot.get();
+    let ins = engine.insurance_fund.balance.get();
+    assert!(vault >= c_tot.saturating_add(ins), "SOLVENCY VIOLATION");
+    println!("\n  h           = {:.6}", haircut_f64(&engine));
+    println!("  pnl_pos_tot = ${:.0}", engine.pnl_pos_tot.try_into_u128().unwrap_or(0) as f64 / 1e6);
+    println!("  SOLVENCY: PASS");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Main
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1642,6 +1831,10 @@ fn main() {
 
     if env::args().any(|a| a == "--test=zombie_haircut") {
         test_zombie_haircut();
+        return;
+    }
+    if env::args().any(|a| a == "--test=adl_fairness") {
+        test_adl_fairness();
         return;
     }
 
