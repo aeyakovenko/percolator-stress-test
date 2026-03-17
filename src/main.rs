@@ -22,7 +22,7 @@ use std::{
     time::Instant,
 };
 
-use percolator::{RiskEngine, RiskParams, I128, U128, POS_SCALE, wide_math::I256};
+use percolator::{RiskEngine, RiskParams, I128, U128, POS_SCALE, ADL_ONE, SideMode, wide_math::I256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -237,6 +237,15 @@ struct RunSummary {
     withdraw_successes: u64,
     close_attempts: u64,
     close_successes: u64,
+    /// ADL metrics
+    adl_a_reductions: u64,   // cranks where A_opp decreased (quantity socialization)
+    adl_k_changes: u64,      // cranks where K_opp changed from ADL (quote socialization)
+    min_a_long: u128,
+    min_a_short: u128,
+    final_a_long: u128,
+    final_a_short: u128,
+    drain_only_entered: bool,
+    epoch_resets: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -336,6 +345,15 @@ struct ScenarioSummary {
     withdraw_successes_mean: f64,
     close_attempts_mean: f64,
     close_successes_mean: f64,
+    /// ADL aggregate metrics
+    adl_a_reductions_mean: f64,
+    adl_a_reductions_p99: f64,
+    adl_k_changes_mean: f64,
+    min_a_long_p01: f64,
+    min_a_short_p01: f64,
+    drain_only_frac: f64,
+    epoch_reset_frac: f64,
+    epoch_resets_mean: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -722,6 +740,14 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut withdraw_successes: u64 = 0;
     let mut close_attempts: u64 = 0;
     let mut close_successes: u64 = 0;
+    let mut adl_a_reductions: u64 = 0;
+    let mut adl_k_changes: u64 = 0;
+    let mut min_a_long: u128 = ADL_ONE;
+    let mut min_a_short: u128 = ADL_ONE;
+    let mut drain_only_entered = false;
+    let mut epoch_resets: u64 = 0;
+    let mut prev_epoch_long = engine.adl_epoch_long;
+    let mut prev_epoch_short = engine.adl_epoch_short;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
     let crank_every = cfg.crank_interval.max(1);
@@ -732,12 +758,40 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
         // Only crank every N slots to simulate keeper lag
         if slot_offset % crank_every == 0 {
+            // Capture pre-crank ADL state
+            let pre_a_long = engine.adl_mult_long;
+            let pre_a_short = engine.adl_mult_short;
+            let pre_k_long = engine.adl_coeff_long;
+            let pre_k_short = engine.adl_coeff_short;
+
             let _ = engine.keeper_crank(
                 lp_idx,
                 slot,
                 oracle,
                 cfg.funding_rate_bps_per_slot,
             );
+
+            // Track ADL events: A decreased = quantity socialization
+            if engine.adl_mult_long < pre_a_long || engine.adl_mult_short < pre_a_short {
+                adl_a_reductions += 1;
+            }
+            // K changed from ADL (coincident with A change or new liquidations)
+            if engine.adl_coeff_long != pre_k_long || engine.adl_coeff_short != pre_k_short {
+                adl_k_changes += 1;
+            }
+            min_a_long = min_a_long.min(engine.adl_mult_long);
+            min_a_short = min_a_short.min(engine.adl_mult_short);
+            if engine.side_mode_long == SideMode::DrainOnly || engine.side_mode_short == SideMode::DrainOnly {
+                drain_only_entered = true;
+            }
+            if engine.adl_epoch_long > prev_epoch_long {
+                epoch_resets += engine.adl_epoch_long - prev_epoch_long;
+                prev_epoch_long = engine.adl_epoch_long;
+            }
+            if engine.adl_epoch_short > prev_epoch_short {
+                epoch_resets += engine.adl_epoch_short - prev_epoch_short;
+                prev_epoch_short = engine.adl_epoch_short;
+            }
 
             // Hard invariant checks — fail fast on conservation violation
             let vault_val = engine.vault.get();
@@ -930,6 +984,14 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         withdraw_successes,
         close_attempts,
         close_successes,
+        adl_a_reductions,
+        adl_k_changes,
+        min_a_long,
+        min_a_short,
+        final_a_long: engine.adl_mult_long,
+        final_a_short: engine.adl_mult_short,
+        drain_only_entered,
+        epoch_resets,
     };
 
     (summary, snapshots)
@@ -1045,6 +1107,18 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         withdraw_successes_mean: mean(&sorted(runs.iter().map(|r| r.withdraw_successes as f64))),
         close_attempts_mean: mean(&sorted(runs.iter().map(|r| r.close_attempts as f64))),
         close_successes_mean: mean(&sorted(runs.iter().map(|r| r.close_successes as f64))),
+
+        // ADL aggregates
+        adl_a_reductions_mean: mean(&sorted(runs.iter().map(|r| r.adl_a_reductions as f64))),
+        adl_a_reductions_p99: quantile(&sorted(runs.iter().map(|r| r.adl_a_reductions as f64)), 0.99),
+        adl_k_changes_mean: mean(&sorted(runs.iter().map(|r| r.adl_k_changes as f64))),
+        min_a_long_p01: quantile(&sorted(runs.iter().map(|r| r.min_a_long as f64)), 0.01),
+        min_a_short_p01: quantile(&sorted(runs.iter().map(|r| r.min_a_short as f64)), 0.01),
+        drain_only_frac: runs.iter().filter(|r| r.drain_only_entered).count() as f64
+            / runs.len().max(1) as f64,
+        epoch_reset_frac: runs.iter().filter(|r| r.epoch_resets > 0).count() as f64
+            / runs.len().max(1) as f64,
+        epoch_resets_mean: mean(&sorted(runs.iter().map(|r| r.epoch_resets as f64))),
     }
 }
 
@@ -1076,11 +1150,12 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
          users_liquidated,users_with_positions,insurance_end,c_tot_end,pnl_pos_tot_end,\
          h_zero_slots,h_zero_first_slot,h_below_50_slots,h_below_10_slots,\
          min_true_h,min_residual,\
-         withdraw_attempts,withdraw_successes,close_attempts,close_successes\n",
+         withdraw_attempts,withdraw_successes,close_attempts,close_successes,\
+         adl_a_reductions,adl_k_changes,min_a_long,min_a_short,epoch_resets\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
@@ -1102,6 +1177,11 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             r.withdraw_successes,
             r.close_attempts,
             r.close_successes,
+            r.adl_a_reductions,
+            r.adl_k_changes,
+            r.min_a_long,
+            r.min_a_short,
+            r.epoch_resets,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
@@ -1148,6 +1228,115 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
     );
 
     summary
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADL scenario presets
+// ════════════════════════════════════════════════════════════════════════════
+
+fn apply_scenario_preset(cfg: &mut Config, name: &str) {
+    match name {
+        // Scenario 1: Basic ADL trigger — fast crash + high leverage + no insurance + crank lag
+        // Goal: produce bankrupt liquidations with D > 0, exercising enqueue_adl
+        "adl_trigger" => {
+            cfg.im_bps = 250;              // 2.5% IM → 40x max leverage
+            cfg.mm_bps = 125;              // 1.25% MM
+            cfg.crash_pct_bps = 6000;      // 60% crash
+            cfg.crash_len = 10;            // fast
+            cfg.crank_interval = 5;        // keeper lag
+            cfg.insurance_topup_usdc = 0;  // no insurance cushion
+            cfg.long_bias = 0.95;          // nearly all longs
+            cfg.lp_capital_usdc = 10_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 0;        // no bounce
+            cfg.trading_fee_bps = 0;       // simplify
+            cfg.liquidation_fee_bps = 0;
+        }
+        // Scenario 2: A-multiplier decay — many sequential bankruptcies grinding A_opp down
+        // Goal: observe A_short shrinking across multiple cranks as longs go bankrupt
+        "adl_a_decay" => {
+            cfg.im_bps = 200;              // 2% → 50x max
+            cfg.mm_bps = 100;
+            cfg.crash_pct_bps = 7000;      // 70% crash
+            cfg.crash_len = 30;            // slower = more sequential liquidation batches
+            cfg.crank_interval = 2;
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.90;
+            cfg.n_users = 3000;
+            cfg.total_slots = 400;
+            cfg.bounce_pct_bps = 0;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+        }
+        // Scenario 3: K-index deficit socialization — verify quote losses via K
+        // Goal: D > 0 writes negative delta into K_opp; opposing accounts absorb loss on touch
+        "adl_k_deficit" => {
+            cfg.im_bps = 300;
+            cfg.mm_bps = 150;
+            cfg.crash_pct_bps = 5000;      // 50% crash
+            cfg.crash_len = 15;
+            cfg.crank_interval = 3;
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.85;
+            cfg.total_slots = 300;
+            cfg.warmup_slots = 100;
+            cfg.bounce_pct_bps = 0;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+        }
+        // Scenario 4: DrainOnly / epoch reset — grind A below MIN_A_SIDE
+        // Goal: enough sequential ADL events to exhaust A precision → DrainOnly → reset
+        "adl_drain_reset" => {
+            cfg.im_bps = 150;              // 1.5% → 66x max
+            cfg.mm_bps = 75;
+            cfg.crash_pct_bps = 8000;      // 80% crash
+            cfg.crash_len = 8;             // very fast
+            cfg.crank_interval = 10;       // very laggy
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.98;          // nearly all longs
+            cfg.n_users = 500;             // fewer users = A shrinks faster per event
+            cfg.lp_capital_usdc = 5_000_000;
+            cfg.total_slots = 300;
+            cfg.bounce_pct_bps = 0;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+        }
+        // Scenario 5: Stale account settlement — accounts untouched during ADL
+        // Goal: verify lazy A/K settlement is correct when accounts finally touch
+        "adl_stale" => {
+            cfg.im_bps = 250;
+            cfg.mm_bps = 125;
+            cfg.crash_pct_bps = 6000;
+            cfg.crash_len = 10;
+            cfg.crank_interval = 5;
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.95;
+            cfg.lp_capital_usdc = 10_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 2000;     // bounce after crash — surviving accounts touch post-ADL
+            cfg.bounce_len = 60;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+        }
+        // Scenario 6: Cascading bankruptcies — massive crash + crank lag = many bankrupt per crank
+        // Goal: multiple cranks each process batches of bankrupt liquidations, calling enqueue_adl
+        "adl_cascade" => {
+            cfg.im_bps = 200;
+            cfg.mm_bps = 100;
+            cfg.crash_pct_bps = 7000;      // 70% crash
+            cfg.crash_len = 15;            // moderate speed
+            cfg.crank_interval = 5;        // moderate lag
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.95;          // mostly longs but some shorts to absorb ADL
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 5_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 0;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+        }
+        _ => eprintln!("unknown scenario: {}", name),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1225,6 +1414,7 @@ fn parse_args() -> Config {
             "grid_insurance" => {
                 cfg.grid_insurance = val.split(',').map(|s| s.parse().unwrap()).collect()
             }
+            "scenario" => apply_scenario_preset(&mut cfg, val),
             _ => eprintln!("unknown arg: --{}", key),
         }
     }
