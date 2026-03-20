@@ -145,6 +145,15 @@ struct Config {
     grid_warmup_slots: Vec<u64>,
     grid_insurance: Vec<u64>,
 
+    // Candidate ordering: "all", "deficit", "adversarial"
+    candidate_ordering: String,
+
+    // Min liquidation abs (atomic USDC; 1 = effectively disabled)
+    min_liquidation_abs: u128,
+
+    // Dynamic funding: (slot_offset, rate_bps) pairs applied during crash
+    funding_schedule: Vec<(u64, i64)>,
+
     // Output
     out_dir: String,
     snapshots: bool,
@@ -190,6 +199,9 @@ impl Default for Config {
             grid_crash_pcts: vec![],
             grid_warmup_slots: vec![],
             grid_insurance: vec![],
+            candidate_ordering: "all".into(),
+            min_liquidation_abs: 1,
+            funding_schedule: vec![],
             out_dir: "stress_out".into(),
             snapshots: true,
         }
@@ -548,6 +560,30 @@ fn deficit_ordered_candidates(engine: &RiskEngine) -> Vec<u16> {
     candidates.into_iter().map(|(idx, _)| idx).collect()
 }
 
+/// Adversarial keeper ordering: most profitable accounts first (opposite of honest).
+/// Profitable longs get touched and settle K before liquidations push K negative.
+fn adversarial_ordered_candidates(engine: &RiskEngine) -> Vec<u16> {
+    let mut candidates: Vec<(u16, i128)> = (0..4096u16)
+        .filter(|&i| engine.is_used(i as usize))
+        .map(|i| {
+            let acct = &engine.accounts[i as usize];
+            let equity = acct.capital.get() as i128 + acct.pnl;
+            (i, equity)
+        })
+        .collect();
+    candidates.sort_by_key(|&(_, eq)| std::cmp::Reverse(eq));
+    candidates.into_iter().map(|(idx, _)| idx).collect()
+}
+
+/// Build candidate list based on config ordering mode
+fn build_candidates(engine: &RiskEngine, ordering: &str) -> Vec<u16> {
+    match ordering {
+        "deficit" => deficit_ordered_candidates(engine),
+        "adversarial" => adversarial_ordered_candidates(engine),
+        _ => all_accounts(engine),
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Single simulation run
 // ════════════════════════════════════════════════════════════════════════════
@@ -577,7 +613,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         liquidation_fee_bps: cfg.liquidation_fee_bps,
         liquidation_fee_cap: U128::new(usdc(50_000)),
         liquidation_buffer_bps: cfg.liquidation_buffer_bps,
-        min_liquidation_abs: U128::new(1),
+        min_liquidation_abs: U128::new(cfg.min_liquidation_abs),
         min_initial_deposit: U128::new(0),
     };
 
@@ -788,10 +824,16 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let pre_k_short = engine.adl_coeff_short;
 
             // Set funding rate before crank (spec §5.5 anti-retroactivity)
-            if cfg.funding_rate_bps_per_slot != 0 {
+            if !cfg.funding_schedule.is_empty() {
+                let mut rate = 0i64;
+                for &(trigger_slot, r) in &cfg.funding_schedule {
+                    if slot_offset >= trigger_slot { rate = r; }
+                }
+                engine.set_funding_rate_for_next_interval(rate);
+            } else if cfg.funding_rate_bps_per_slot != 0 {
                 engine.set_funding_rate_for_next_interval(cfg.funding_rate_bps_per_slot);
             }
-            let candidates = all_accounts(&engine);
+            let candidates = build_candidates(&engine, &cfg.candidate_ordering);
             let _ = engine.keeper_crank(slot, oracle, &candidates, 4096);
 
             // Track ADL events: A decreased = quantity socialization
@@ -912,10 +954,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Final crank to settle all state (especially important with crank lag) ──
     let final_slot = crash_start + cfg.total_slots;
     let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
-    if cfg.funding_rate_bps_per_slot != 0 {
-        engine.set_funding_rate_for_next_interval(cfg.funding_rate_bps_per_slot);
-    }
-    let candidates = all_accounts(&engine);
+    let candidates = build_candidates(&engine, &cfg.candidate_ordering);
     let _ = engine.keeper_crank(final_slot, final_oracle, &candidates, 4096);
     {
         let vault_val = engine.vault.get();
@@ -1359,6 +1398,82 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.trading_fee_bps = 0;
             cfg.liquidation_fee_bps = 0;
         }
+        // Adversarial keeper ordering — touch profitable longs first, liquidate last
+        "adversarial_keeper" => {
+            cfg.im_bps = 250;
+            cfg.mm_bps = 125;
+            cfg.crash_pct_bps = 5000;
+            cfg.crash_len = 20;
+            cfg.crank_interval = 3;
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.85;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 10_000_000;
+            cfg.total_slots = 300;
+            cfg.bounce_pct_bps = 1000;
+            cfg.bounce_len = 60;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+            cfg.candidate_ordering = "adversarial".into();
+        }
+        // Funding rate dynamics — anti-retroactivity with rate flips
+        "funding_dynamics" => {
+            cfg.im_bps = 500;
+            cfg.mm_bps = 250;
+            cfg.crash_pct_bps = 2000;
+            cfg.crash_len = 50;
+            cfg.crank_interval = 10;
+            cfg.insurance_topup_usdc = 5_000_000;
+            cfg.long_bias = 0.5;
+            cfg.n_users = 1000;
+            cfg.lp_capital_usdc = 20_000_000;
+            cfg.total_slots = 400;
+            cfg.bounce_pct_bps = 1000;
+            cfg.bounce_len = 100;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+            cfg.funding_schedule = vec![
+                (0, 5000),     // longs pay shorts
+                (100, -5000),  // rate reversal
+                (200, 0),      // funding stops
+            ];
+        }
+        // Dust close / GC behavior with realistic min_liquidation_abs
+        "dust_gc" => {
+            cfg.im_bps = 1000;
+            cfg.mm_bps = 500;
+            cfg.crash_pct_bps = 4000;
+            cfg.crash_len = 30;
+            cfg.crank_interval = 2;
+            cfg.insurance_topup_usdc = 1_000_000;
+            cfg.long_bias = 0.7;
+            cfg.n_users = 3000;
+            cfg.lp_capital_usdc = 20_000_000;
+            cfg.total_slots = 300;
+            cfg.bounce_pct_bps = 500;
+            cfg.bounce_len = 60;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 100;
+            cfg.min_liquidation_abs = 10_000_000; // $10 min
+            cfg.maintenance_fee_per_slot = 100;
+        }
+        // Adversarial keeper + ADL cascade (worst case for fairness)
+        "adversarial_adl_cascade" => {
+            cfg.im_bps = 200;
+            cfg.mm_bps = 100;
+            cfg.crash_pct_bps = 7000;
+            cfg.crash_len = 15;
+            cfg.crank_interval = 5;
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.95;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 5_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 0;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+            cfg.candidate_ordering = "adversarial".into();
+        }
         _ => eprintln!("unknown scenario: {}", name),
     }
 }
@@ -1439,6 +1554,8 @@ fn parse_args() -> Config {
                 cfg.grid_insurance = val.split(',').map(|s| s.parse().unwrap()).collect()
             }
             "scenario" => apply_scenario_preset(&mut cfg, val),
+            "candidate_ordering" => cfg.candidate_ordering = val.to_string(),
+            "min_liquidation_abs" => cfg.min_liquidation_abs = val.parse().unwrap(),
             _ => eprintln!("unknown arg: --{}", key),
         }
     }
