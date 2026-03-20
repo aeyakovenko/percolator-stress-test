@@ -2394,6 +2394,294 @@ fn test_zombie_haircut() {
     println!("  SOLVENCY: PASS");
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Audit issue tests (commit 640055a remaining issues)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn make_test_engine() -> (Box<RiskEngine>, u16) {
+    let oracle = price_e6(60_000);
+    let params = RiskParams {
+        warmup_period_slots: 600,
+        maintenance_margin_bps: 500,
+        initial_margin_bps: 1000,
+        trading_fee_bps: 100, // 1% trading fee
+        max_accounts: 4096,
+        new_account_fee: U128::new(0),
+        maintenance_fee_per_slot: U128::new(100),
+        max_crank_staleness_slots: u64::MAX,
+        liquidation_fee_bps: 50,
+        liquidation_fee_cap: U128::new(usdc(50_000)),
+        liquidation_buffer_bps: 100,
+        min_liquidation_abs: U128::new(1),
+        min_initial_deposit: U128::new(0),
+    };
+    let mut engine = new_engine(params);
+    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    engine.deposit(lp, usdc(50_000_000), oracle, 0).unwrap();
+    let cands = all_accounts(&engine);
+    let _ = engine.keeper_crank(0, oracle, &cands, 4096);
+    (engine, lp)
+}
+
+/// Issue 1: Trading fee charged only to account a, not both a and b.
+/// Spec §10.5 step 28 says both accounts should be charged.
+/// This test detects the asymmetry: a's capital drops by fee, b's doesn't.
+fn test_fee_asymmetry() {
+    let oracle = price_e6(60_000);
+    let (mut engine, lp) = make_test_engine();
+
+    let user_a = engine.add_user(0).unwrap();
+    engine.deposit(user_a, usdc(1_000_000), oracle, 0).unwrap();
+    let user_b = engine.add_user(0).unwrap();
+    engine.deposit(user_b, usdc(1_000_000), oracle, 0).unwrap();
+
+    let cands = all_accounts(&engine);
+    for s in 1..=64 { let _ = engine.keeper_crank(s, oracle, &cands, 4096); }
+
+    let cap_a_pre = engine.accounts[user_a as usize].capital.get();
+    let cap_b_pre = engine.accounts[user_b as usize].capital.get();
+    let ins_pre = engine.insurance_fund.balance.get();
+
+    // Trade: a buys from b. size_q > 0 means a gets +size, b gets -size.
+    let size_q = (usdc(500_000) * POS_SCALE / oracle as u128) as i128;
+    engine.execute_trade(user_a, user_b, oracle, 64, size_q, oracle).unwrap();
+
+    let cap_a_post = engine.accounts[user_a as usize].capital.get();
+    let cap_b_post = engine.accounts[user_b as usize].capital.get();
+    let ins_post = engine.insurance_fund.balance.get();
+    let fee_charged_a = cap_a_pre - cap_a_post;
+    let fee_charged_b = cap_b_pre - cap_b_post;
+    let fee_to_insurance = ins_post - ins_pre;
+
+    println!("=== ISSUE 1: Trading Fee Asymmetry ===");
+    println!("  trading_fee_bps = 100 (1%)");
+    println!("  trade notional  = ~$500K");
+    println!("  expected fee/side = ~$5K");
+    println!("  fee charged to a = ${:.0}", fee_charged_a as f64 / 1e6);
+    println!("  fee charged to b = ${:.0}", fee_charged_b as f64 / 1e6);
+    println!("  fee to insurance = ${:.0}", fee_to_insurance as f64 / 1e6);
+    if fee_charged_b == 0 {
+        println!("  BUG CONFIRMED: account b was NOT charged trading fee");
+        println!("  Insurance received ${:.0} (should be ~$10K if both charged)", fee_to_insurance as f64 / 1e6);
+    } else {
+        println!("  OK: both accounts charged");
+    }
+}
+
+/// Issue 2: close_account forgives fee debt while returning capital.
+/// Create an account with maintenance fee debt, then close it.
+/// Check if fee_credits < 0 is forgiven before capital returned.
+fn test_close_account_fee_forgiveness() {
+    let oracle = price_e6(60_000);
+    let (mut engine, lp) = make_test_engine();
+
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, usdc(100_000), oracle, 0).unwrap();
+
+    let cands = all_accounts(&engine);
+    for s in 1..=64 { let _ = engine.keeper_crank(s, oracle, &cands, 4096); }
+
+    // Open a position
+    let size_q = (usdc(200_000) * POS_SCALE / oracle as u128) as i128;
+    engine.execute_trade(user, lp, oracle, 64, size_q, oracle).unwrap();
+
+    // Crank for many slots to accumulate maintenance fee debt
+    for s in 65..=1000 {
+        let cands = all_accounts(&engine);
+        let _ = engine.keeper_crank(s, oracle, &cands, 4096);
+    }
+
+    // Close the position (sell back to LP)
+    let pos = engine.accounts[user as usize].position_basis_q;
+    if pos != 0 {
+        let _ = engine.execute_trade(user, lp, oracle, 1000, -pos, oracle);
+    }
+
+    let cands = all_accounts(&engine);
+    for s in 1001..=1010 { let _ = engine.keeper_crank(s, oracle, &cands, 4096); }
+
+    let fee_credits_pre = engine.accounts[user as usize].fee_credits.get();
+    let capital_pre = engine.accounts[user as usize].capital.get();
+    let pnl_pre = engine.accounts[user as usize].pnl;
+    let pos_pre = engine.accounts[user as usize].position_basis_q;
+
+    println!("\n=== ISSUE 2: close_account Fee Forgiveness ===");
+    println!("  Before close_account:");
+    println!("    capital      = ${:.0}", capital_pre as f64 / 1e6);
+    println!("    pnl          = ${:.0}", pnl_pre as f64 / 1e6);
+    println!("    fee_credits  = {}", fee_credits_pre);
+    println!("    position     = {}", pos_pre);
+
+    match engine.close_account(user, 1011, oracle) {
+        Ok(refund) => {
+            println!("  close_account returned ${:.0}", refund as f64 / 1e6);
+            if fee_credits_pre < 0 && refund > 0 {
+                let debt = (-fee_credits_pre) as u128;
+                println!("  BUG: fee debt of {} was forgiven, ${:.0} capital returned",
+                    debt, refund as f64 / 1e6);
+                println!("  Spec says: withdraw should sweep fee debt from capital first");
+            } else if fee_credits_pre >= 0 {
+                println!("  No fee debt to forgive (fee_credits >= 0)");
+            } else {
+                println!("  OK: no capital returned with fee debt");
+            }
+        }
+        Err(e) => println!("  close_account failed: {:?} (account may have positive PnL)", e),
+    }
+}
+
+/// Issue 3: Strictly-risk-reducing exemption path.
+/// Put account below maintenance margin, then attempt a risk-reducing trade.
+/// If the I256 buffer comparison is correct, the trade should succeed iff
+/// post-trade buffer > pre-trade buffer.
+fn test_risk_reducing_exemption() {
+    let oracle = price_e6(60_000);
+    let (mut engine, lp) = make_test_engine();
+
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, usdc(100_000), oracle, 0).unwrap();
+
+    let cands = all_accounts(&engine);
+    for s in 1..=64 { let _ = engine.keeper_crank(s, oracle, &cands, 4096); }
+
+    // Open a leveraged long position
+    let size_q = (usdc(800_000) * POS_SCALE / oracle as u128) as i128; // ~8x leverage
+    engine.execute_trade(user, lp, oracle, 64, size_q, oracle).unwrap();
+
+    // Inject negative PnL to push below maintenance margin
+    let loss = -(usdc(70_000) as i128); // loses most of capital
+    engine.set_pnl(user as usize, loss);
+
+    let cap = engine.accounts[user as usize].capital.get();
+    let pnl = engine.accounts[user as usize].pnl;
+    let pos = engine.accounts[user as usize].position_basis_q;
+
+    println!("\n=== ISSUE 3: Risk-Reducing Exemption Path ===");
+    println!("  Account state (below maintenance):");
+    println!("    capital  = ${:.0}", cap as f64 / 1e6);
+    println!("    pnl      = ${:.0}", pnl as f64 / 1e6);
+    println!("    position = {} (long)", pos);
+
+    // Try a strictly risk-reducing trade: close half the position
+    let half_close = -(pos / 2);
+    println!("  Attempting risk-reducing trade: close half position (size={})", half_close);
+    match engine.execute_trade(user, lp, oracle, 64, half_close, oracle) {
+        Ok(()) => {
+            let new_pos = engine.accounts[user as usize].position_basis_q;
+            println!("  SUCCESS: position reduced {} → {}", pos, new_pos);
+            println!("  Risk-reducing exemption path exercised ✓");
+        }
+        Err(e) => {
+            println!("  REJECTED: {:?}", e);
+            println!("  (This may be correct if buffer didn't improve, or a bug in I256 comparison)");
+        }
+    }
+
+    // Try a risk-INCREASING trade (should fail)
+    let increase = size_q / 4;
+    println!("  Attempting risk-increasing trade: add to position (size={})", increase);
+    match engine.execute_trade(user, lp, oracle, 64, increase, oracle) {
+        Ok(()) => println!("  BUG: risk-increasing trade accepted while below maintenance!"),
+        Err(e) => println!("  Correctly rejected: {:?} ✓", e),
+    }
+}
+
+/// Issue 4: Full ADL pipeline integration.
+/// Execute trade → liquidation → enqueue_adl → schedule_end_of_instruction_resets
+/// → subsequent trade, with real accounts on both sides going through K-socialization.
+/// Verify OI_eff_long == OI_eff_short is maintained throughout.
+fn test_adl_pipeline_integration() {
+    let oracle = price_e6(60_000);
+    let (mut engine, lp) = make_test_engine();
+
+    // 3 longs + 3 shorts, different sizes
+    let mut longs: Vec<u16> = Vec::new();
+    let mut shorts: Vec<u16> = Vec::new();
+    for cap in [200_000, 500_000, 1_000_000] {
+        let idx = engine.add_user(0).unwrap();
+        engine.deposit(idx, usdc(cap), oracle, 0).unwrap();
+        longs.push(idx);
+    }
+    for cap in [100_000, 300_000, 600_000] {
+        let idx = engine.add_user(0).unwrap();
+        engine.deposit(idx, usdc(cap), oracle, 0).unwrap();
+        shorts.push(idx);
+    }
+
+    let cands = all_accounts(&engine);
+    for s in 1..=64 { let _ = engine.keeper_crank(s, oracle, &cands, 4096); }
+
+    // Open positions
+    let slot = 64;
+    for &idx in &longs {
+        let cap = engine.accounts[idx as usize].capital.get();
+        let size_q = (cap * 5 * POS_SCALE / oracle as u128) as i128; // 5x long
+        let _ = engine.execute_trade(idx, lp, oracle, slot, size_q, oracle);
+    }
+    for &idx in &shorts {
+        let cap = engine.accounts[idx as usize].capital.get();
+        let size_q = (cap * 8 * POS_SCALE / oracle as u128) as i128; // 8x short
+        let _ = engine.execute_trade(lp, idx, oracle, slot, size_q, oracle);
+    }
+
+    println!("\n=== ISSUE 4: Full ADL Pipeline Integration ===");
+    println!("  Initial OI_long={} OI_short={}", engine.oi_eff_long_q, engine.oi_eff_short_q);
+    assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q, "OI imbalance after setup");
+
+    // Make shorts deeply bankrupt
+    for &idx in &shorts {
+        engine.set_pnl(idx as usize, -(usdc(1_000_000) as i128));
+    }
+
+    // Crank to liquidate shorts → ADL fires → K_long changes
+    let mut oi_checks_passed = 0u32;
+    let pre_k_long = engine.adl_coeff_long;
+    let pre_a_long = engine.adl_mult_long;
+    let pre_epoch = engine.adl_epoch_long;
+
+    for s in 65..=200 {
+        let cands = deficit_ordered_candidates(&engine);
+        let _ = engine.keeper_crank(s, oracle, &cands, 4096);
+        // OI balance must hold after every crank
+        assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q,
+            "OI IMBALANCE at slot {}: long={} short={}", s, engine.oi_eff_long_q, engine.oi_eff_short_q);
+        oi_checks_passed += 1;
+    }
+
+    println!("  After liquidation cascade:");
+    println!("    liquidations  = {}", engine.lifetime_liquidations);
+    println!("    A_long: {} → {}", pre_a_long, engine.adl_mult_long);
+    println!("    K_long: {} → {}", pre_k_long, engine.adl_coeff_long);
+    println!("    epoch_long: {} → {}", pre_epoch, engine.adl_epoch_long);
+    println!("    OI_long={} OI_short={}", engine.oi_eff_long_q, engine.oi_eff_short_q);
+    println!("    OI balance checks passed: {}/136 cranks", oi_checks_passed);
+
+    // Now try a SUBSEQUENT trade on the post-ADL state
+    println!("\n  Attempting post-ADL trade...");
+    let new_user = engine.add_user(0).unwrap();
+    engine.deposit(new_user, usdc(500_000), oracle, 200).unwrap();
+    let cands = all_accounts(&engine);
+    let _ = engine.keeper_crank(201, oracle, &cands, 4096);
+
+    let new_size = (usdc(1_000_000) * POS_SCALE / oracle as u128) as i128;
+    match engine.execute_trade(new_user, lp, oracle, 201, new_size, oracle) {
+        Ok(()) => {
+            println!("    Post-ADL trade succeeded ✓");
+            assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q,
+                "OI imbalance after post-ADL trade");
+            println!("    OI balance maintained after trade ✓");
+        }
+        Err(e) => println!("    Post-ADL trade failed: {:?} (may need epoch reset first)", e),
+    }
+
+    // Solvency
+    let vault = engine.vault.get();
+    let c_tot = engine.c_tot.get();
+    let ins = engine.insurance_fund.balance.get();
+    assert!(vault >= c_tot.saturating_add(ins), "SOLVENCY VIOLATION");
+    println!("    SOLVENCY: PASS");
+}
+
 fn main() {
     if env::args().any(|a| a == "--help" || a == "-h") {
         print_usage();
@@ -2414,6 +2702,13 @@ fn main() {
     }
     if env::args().any(|a| a.starts_with("--test=adl_fuzz")) {
         test_adl_fuzz();
+        return;
+    }
+    if env::args().any(|a| a == "--test=audit") {
+        test_fee_asymmetry();
+        test_close_account_fee_forgiveness();
+        test_risk_reducing_exemption();
+        test_adl_pipeline_integration();
         return;
     }
 
