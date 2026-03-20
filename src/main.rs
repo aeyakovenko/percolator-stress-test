@@ -615,6 +615,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         liquidation_buffer_bps: cfg.liquidation_buffer_bps,
         min_liquidation_abs: U128::new(cfg.min_liquidation_abs),
         min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     };
 
     let mut engine = new_engine(params);
@@ -1614,6 +1616,8 @@ fn test_adl_fairness() {
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
         min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     };
     let mut engine = new_engine(params);
 
@@ -1807,6 +1811,8 @@ fn test_adl_saturation() {
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
         min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     };
     let mut engine = new_engine(params);
 
@@ -2008,6 +2014,8 @@ fn test_adl_fuzz() {
             liquidation_buffer_bps: rng.gen_range(50..=500),
             min_liquidation_abs: U128::new(1),
             min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
         };
         let mut engine = new_engine(params);
 
@@ -2231,6 +2239,8 @@ fn test_zombie_haircut() {
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
         min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     };
     let mut engine = new_engine(params);
 
@@ -2414,6 +2424,8 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
         min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     };
     let mut engine = new_engine(params);
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
