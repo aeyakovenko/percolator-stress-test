@@ -1476,6 +1476,80 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.liquidation_fee_bps = 0;
             cfg.candidate_ordering = "adversarial".into();
         }
+        // ── 10/10 crash scenarios (Oct 10, 2025 flash crash) ──
+        // BTC: $122K → $105K (14%) in ~40 minutes, 87% long bias
+        "ten10_btc" => {
+            cfg.p0 = 122_000;
+            cfg.crash_pct_bps = 1400;       // 14% crash
+            cfg.crash_len = 40;             // 40 slots ≈ 40 minutes
+            cfg.bounce_pct_bps = 0;         // no immediate recovery
+            cfg.bounce_len = 1;
+            cfg.total_slots = 200;          // watch for 200 minutes
+            cfg.long_bias = 0.87;           // 87% of positions were long
+            cfg.im_bps = 500;              // 5% IM (20x max leverage)
+            cfg.mm_bps = 250;              // 2.5% MM
+            cfg.n_users = 3000;            // many traders
+            cfg.lp_capital_usdc = 100_000_000; // $100M LP
+            cfg.insurance_topup_usdc = 20_000_000; // $20M insurance
+            cfg.crank_interval = 1;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+        }
+        // SOL: >40% crash, extreme altcoin drawdown
+        "ten10_sol" => {
+            cfg.p0 = 290;                   // SOL pre-crash
+            cfg.crash_pct_bps = 4000;       // 40% crash
+            cfg.crash_len = 40;
+            cfg.bounce_pct_bps = 0;
+            cfg.bounce_len = 1;
+            cfg.total_slots = 200;
+            cfg.long_bias = 0.90;
+            cfg.im_bps = 500;
+            cfg.mm_bps = 250;
+            cfg.n_users = 3000;
+            cfg.lp_capital_usdc = 50_000_000;
+            cfg.insurance_topup_usdc = 10_000_000;
+            cfg.crank_interval = 1;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+        }
+        // Altcoin armageddon: 80% crash (ATOM near-zero wick, WLD -70%)
+        "ten10_alt" => {
+            cfg.p0 = 100;
+            cfg.crash_pct_bps = 8000;       // 80% crash
+            cfg.crash_len = 30;
+            cfg.bounce_pct_bps = 2000;      // 20% dead cat bounce
+            cfg.bounce_len = 60;
+            cfg.total_slots = 200;
+            cfg.long_bias = 0.90;
+            cfg.im_bps = 500;
+            cfg.mm_bps = 250;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 20_000_000;
+            cfg.insurance_topup_usdc = 5_000_000;
+            cfg.crank_interval = 1;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+        }
+        // HL-scale: $10B liquidations, max stress, no insurance (models HL's ADL path)
+        "ten10_hl" => {
+            cfg.p0 = 122_000;
+            cfg.crash_pct_bps = 1400;
+            cfg.crash_len = 40;
+            cfg.bounce_pct_bps = 0;
+            cfg.bounce_len = 1;
+            cfg.total_slots = 200;
+            cfg.long_bias = 0.87;
+            cfg.im_bps = 300;              // 3.3% IM (30x leverage — HL offers high lev)
+            cfg.mm_bps = 150;
+            cfg.n_users = 3000;
+            cfg.lp_capital_usdc = 100_000_000;
+            cfg.insurance_topup_usdc = 0;   // no insurance — forces ADL path
+            cfg.crank_interval = 1;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+            cfg.candidate_ordering = "deficit".into(); // honest keeper
+        }
         _ => eprintln!("unknown scenario: {}", name),
     }
 }
