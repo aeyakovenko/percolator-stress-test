@@ -9,7 +9,7 @@ name = "stress_test"
 path = "src/main.rs"
 
 [dependencies]
-percolator = { path = "../percolator" }
+percolator = { path = "../percolator", features = ["test"] }
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"

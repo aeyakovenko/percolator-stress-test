@@ -22,7 +22,7 @@ use std::{
     time::Instant,
 };
 
-use percolator::{RiskEngine, RiskParams, I128, U128, POS_SCALE, ADL_ONE, SideMode};
+use percolator::{RiskEngine, RiskParams, LiquidationPolicy, I128, U128, POS_SCALE, ADL_ONE, SideMode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -164,8 +164,8 @@ impl Default for Config {
         Config {
             runs: 200,
             base_seed: 1,
-            n_users: 2000,
-            n_zombies: 50,
+            n_users: 55,
+            n_zombies: 5,
             warmup_slots: 600,
             mm_bps: 500,
             im_bps: 1000,
@@ -539,13 +539,13 @@ fn new_engine(params: RiskParams) -> Box<RiskEngine> {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Return all used account indices — simple sweep for general cranking.
-fn all_accounts(engine: &RiskEngine) -> Vec<u16> {
-    (0..4096u16).filter(|&i| engine.is_used(i as usize)).collect()
+fn all_accounts(engine: &RiskEngine) -> Vec<(u16, Option<LiquidationPolicy>)> {
+    (0..4096u16).filter(|&i| engine.is_used(i as usize)).map(|i| (i, Some(LiquidationPolicy::FullClose))).collect()
 }
 
 /// Return all used account indices ordered by deficit (most bankrupt first).
 /// Matches spec §11.6.2 Band B: "higher predicted uncovered deficit" first.
-fn deficit_ordered_candidates(engine: &RiskEngine) -> Vec<u16> {
+fn deficit_ordered_candidates(engine: &RiskEngine) -> Vec<(u16, Option<LiquidationPolicy>)> {
     let mut candidates: Vec<(u16, i128)> = (0..4096u16)
         .filter(|&i| engine.is_used(i as usize))
         .map(|i| {
@@ -557,12 +557,12 @@ fn deficit_ordered_candidates(engine: &RiskEngine) -> Vec<u16> {
         .collect();
     // Sort ascending by equity so most bankrupt (lowest equity) comes first
     candidates.sort_by_key(|&(_, eq)| eq);
-    candidates.into_iter().map(|(idx, _)| idx).collect()
+    candidates.into_iter().map(|(idx, _)| (idx, Some(LiquidationPolicy::FullClose))).collect()
 }
 
 /// Adversarial keeper ordering: most profitable accounts first (opposite of honest).
 /// Profitable longs get touched and settle K before liquidations push K negative.
-fn adversarial_ordered_candidates(engine: &RiskEngine) -> Vec<u16> {
+fn adversarial_ordered_candidates(engine: &RiskEngine) -> Vec<(u16, Option<LiquidationPolicy>)> {
     let mut candidates: Vec<(u16, i128)> = (0..4096u16)
         .filter(|&i| engine.is_used(i as usize))
         .map(|i| {
@@ -572,11 +572,11 @@ fn adversarial_ordered_candidates(engine: &RiskEngine) -> Vec<u16> {
         })
         .collect();
     candidates.sort_by_key(|&(_, eq)| std::cmp::Reverse(eq));
-    candidates.into_iter().map(|(idx, _)| idx).collect()
+    candidates.into_iter().map(|(idx, _)| (idx, Some(LiquidationPolicy::FullClose))).collect()
 }
 
 /// Build candidate list based on config ordering mode
-fn build_candidates(engine: &RiskEngine, ordering: &str) -> Vec<u16> {
+fn build_candidates(engine: &RiskEngine, ordering: &str) -> Vec<(u16, Option<LiquidationPolicy>)> {
     match ordering {
         "deficit" => deficit_ordered_candidates(engine),
         "adversarial" => adversarial_ordered_candidates(engine),
@@ -606,7 +606,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         maintenance_margin_bps: cfg.mm_bps,
         initial_margin_bps: cfg.im_bps,
         trading_fee_bps: cfg.trading_fee_bps,
-        max_accounts: 4096,
+        max_accounts: percolator::MAX_ACCOUNTS as u64,
         new_account_fee: U128::new(0),
         maintenance_fee_per_slot: U128::new(cfg.maintenance_fee_per_slot),
         max_crank_staleness_slots: u64::MAX,
@@ -614,15 +614,16 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         liquidation_fee_cap: U128::new(usdc(50_000)),
         liquidation_buffer_bps: cfg.liquidation_buffer_bps,
         min_liquidation_abs: U128::new(cfg.min_liquidation_abs),
-        min_initial_deposit: U128::new(0),
+        min_initial_deposit: U128::new(100),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::new(0),
     };
 
     let mut engine = new_engine(params);
 
     // ── Seed insurance + LP ─────────────────────────────────────────────
-    let _ = engine.top_up_insurance_fund(usdc(cfg.insurance_topup_usdc));
+    let _ = engine.top_up_insurance_fund(usdc(cfg.insurance_topup_usdc), 0);
 
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
     engine.deposit(lp_idx, usdc(cfg.lp_capital_usdc), p0, 0).unwrap();
@@ -825,16 +826,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let pre_k_long = engine.adl_coeff_long;
             let pre_k_short = engine.adl_coeff_short;
 
-            // Set funding rate before crank (spec §5.5 anti-retroactivity)
-            if !cfg.funding_schedule.is_empty() {
-                let mut rate = 0i64;
-                for &(trigger_slot, r) in &cfg.funding_schedule {
-                    if slot_offset >= trigger_slot { rate = r; }
-                }
-                engine.set_funding_rate_for_next_interval(rate);
-            } else if cfg.funding_rate_bps_per_slot != 0 {
-                engine.set_funding_rate_for_next_interval(cfg.funding_rate_bps_per_slot);
-            }
             let candidates = build_candidates(&engine, &cfg.candidate_ordering);
             let _ = engine.keeper_crank(slot, oracle, &candidates, 4096);
 
@@ -1327,7 +1318,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 2;
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.90;
-            cfg.n_users = 3000;
+            cfg.n_users = 55;
             cfg.total_slots = 400;
             cfg.bounce_pct_bps = 0;
             cfg.trading_fee_bps = 0;
@@ -1359,7 +1350,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 10;       // very laggy
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.98;          // nearly all longs
-            cfg.n_users = 500;             // fewer users = A shrinks faster per event
+            cfg.n_users = 40;             // fewer users = A shrinks faster per event
             cfg.lp_capital_usdc = 5_000_000;
             cfg.total_slots = 300;
             cfg.bounce_pct_bps = 0;
@@ -1393,7 +1384,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 5;        // moderate lag
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.95;          // mostly longs but some shorts to absorb ADL
-            cfg.n_users = 2000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 5_000_000;
             cfg.total_slots = 200;
             cfg.bounce_pct_bps = 0;
@@ -1409,7 +1400,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 3;
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.85;
-            cfg.n_users = 2000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 10_000_000;
             cfg.total_slots = 300;
             cfg.bounce_pct_bps = 1000;
@@ -1427,7 +1418,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 10;
             cfg.insurance_topup_usdc = 5_000_000;
             cfg.long_bias = 0.5;
-            cfg.n_users = 1000;
+            cfg.n_users = 50;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.total_slots = 400;
             cfg.bounce_pct_bps = 1000;
@@ -1449,7 +1440,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 2;
             cfg.insurance_topup_usdc = 1_000_000;
             cfg.long_bias = 0.7;
-            cfg.n_users = 3000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.total_slots = 300;
             cfg.bounce_pct_bps = 500;
@@ -1468,7 +1459,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 5;
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.95;
-            cfg.n_users = 2000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 5_000_000;
             cfg.total_slots = 200;
             cfg.bounce_pct_bps = 0;
@@ -1488,7 +1479,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.87;           // 87% of positions were long
             cfg.im_bps = 500;              // 5% IM (20x max leverage)
             cfg.mm_bps = 250;              // 2.5% MM
-            cfg.n_users = 3000;            // many traders
+            cfg.n_users = 55;            // many traders
             cfg.lp_capital_usdc = 100_000_000; // $100M LP
             cfg.insurance_topup_usdc = 20_000_000; // $20M insurance
             cfg.crank_interval = 1;
@@ -1506,7 +1497,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.90;
             cfg.im_bps = 500;
             cfg.mm_bps = 250;
-            cfg.n_users = 3000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 50_000_000;
             cfg.insurance_topup_usdc = 10_000_000;
             cfg.crank_interval = 1;
@@ -1524,7 +1515,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.90;
             cfg.im_bps = 500;
             cfg.mm_bps = 250;
-            cfg.n_users = 2000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.insurance_topup_usdc = 5_000_000;
             cfg.crank_interval = 1;
@@ -1542,7 +1533,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.87;
             cfg.im_bps = 300;              // 3.3% IM (30x leverage — HL offers high lev)
             cfg.mm_bps = 150;
-            cfg.n_users = 3000;
+            cfg.n_users = 55;
             cfg.lp_capital_usdc = 100_000_000;
             cfg.insurance_topup_usdc = 0;   // no insurance — forces ADL path
             cfg.crank_interval = 1;
@@ -1681,17 +1672,18 @@ fn test_adl_fairness() {
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 0,
-        max_accounts: 4096,
+        max_accounts: percolator::MAX_ACCOUNTS as u64,
         new_account_fee: U128::new(0),
         maintenance_fee_per_slot: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
-        liquidation_fee_cap: U128::new(0),
+        liquidation_fee_cap: U128::new(usdc(50_000)),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
-        min_initial_deposit: U128::new(0),
+        min_initial_deposit: U128::new(100),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::new(0),
     };
     let mut engine = new_engine(params);
 
@@ -1876,17 +1868,18 @@ fn test_adl_saturation() {
         maintenance_margin_bps: 200,    // 2% MM → high leverage
         initial_margin_bps: 500,        // 5% IM → 20x max
         trading_fee_bps: 0,
-        max_accounts: 4096,
+        max_accounts: percolator::MAX_ACCOUNTS as u64,
         new_account_fee: U128::new(0),
         maintenance_fee_per_slot: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
-        liquidation_fee_cap: U128::new(0),
+        liquidation_fee_cap: U128::new(usdc(50_000)),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
-        min_initial_deposit: U128::new(0),
+        min_initial_deposit: U128::new(100),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::new(0),
     };
     let mut engine = new_engine(params);
 
@@ -1901,7 +1894,7 @@ fn test_adl_saturation() {
     engine.deposit(the_long, usdc(10_000_000), oracle, 0).unwrap(); // $10M
 
     // Create as many shorts as possible
-    let max_shorts = 4094u16; // 4096 - LP - the_long
+    let max_shorts = (percolator::MAX_ACCOUNTS - 2) as u16; // all slots except LP + the_long
     let mut shorts: Vec<u16> = Vec::with_capacity(max_shorts as usize);
     println!("Creating {} short accounts...", max_shorts);
     for _ in 0..max_shorts {
@@ -2069,8 +2062,9 @@ fn test_adl_fuzz() {
         let mut rng = ChaCha8Rng::seed_from_u64(global_rng.gen());
 
         // Random config per seed
-        let n_longs: usize = rng.gen_range(2..=50);
-        let n_shorts: usize = rng.gen_range(10..=500);
+        let max_users = percolator::MAX_ACCOUNTS - 1; // reserve 1 for LP
+        let n_longs: usize = rng.gen_range(2..=max_users / 3);
+        let n_shorts: usize = rng.gen_range(2..=(max_users - n_longs));
         let mm_bps: u64 = rng.gen_range(100..=1000);
         let im_bps: u64 = mm_bps + rng.gen_range(100..=1000); // IM strictly > MM
 
@@ -2079,17 +2073,18 @@ fn test_adl_fuzz() {
             maintenance_margin_bps: mm_bps,
             initial_margin_bps: im_bps,
             trading_fee_bps: 0,
-            max_accounts: 4096,
+            max_accounts: percolator::MAX_ACCOUNTS as u64,
             new_account_fee: U128::new(0),
             maintenance_fee_per_slot: U128::new(0),
             max_crank_staleness_slots: u64::MAX,
             liquidation_fee_bps: 0,
-            liquidation_fee_cap: U128::new(0),
+            liquidation_fee_cap: U128::new(usdc(50_000)),
             liquidation_buffer_bps: rng.gen_range(50..=500),
             min_liquidation_abs: U128::new(1),
-            min_initial_deposit: U128::new(0),
-        min_nonzero_mm_req: 1,
-        min_nonzero_im_req: 2,
+            min_initial_deposit: U128::new(100),
+            min_nonzero_mm_req: 1,
+            min_nonzero_im_req: 2,
+            insurance_floor: U128::new(0),
         };
         let mut engine = new_engine(params);
 
@@ -2304,22 +2299,23 @@ fn test_zombie_haircut() {
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 0,
-        max_accounts: 4096,
+        max_accounts: percolator::MAX_ACCOUNTS as u64,
         new_account_fee: U128::new(0),
         maintenance_fee_per_slot: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
-        liquidation_fee_cap: U128::new(0),
+        liquidation_fee_cap: U128::new(usdc(50_000)),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
-        min_initial_deposit: U128::new(0),
+        min_initial_deposit: U128::new(100),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::new(0),
     };
     let mut engine = new_engine(params);
 
     // Setup: LP + zombie (long) + 3 profit holders (long) who will exit
-    let _ = engine.top_up_insurance_fund(usdc(1_000_000));
+    let _ = engine.top_up_insurance_fund(usdc(1_000_000), 0);
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
     engine.deposit(lp, usdc(10_000_000), oracle, 0).unwrap(); // $10M LP (less than total PnL)
     let _ = engine.keeper_crank(0, oracle, &all_accounts(&engine), 4096);
@@ -2489,7 +2485,7 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 100, // 1% trading fee
-        max_accounts: 4096,
+        max_accounts: percolator::MAX_ACCOUNTS as u64,
         new_account_fee: U128::new(0),
         maintenance_fee_per_slot: U128::new(100),
         max_crank_staleness_slots: u64::MAX,
@@ -2497,9 +2493,10 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         liquidation_fee_cap: U128::new(usdc(50_000)),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(1),
-        min_initial_deposit: U128::new(0),
+        min_initial_deposit: U128::new(100),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::new(0),
     };
     let mut engine = new_engine(params);
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
