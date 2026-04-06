@@ -621,7 +621,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         insurance_floor: U128::new(0),
     };
 
-    let mut engine = new_engine(params);
+    let mut engine = new_engine_with(params, 0, p0);
 
     // ── Seed insurance + LP ─────────────────────────────────────────────
     let _ = engine.top_up_insurance_fund(usdc(cfg.insurance_topup_usdc), 0);
@@ -715,44 +715,33 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         let pos_q = notional_atomic
             .saturating_mul(POS_SCALE)
             .checked_div(p0 as u128)
-            .unwrap_or(POS_SCALE)
-            .max(POS_SCALE);
+            .unwrap_or(1)
+            .max(1);
 
         let sign: i128 = if long { 1 } else { -1 };
 
-        // Retry with halved size on failure.
-        // Snapshot/restore models Solana TX atomicity: execute_trade mutates
-        // state (funding, mark settlement, maintenance fees) before the final
-        // margin check. On-chain, Err reverts everything; we must do the same.
+        // Try at target leverage, then at 90% of max IM-safe leverage.
+        // Snapshot/restore models Solana TX atomicity.
         let snapshot = engine.clone();
-        let mut q = pos_q;
+        let attempts = [pos_q, {
+            let safe_notional = (cap_f * (max_lev * 0.9) * util) as u128;
+            safe_notional.saturating_mul(POS_SCALE).checked_div(p0 as u128).unwrap_or(1).max(1)
+        }];
         let mut ok = false;
-        for _ in 0..5 {
-            let size_q = if sign > 0 {
-                q as i128
-            } else {
-                -(q as i128)
-            };
+        for &q in &attempts {
+            let size_q = (q as i128) * sign;
             let raw_size = (q / POS_SCALE) as i128 * sign;
             let ep = matcher.exec_price(p0, raw_size);
-            if engine
-                .execute_trade_not_atomic(lp_idx, user.idx, p0, trade_slot, size_q, ep, 0)
-                .is_ok()
-            {
-                user.had_position = true;
-                ok = true;
-                break;
-            }
-            // Restore between each retry — failed attempt mutated state
-            *engine = snapshot.as_ref().clone();
-            q /= 2;
-            if q < POS_SCALE {
-                break;
+            match engine.execute_trade_not_atomic(user.idx, lp_idx, p0, trade_slot, size_q, ep, 0) {
+                Ok(()) => { user.had_position = true; ok = true; break; }
+                Err(e) => {
+                    *engine = snapshot.as_ref().clone();
+                    // debug: uncomment to see trade failures
+                    // eprintln!("  trade user={} q={} lev={:.1} err={:?}", user.idx, q, lev, e);
+                }
             }
         }
-        if !ok {
-            *engine = *snapshot;
-        }
+        if !ok { *engine = *snapshot; }
     }
 
     // ── Post-trade sweep ────────────────────────────────────────────────
