@@ -145,6 +145,15 @@ struct Config {
     // Min liquidation abs (atomic USDC; 1 = effectively disabled)
     min_liquidation_abs: u128,
 
+    // Funding rate schedule: (slot_offset, rate_bps_per_slot) pairs
+    // Applied in order during crash loop. Empty = constant 0.
+    funding_schedule: Vec<(u64, i64)>,
+
+    // Oracle manipulation: flash wick parameters
+    wick_slot: u64,       // slot offset for the wick (0 = disabled)
+    wick_pct_bps: u64,    // wick magnitude in bps (e.g. 5000 = 50% spike)
+    wick_duration: u64,   // how many slots the wick lasts before reverting
+
     // Output
     out_dir: String,
     snapshots: bool,
@@ -189,6 +198,10 @@ impl Default for Config {
             grid_warmup_slots: vec![],
             grid_insurance: vec![],
             candidate_ordering: "all".into(),
+            funding_schedule: vec![],
+            wick_slot: 0,
+            wick_pct_bps: 0,
+            wick_duration: 0,
             min_liquidation_abs: 1,
             out_dir: "stress_out".into(),
             snapshots: true,
@@ -795,7 +808,21 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
     for slot_offset in 0..cfg.total_slots {
         let slot = crash_start + slot_offset;
-        let oracle = price_path(cfg, slot_offset);
+        let mut oracle = price_path(cfg, slot_offset);
+
+        // Oracle manipulation: flash wick (spike then revert)
+        if cfg.wick_slot > 0 && slot_offset >= cfg.wick_slot
+            && slot_offset < cfg.wick_slot + cfg.wick_duration
+        {
+            let base = price_path(cfg, slot_offset);
+            oracle = (base as u128 * (10_000 + cfg.wick_pct_bps as u128) / 10_000) as u64;
+        }
+
+        // Compute funding rate from schedule
+        let mut funding_rate: i64 = 0;
+        for &(trigger_slot, rate) in &cfg.funding_schedule {
+            if slot_offset >= trigger_slot { funding_rate = rate; }
+        }
 
         // Only crank every N slots to simulate keeper lag
         if slot_offset % crank_every == 0 {
@@ -806,7 +833,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let pre_k_short = engine.adl_coeff_short;
 
             let candidates = build_candidates(&engine, &cfg.candidate_ordering);
-            let _ = engine.keeper_crank_not_atomic(slot, oracle, &candidates, 4096, 0);
+            let _ = engine.keeper_crank_not_atomic(slot, oracle, &candidates, 4096, funding_rate);
 
             // Track ADL events: A decreased = quantity socialization
             if engine.adl_mult_long < pre_a_long || engine.adl_mult_short < pre_a_short {
@@ -1375,14 +1402,15 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.candidate_ordering = "adversarial".into();
         }
         // Funding rate dynamics — anti-retroactivity with rate flips
+        // Funding rate dynamics: rate flips with long dt intervals
         "funding_dynamics" => {
             cfg.im_bps = 500;
             cfg.mm_bps = 250;
             cfg.crash_pct_bps = 2000;
             cfg.crash_len = 50;
-            cfg.crank_interval = 10;
+            cfg.crank_interval = 10; // long dt = funding accumulates between cranks
             cfg.insurance_topup_usdc = 5_000_000;
-            cfg.long_bias = 0.5;
+            cfg.long_bias = 0.5; // balanced — funding affects both sides
             cfg.n_users = 1000;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.total_slots = 400;
@@ -1390,6 +1418,88 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.bounce_len = 100;
             cfg.trading_fee_bps = 5;
             cfg.liquidation_fee_bps = 50;
+            // Rate flips: +5000 bps/slot for slots 0-99, -5000 for 100-199, 0 after
+            cfg.funding_schedule = vec![(0, 5000), (100, -5000), (200, 0)];
+        }
+        // Extreme funding: max rate (+10000 bps/slot) sustained, crushes one side
+        "funding_extreme" => {
+            cfg.im_bps = 300;
+            cfg.mm_bps = 150;
+            cfg.crash_pct_bps = 1000; // mild crash — funding is the killer
+            cfg.crash_len = 100;
+            cfg.crank_interval = 5;
+            cfg.insurance_topup_usdc = 10_000_000;
+            cfg.long_bias = 0.5;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 50_000_000;
+            cfg.total_slots = 300;
+            cfg.bounce_pct_bps = 0;
+            cfg.bounce_len = 1;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+            // Max funding rate sustained for 200 slots: longs pay shorts
+            cfg.funding_schedule = vec![(0, 10000)];
+        }
+        // Oracle flash wick: 50% spike for 3 slots then revert during crash
+        "oracle_wick" => {
+            cfg.im_bps = 500;
+            cfg.mm_bps = 250;
+            cfg.crash_pct_bps = 3000;
+            cfg.crash_len = 60;
+            cfg.crank_interval = 1;
+            cfg.insurance_topup_usdc = 10_000_000;
+            cfg.long_bias = 0.5;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 50_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 800;
+            cfg.bounce_len = 60;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+            // Flash wick: +50% spike at slot 30, lasts 3 slots
+            cfg.wick_slot = 30;
+            cfg.wick_pct_bps = 5000;
+            cfg.wick_duration = 3;
+        }
+        // Oracle wick during ADL cascade: wick + high leverage + no insurance
+        "oracle_wick_adl" => {
+            cfg.im_bps = 200;
+            cfg.mm_bps = 100;
+            cfg.crash_pct_bps = 5000;
+            cfg.crash_len = 20;
+            cfg.crank_interval = 3;
+            cfg.insurance_topup_usdc = 0;
+            cfg.long_bias = 0.9;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 20_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 0;
+            cfg.bounce_len = 1;
+            cfg.trading_fee_bps = 0;
+            cfg.liquidation_fee_bps = 0;
+            // Wick at crash bottom: +80% spike for 2 slots
+            cfg.wick_slot = 20;
+            cfg.wick_pct_bps = 8000;
+            cfg.wick_duration = 2;
+        }
+        // Funding + crash combo: max funding during crash amplifies losses
+        "funding_crash_combo" => {
+            cfg.im_bps = 300;
+            cfg.mm_bps = 150;
+            cfg.crash_pct_bps = 4000;
+            cfg.crash_len = 30;
+            cfg.crank_interval = 5;
+            cfg.insurance_topup_usdc = 5_000_000;
+            cfg.long_bias = 0.85;
+            cfg.n_users = 2000;
+            cfg.lp_capital_usdc = 30_000_000;
+            cfg.total_slots = 200;
+            cfg.bounce_pct_bps = 0;
+            cfg.bounce_len = 1;
+            cfg.trading_fee_bps = 5;
+            cfg.liquidation_fee_bps = 50;
+            // Max funding against longs during the crash
+            cfg.funding_schedule = vec![(0, 10000), (60, 0)];
         }
         // Dust close / GC behavior with realistic min_liquidation_abs
         "dust_gc" => {
