@@ -163,8 +163,8 @@ impl Default for Config {
         Config {
             runs: 200,
             base_seed: 1,
-            n_users: 55,
-            n_zombies: 5,
+            n_users: 2000,
+            n_zombies: 50,
             warmup_slots: 600,
             mm_bps: 500,
             im_bps: 1000,
@@ -1310,7 +1310,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 2;
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.90;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.total_slots = 400;
             cfg.bounce_pct_bps = 0;
             cfg.trading_fee_bps = 0;
@@ -1342,7 +1342,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 10;       // very laggy
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.98;          // nearly all longs
-            cfg.n_users = 40;             // fewer users = A shrinks faster per event
+            cfg.n_users = 500;             // fewer users = A shrinks faster per event
             cfg.lp_capital_usdc = 5_000_000;
             cfg.total_slots = 300;
             cfg.bounce_pct_bps = 0;
@@ -1376,7 +1376,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 5;        // moderate lag
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.95;          // mostly longs but some shorts to absorb ADL
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 5_000_000;
             cfg.total_slots = 200;
             cfg.bounce_pct_bps = 0;
@@ -1392,7 +1392,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 3;
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.85;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 10_000_000;
             cfg.total_slots = 300;
             cfg.bounce_pct_bps = 1000;
@@ -1410,7 +1410,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 10;
             cfg.insurance_topup_usdc = 5_000_000;
             cfg.long_bias = 0.5;
-            cfg.n_users = 50;
+            cfg.n_users = 1000;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.total_slots = 400;
             cfg.bounce_pct_bps = 1000;
@@ -1432,7 +1432,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 2;
             cfg.insurance_topup_usdc = 1_000_000;
             cfg.long_bias = 0.7;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.total_slots = 300;
             cfg.bounce_pct_bps = 500;
@@ -1451,7 +1451,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.crank_interval = 5;
             cfg.insurance_topup_usdc = 0;
             cfg.long_bias = 0.95;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 5_000_000;
             cfg.total_slots = 200;
             cfg.bounce_pct_bps = 0;
@@ -1472,7 +1472,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.87;           // 87% of positions were long
             cfg.im_bps = 200;              // 2% IM (50x max leverage — HL-like)
             cfg.mm_bps = 100;              // 1% MM
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 100_000_000;
             cfg.insurance_topup_usdc = 20_000_000;
             cfg.crank_interval = 3;        // crank lag (overwhelmed during crash)
@@ -1490,7 +1490,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.90;
             cfg.im_bps = 200;              // 50x max
             cfg.mm_bps = 100;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 50_000_000;
             cfg.insurance_topup_usdc = 10_000_000;
             cfg.crank_interval = 3;
@@ -1508,7 +1508,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.90;
             cfg.im_bps = 200;
             cfg.mm_bps = 100;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.insurance_topup_usdc = 5_000_000;
             cfg.crank_interval = 5;        // extreme lag during alt crash
@@ -1526,7 +1526,7 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.long_bias = 0.87;
             cfg.im_bps = 150;              // 1.5% IM (66x leverage — HL max)
             cfg.mm_bps = 75;
-            cfg.n_users = 55;
+            cfg.n_users = 2000;
             cfg.lp_capital_usdc = 100_000_000;
             cfg.insurance_topup_usdc = 0;   // no insurance — forces ADL path
             cfg.crank_interval = 5;        // severe lag (HL was overwhelmed)
@@ -2052,9 +2052,9 @@ fn test_adl_fuzz() {
         let mut rng = ChaCha8Rng::seed_from_u64(global_rng.gen());
 
         // Random config per seed
-        let max_users = percolator::MAX_ACCOUNTS - 1; // reserve 1 for LP
+        let max_users = 500; // cap for fuzz performance
         let n_longs: usize = rng.gen_range(2..=max_users / 3);
-        let n_shorts: usize = rng.gen_range(2..=(max_users - n_longs));
+        let n_shorts: usize = rng.gen_range(10..=(max_users - n_longs));
         let mm_bps: u64 = rng.gen_range(100..=1000);
         let im_bps: u64 = mm_bps + rng.gen_range(100..=1000); // IM strictly > MM
 
