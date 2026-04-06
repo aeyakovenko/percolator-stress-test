@@ -694,12 +694,14 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             (cfg.whale_leverage, 0.9, true)
         } else {
             let roll: f64 = rng.gen();
-            let l = if roll < 0.80 {
+            let l = if roll < 0.40 {
                 rng.gen_range(2.0..8.0f64)
-            } else if roll < 0.99 {
-                rng.gen_range(1.0..5.0f64)
+            } else if roll < 0.70 {
+                rng.gen_range(5.0..15.0f64)
+            } else if roll < 0.90 {
+                rng.gen_range(10.0..max_lev.min(30.0).max(10.1))
             } else {
-                rng.gen_range(2.0..max_lev.min(30.0).max(2.1))
+                rng.gen_range(15.0..max_lev.min(50.0).max(15.1))
             };
             let u = rng.gen_range(0.4..0.95f64);
             let dir = rng.gen::<f64>() < cfg.long_bias;
@@ -1470,38 +1472,39 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
         }
         // ── 10/10 crash scenarios (Oct 10, 2025 flash crash) ──
         // BTC: $122K → $105K (14%) in ~40 minutes, 87% long bias
+        // HL offered 50-100x leverage; users were massively overleveraged
         "ten10_btc" => {
             cfg.p0 = 122_000;
             cfg.crash_pct_bps = 1400;       // 14% crash
             cfg.crash_len = 40;             // 40 slots ≈ 40 minutes
             cfg.bounce_pct_bps = 0;         // no immediate recovery
             cfg.bounce_len = 1;
-            cfg.total_slots = 200;          // watch for 200 minutes
+            cfg.total_slots = 200;
             cfg.long_bias = 0.87;           // 87% of positions were long
-            cfg.im_bps = 500;              // 5% IM (20x max leverage)
-            cfg.mm_bps = 250;              // 2.5% MM
-            cfg.n_users = 55;            // many traders
-            cfg.lp_capital_usdc = 100_000_000; // $100M LP
-            cfg.insurance_topup_usdc = 20_000_000; // $20M insurance
-            cfg.crank_interval = 1;
+            cfg.im_bps = 200;              // 2% IM (50x max leverage — HL-like)
+            cfg.mm_bps = 100;              // 1% MM
+            cfg.n_users = 55;
+            cfg.lp_capital_usdc = 100_000_000;
+            cfg.insurance_topup_usdc = 20_000_000;
+            cfg.crank_interval = 3;        // crank lag (overwhelmed during crash)
             cfg.trading_fee_bps = 5;
             cfg.liquidation_fee_bps = 50;
         }
         // SOL: >40% crash, extreme altcoin drawdown
         "ten10_sol" => {
-            cfg.p0 = 290;                   // SOL pre-crash
+            cfg.p0 = 290;
             cfg.crash_pct_bps = 4000;       // 40% crash
             cfg.crash_len = 40;
             cfg.bounce_pct_bps = 0;
             cfg.bounce_len = 1;
             cfg.total_slots = 200;
             cfg.long_bias = 0.90;
-            cfg.im_bps = 500;
-            cfg.mm_bps = 250;
+            cfg.im_bps = 200;              // 50x max
+            cfg.mm_bps = 100;
             cfg.n_users = 55;
             cfg.lp_capital_usdc = 50_000_000;
             cfg.insurance_topup_usdc = 10_000_000;
-            cfg.crank_interval = 1;
+            cfg.crank_interval = 3;
             cfg.trading_fee_bps = 5;
             cfg.liquidation_fee_bps = 50;
         }
@@ -1514,16 +1517,16 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.bounce_len = 60;
             cfg.total_slots = 200;
             cfg.long_bias = 0.90;
-            cfg.im_bps = 500;
-            cfg.mm_bps = 250;
+            cfg.im_bps = 200;
+            cfg.mm_bps = 100;
             cfg.n_users = 55;
             cfg.lp_capital_usdc = 20_000_000;
             cfg.insurance_topup_usdc = 5_000_000;
-            cfg.crank_interval = 1;
+            cfg.crank_interval = 5;        // extreme lag during alt crash
             cfg.trading_fee_bps = 5;
             cfg.liquidation_fee_bps = 50;
         }
-        // HL-scale: $10B liquidations, max stress, no insurance (models HL's ADL path)
+        // HL-scale: max stress, no insurance (models HL's forced ADL path)
         "ten10_hl" => {
             cfg.p0 = 122_000;
             cfg.crash_pct_bps = 1400;
@@ -1532,15 +1535,15 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.bounce_len = 1;
             cfg.total_slots = 200;
             cfg.long_bias = 0.87;
-            cfg.im_bps = 300;              // 3.3% IM (30x leverage — HL offers high lev)
-            cfg.mm_bps = 150;
+            cfg.im_bps = 150;              // 1.5% IM (66x leverage — HL max)
+            cfg.mm_bps = 75;
             cfg.n_users = 55;
             cfg.lp_capital_usdc = 100_000_000;
             cfg.insurance_topup_usdc = 0;   // no insurance — forces ADL path
-            cfg.crank_interval = 1;
+            cfg.crank_interval = 5;        // severe lag (HL was overwhelmed)
             cfg.trading_fee_bps = 0;
             cfg.liquidation_fee_bps = 0;
-            cfg.candidate_ordering = "deficit".into(); // honest keeper
+            cfg.candidate_ordering = "deficit".into();
         }
         _ => eprintln!("unknown scenario: {}", name),
     }
