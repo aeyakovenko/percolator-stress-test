@@ -7,8 +7,6 @@
 //!
 //! - [FIXED] SlippageMatcher: use --slippage=N (bps) to deviate exec_price
 //!   from oracle, generating non-zero trade_pnl that exercises warmup restart.
-//! - Constant funding_rate_bps_per_slot: no anti-retroactivity testing.
-//!   Need rate changes across long dt intervals to test stored-rate semantics.
 //! - reserved_pnl always 0: pending withdrawal interactions untested.
 //! - maintenance_fee_per_slot = 0 by default: fee debt accumulation untested.
 //!   Run scenarios with non-zero maintenance_fee to exercise fee drain paths.
@@ -110,9 +108,6 @@ struct Config {
     bounce_len: u64,
     total_slots: u64,
 
-    // Funding
-    funding_rate_bps_per_slot: i64,
-
     // Zombie knobs
     zombie_pnl_usdc: u64,
     zombie_fee_debt_usdc: u64,
@@ -150,9 +145,6 @@ struct Config {
     // Min liquidation abs (atomic USDC; 1 = effectively disabled)
     min_liquidation_abs: u128,
 
-    // Dynamic funding: (slot_offset, rate_bps) pairs applied during crash
-    funding_schedule: Vec<(u64, i64)>,
-
     // Output
     out_dir: String,
     snapshots: bool,
@@ -179,7 +171,6 @@ impl Default for Config {
             bounce_pct_bps: 800,
             bounce_len: 60,
             total_slots: 600,
-            funding_rate_bps_per_slot: 0,
             zombie_pnl_usdc: 50_000,
             zombie_fee_debt_usdc: 200,
             price_path_type: "crash_bounce".into(),
@@ -199,7 +190,6 @@ impl Default for Config {
             grid_insurance: vec![],
             candidate_ordering: "all".into(),
             min_liquidation_abs: 1,
-            funding_schedule: vec![],
             out_dir: "stress_out".into(),
             snapshots: true,
         }
@@ -220,7 +210,6 @@ struct RunSummary {
     pnl_pos_tot_end: u128,
     vault_end: u128,
     liquidations: u64,
-    force_closes: u64,
     users_liquidated: usize,
     users_with_positions: usize,
     capital_ratios: Vec<f64>,
@@ -269,7 +258,6 @@ struct SlotSnapshot {
     insurance: u128,
     open_interest: u128,
     cum_liquidations: u64,
-    cum_force_closes: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -295,10 +283,6 @@ struct ScenarioSummary {
     liq_p50: f64,
     liq_p90: f64,
     liq_p99: f64,
-
-    fc_mean: f64,
-    fc_p50: f64,
-    fc_p90: f64,
 
     users_liq_frac_mean: f64,
     users_liq_frac_p90: f64,
@@ -729,10 +713,13 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         }];
         let mut ok = false;
         for &q in &attempts {
-            let size_q = (q as i128) * sign;
+            let abs_size = q as i128; // size_q must be positive
             let raw_size = (q / POS_SCALE) as i128 * sign;
             let ep = matcher.exec_price(p0, raw_size);
-            match engine.execute_trade_not_atomic(user.idx, lp_idx, p0, trade_slot, size_q, ep, 0) {
+            // For longs: (user, lp, +size) → user gets +size (long)
+            // For shorts: (lp, user, +size) → user gets -size (short)
+            let (a, b) = if long { (user.idx, lp_idx) } else { (lp_idx, user.idx) };
+            match engine.execute_trade_not_atomic(a, b, p0, trade_slot, abs_size, ep, 0) {
                 Ok(()) => { user.had_position = true; ok = true; break; }
                 Err(e) => {
                     *engine = snapshot.as_ref().clone();
@@ -867,7 +854,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                     if !user.had_position { continue; }
 
                     let acct = &engine.accounts[user.idx as usize];
-                    let has_position = !acct.position_basis_q == 0;
+                    let has_position = acct.position_basis_q != 0;
 
                     if has_position {
                         // Try withdrawing 10% of capital
@@ -931,7 +918,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                 insurance: engine.insurance_fund.balance.get(),
                 open_interest: engine.oi_eff_long_q,
                 cum_liquidations: engine.lifetime_liquidations,
-                cum_force_closes: 0,
             });
         }
     }
@@ -985,13 +971,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         let prin_ratio = if init > 0.0 { capital / init } else { 0.0 };
         principal_ratios.push(prin_ratio);
 
-        // Withdrawable = capital + haircutted warmed-up PnL
-        let warmed_pnl = engine.effective_matured_pnl(user.idx as usize);
-        let haircutted_pnl = if h_den > 0 {
-            warmed_pnl.saturating_mul(h_num) / h_den
-        } else {
-            0
-        };
+        // Withdrawable = capital + effective matured PnL (already haircutted by engine)
+        let haircutted_pnl = engine.effective_matured_pnl(user.idx as usize);
         let withdrawable = acct.capital.get().saturating_add(haircutted_pnl) as f64;
         let wd_ratio = if init > 0.0 { withdrawable / init } else { 0.0 };
         withdrawable_ratios.push(wd_ratio);
@@ -1015,7 +996,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         pnl_pos_tot_end: engine.pnl_pos_tot,
         vault_end: engine.vault.get(),
         liquidations: engine.lifetime_liquidations,
-        force_closes: 0,
         users_liquidated,
         users_with_positions,
         capital_ratios,
@@ -1053,7 +1033,6 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
     let min_hs = sorted(runs.iter().map(|r| r.min_h));
     let final_hs = sorted(runs.iter().map(|r| r.final_h));
     let liqs = sorted(runs.iter().map(|r| r.liquidations as f64));
-    let fcs = sorted(runs.iter().map(|r| r.force_closes as f64));
     let liq_fracs = sorted(runs.iter().map(|r| {
         if r.users_with_positions > 0 {
             r.users_liquidated as f64 / r.users_with_positions as f64
@@ -1107,10 +1086,6 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         liq_p50: quantile(&liqs, 0.50),
         liq_p90: quantile(&liqs, 0.90),
         liq_p99: quantile(&liqs, 0.99),
-
-        fc_mean: mean(&fcs),
-        fc_p50: quantile(&fcs, 0.50),
-        fc_p90: quantile(&fcs, 0.90),
 
         users_liq_frac_mean: mean(&liq_fracs),
         users_liq_frac_p90: quantile(&liq_fracs, 0.90),
@@ -1194,7 +1169,7 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
 
     // runs.csv
     let mut csv = String::from(
-        "seed,min_h,min_h_slot,final_h,liquidations,force_closes,\
+        "seed,min_h,min_h_slot,final_h,liquidations,\
          users_liquidated,users_with_positions,insurance_end,c_tot_end,pnl_pos_tot_end,\
          h_zero_slots,h_zero_first_slot,h_below_50_slots,h_below_10_slots,\
          min_true_h,min_residual,\
@@ -1203,13 +1178,12 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
             r.final_h,
             r.liquidations,
-            r.force_closes,
             r.users_liquidated,
             r.users_with_positions,
             r.insurance_end,
@@ -1245,12 +1219,12 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
     if cfg.snapshots {
         let mut snap_csv = String::from(
             "seed,slot,oracle_price,h,c_tot,pnl_pos_tot,\
-             insurance,open_interest,cum_liquidations,cum_force_closes\n",
+             insurance,open_interest,cum_liquidations\n",
         );
         for snaps in &all_snapshots {
             for s in snaps {
                 snap_csv.push_str(&format!(
-                    "{},{},{},{:.6},{},{},{},{},{},{}\n",
+                    "{},{},{},{:.6},{},{},{},{},{}\n",
                     s.seed,
                     s.slot,
                     s.oracle_price,
@@ -1260,7 +1234,6 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
                     s.insurance,
                     s.open_interest,
                     s.cum_liquidations,
-                    s.cum_force_closes,
                 ));
             }
         }
@@ -1417,11 +1390,6 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.bounce_len = 100;
             cfg.trading_fee_bps = 5;
             cfg.liquidation_fee_bps = 50;
-            cfg.funding_schedule = vec![
-                (0, 5000),     // longs pay shorts
-                (100, -5000),  // rate reversal
-                (200, 0),      // funding stops
-            ];
         }
         // Dust close / GC behavior with realistic min_liquidation_abs
         "dust_gc" => {
@@ -1586,7 +1554,6 @@ fn parse_args() -> Config {
             "bounce_pct" => cfg.bounce_pct_bps = val.parse().unwrap(),
             "bounce_len" => cfg.bounce_len = val.parse().unwrap(),
             "total_slots" => cfg.total_slots = val.parse().unwrap(),
-            "funding_rate" => cfg.funding_rate_bps_per_slot = val.parse().unwrap(),
             "zombie_pnl" => cfg.zombie_pnl_usdc = val.parse().unwrap(),
             "zombie_fee_debt" => cfg.zombie_fee_debt_usdc = val.parse().unwrap(),
             "price_path" => cfg.price_path_type = val.to_string(),
@@ -2329,10 +2296,10 @@ fn test_zombie_haircut() {
     let ub_size_q = (usdc(1_500_000) * POS_SCALE / oracle as u128) as i128;    // 5x lev
     let uc_size_q = (usdc(2_000_000) * POS_SCALE / oracle as u128) as i128;    // 5x lev
 
-    engine.execute_trade_not_atomic(lp, zombie, oracle, slot, zombie_size_q, oracle, 0).unwrap();
-    engine.execute_trade_not_atomic(lp, user_a, oracle, slot, ua_size_q, oracle, 0).unwrap();
-    engine.execute_trade_not_atomic(lp, user_b, oracle, slot, ub_size_q, oracle, 0).unwrap();
-    engine.execute_trade_not_atomic(lp, user_c, oracle, slot, uc_size_q, oracle, 0).unwrap();
+    engine.execute_trade_not_atomic(zombie, lp, oracle, slot, zombie_size_q, oracle, 0).unwrap();
+    engine.execute_trade_not_atomic(user_a, lp, oracle, slot, ua_size_q, oracle, 0).unwrap();
+    engine.execute_trade_not_atomic(user_b, lp, oracle, slot, ub_size_q, oracle, 0).unwrap();
+    engine.execute_trade_not_atomic(user_c, lp, oracle, slot, uc_size_q, oracle, 0).unwrap();
 
     for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0); }
 
@@ -2340,7 +2307,7 @@ fn test_zombie_haircut() {
         let z = zombie as usize;
         let zpnl = engine.accounts[z].pnl;
         let zcap = engine.accounts[z].capital.get();
-        let zpos = !engine.accounts[z].position_basis_q == 0;
+        let zpos = engine.accounts[z].position_basis_q != 0;
         println!("=== {} ===", label);
         println!("  vault       = ${:.0}", engine.vault.get() as f64 / 1e6);
         println!("  c_tot       = ${:.0}", engine.c_tot.get() as f64 / 1e6);
@@ -2564,7 +2531,7 @@ fn test_close_account_fee_forgiveness() {
     // Close the position (sell back to LP)
     let pos = engine.accounts[user as usize].position_basis_q;
     if pos != 0 {
-        let _ = engine.execute_trade_not_atomic(user, lp, oracle, 1000, -pos, oracle, 0);
+        let _ = engine.execute_trade_not_atomic(lp, user, oracle, 1000, pos, oracle, 0);
     }
 
     let cands = all_accounts(&engine);
@@ -2633,9 +2600,9 @@ fn test_risk_reducing_exemption() {
     println!("    position = {} (long)", pos);
 
     // Try a strictly risk-reducing trade: close half the position
-    let half_close = -(pos / 2);
+    let half_close = pos / 2;
     println!("  Attempting risk-reducing trade: close half position (size={})", half_close);
-    match engine.execute_trade_not_atomic(user, lp, oracle, 64, half_close, oracle, 0) {
+    match engine.execute_trade_not_atomic(lp, user, oracle, 64, half_close, oracle, 0) {
         Ok(()) => {
             let new_pos = engine.accounts[user as usize].position_basis_q;
             println!("  SUCCESS: position reduced {} → {}", pos, new_pos);

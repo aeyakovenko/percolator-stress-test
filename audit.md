@@ -1,56 +1,57 @@
 # Percolator Stress Test Audit Results
 
 **Spec:** v11.26  **Engine:** production (MAX_ACCOUNTS=4096)
-**Scenarios:** 31 (31 with liquidations)  **Runs:** 6200  **Solvency violations:** 0
+**Scenarios:** 31 (all with liquidations)  **Runs:** 6200  **Solvency violations:** 0
 
 ## Summary Table
 
-| Scenario | Crash | Liqs | ADL A | Liq%% | true_h p01 | Cap p01 | deficit |
-|---|---|---|---|---|---|---|---|
-| 10_whale | 30% whale | 793 | 50.0 | 3.8%% | 1.000 | 0.090 | 0.0 |
-| 11_funding | 30% fund | 792 | 50.0 | 3.8%% | 1.000 | 0.089 | 0.0 |
-| 12_armageddon | 50% no bnce | 1574 | 54.0 | 17.6%% | 1.000 | 0.038 | 0.0 |
-| 13_skew_lag5 | 30% lag5 | 1425 | 10.0 | 18.1%% | 1.000 | 0.039 | 0.0 |
-| 14_armageddon_lag5 | stair lag5 | 1567 | 33.0 | 20.7%% | 1.000 | 0.037 | 0.0 |
-| 15_armageddon_lag20 | stair lag20 | 1567 | 9.0 | 68.8%% | 0.990 | 0.000 | 0.0 |
-| 1_baseline | 30% bounce | 792 | 50.0 | 3.8%% | 1.000 | 0.089 | 0.0 |
-| 2_flash | 40% bounce | 869 | 9.0 | 44.3%% | 1.000 | 0.000 | 0.0 |
-| 3_slowbleed | 50%/500s | 914 | 309.4 | 14.2%% | 1.000 | 0.047 | 0.0 |
-| 4_noinsurance | 30% no ins | 792 | 50.0 | 3.8%% | 1.000 | 0.089 | 0.0 |
-| 5_tinylp | 30% sm LP | 1 | 0.0 | 0.0%% | 1.000 | 0.995 | 0.0 |
-| 6_degens | 20% 2.5%IM | 585 | 55.8 | 50.0%% | 1.000 | 0.017 | 0.0 |
-| 7_skew90 | 30% 90%skew | 1425 | 50.0 | 3.8%% | 1.000 | 0.090 | 0.0 |
-| 8_staircase | 3x15% | 860 | 52.8 | 11.3%% | 1.000 | 0.063 | 0.0 |
-| 9_oracle | 20% distort | 0 | 0.0 | 0.0%% | 1.000 | 0.995 | 0.0 |
-| adl_a_decay | 70% 2%IM | 1724 | 15.0 | 93.9%% | 0.852 | 0.000 | 0.0 |
-| adl_cascade | 70% batch | 1096 | 3.0 | 95.7%% | 0.334 | 0.000 | 0.0 |
-| adl_drain_reset | 80% 1.5%IM | 447 | 1.0 | 91.2%% | 0.118 | 0.000 | 0.0 |
-| adl_k_deficit | 50% K | 1544 | 5.0 | 90.0%% | 0.710 | 0.000 | 0.0 |
-| adl_stale | 60% bnce | 1638 | 2.0 | 93.9%% | 0.309 | 0.000 | 0.0 |
-| adl_trigger | 60% no ins | 1638 | 2.0 | 93.9%% | 0.309 | 0.000 | 0.0 |
-| adversarial_adl_cascade | 70% adv | 1096 | 3.0 | 95.7%% | 0.397 | 0.000 | 0.0 |
-| adversarial_adl_cascade_honest | 70% honest | 1096 | 3.0 | 95.7%% | 0.449 | 0.000 | 0.0 |
-| adversarial_keeper | 50% adv | 1486 | 7.0 | 89.4%% | 0.781 | 0.000 | 0.0 |
-| adversarial_keeper_honest | 50% honest | 1486 | 7.0 | 89.4%% | 1.000 | 0.000 | 0.0 |
-| dust_gc | 40% GC | 1131 | 13.9 | 37.7%% | 1.000 | 0.007 | 0.0 |
-| funding_dynamics | 20% rate | 297 | 5.0 | 51.2%% | 1.000 | 0.000 | 0.0 |
-| ten10_alt | Alt 80% | 1743 | 6.0 | 96.8%% | 0.595 | 0.000 | 0.0 |
-| ten10_btc | BTC 14% | 728 | 13.0 | 41.1%% | 1.000 | 0.000 | 0.0 |
-| ten10_hl | BTC noI | 714 | 8.0 | 39.1%% | 1.000 | 0.000 | 0.0 |
-| ten10_sol | SOL 40% | 1538 | 14.0 | 85.1%% | 1.000 | 0.000 | 0.0 |
+| Scenario | Liqs | ADL A | Liq%% | true_h p01 | Ins End | deficit |
+|---|---|---|---|---|---|---|
+| 10_whale | 793 | 50.0 | 1.9%% | 1.000 | $11139B | 0.0 |
+| 11_funding | 792 | 50.0 | 1.9%% | 1.000 | $10865B | 0.0 |
+| 12_armageddon | 1626 | 54.0 | 15.8%% | 1.000 | $1607B | 0.0 |
+| 13_skew_lag5 | 1425 | 10.0 | 16.3%% | 1.000 | $11308B | 0.0 |
+| 14_armageddon_lag5 | 1618 | 33.0 | 18.6%% | 1.000 | $1602B | 0.0 |
+| 15_armageddon_lag20 | 1618 | 9.0 | 61.9%% | 0.991 | $235B | 0.0 |
+| 1_baseline | 792 | 50.0 | 1.9%% | 1.000 | $10865B | 0.0 |
+| 2_flash | 869 | 9.0 | 22.2%% | 1.000 | $10855B | 0.0 |
+| 3_slowbleed | 914 | 309.4 | 7.1%% | 1.000 | $10894B | 0.0 |
+| 4_noinsurance | 792 | 50.0 | 1.9%% | 1.000 | $865B | 0.0 |
+| 5_tinylp | 788 | 50.1 | 1.9%% | 1.000 | $10861B | 0.0 |
+| 6_degens | 585 | 55.8 | 25.0%% | 1.000 | $11159B | 0.0 |
+| 7_skew90 | 1425 | 50.0 | 3.4%% | 1.000 | $11318B | 0.0 |
+| 8_staircase | 860 | 52.8 | 5.6%% | 1.000 | $10881B | 0.0 |
+| 9_oracle | 687 | 1.0 | 30.9%% | 0.975 | $3793B | 0.0 |
+| adl_a_decay | 1724 | 15.0 | 84.6%% | 0.859 | $0 | 0.0 |
+| adl_cascade | 1339 | 3.0 | 88.9%% | 0.354 | $0 | 0.0 |
+| adl_drain_reset | 447 | 1.0 | 89.4%% | 0.121 | $0 | 0.0 |
+| adl_k_deficit | 1544 | 5.0 | 76.5%% | 0.727 | $0 | 0.0 |
+| adl_stale | 1705 | 2.0 | 88.9%% | 0.323 | $0 | 0.0 |
+| adl_trigger | 1705 | 2.0 | 88.9%% | 0.323 | $0 | 0.0 |
+| adversarial_adl_cascade | 1339 | 3.0 | 88.9%% | 0.410 | $0 | 0.0 |
+| adversarial_adl_cascade_honest | 1339 | 3.0 | 88.9%% | 0.464 | $0 | 0.0 |
+| adversarial_keeper | 1534 | 7.0 | 75.9%% | 0.801 | $0 | 0.0 |
+| adversarial_keeper_honest | 1534 | 7.0 | 75.9%% | 0.968 | $0 | 0.0 |
+| dust_gc | 1215 | 13.9 | 26.4%% | 1.000 | $2718B | 0.0 |
+| funding_dynamics | 297 | 5.0 | 25.6%% | 1.000 | $5048B | 0.0 |
+| ten10_alt | 1743 | 6.0 | 87.1%% | 0.609 | $642778 | 0.0 |
+| ten10_btc | 728 | 13.0 | 35.8%% | 1.000 | $21216B | 0.0 |
+| ten10_hl | 714 | 8.0 | 34.0%% | 0.996 | $1 | 0.0 |
+| ten10_sol | 1538 | 14.0 | 76.6%% | 1.000 | $7801B | 0.0 |
 
-## 10/10 Crash Simulation (Oct 10, 2025)
+## Loss Absorption Waterfall
 
-BTC \$122K -> \$105K (14%%), 87%% long bias, 50-66x leverage, crank lag 3-5 slots.
+```
+Bankrupt liquidation deficit D
+  1. Insurance absorbs min(D, balance - floor)  --> D_rem
+  2. K_opp shifts (deficit socialized to opposing open positions)
+  3. A_opp shrinks (position quantity reduction)
+  4. If no opposing positions: uninsured loss (residual drops, h falls)
+  5. H gates withdrawal: h = min(Residual, PNL_matured) / PNL_matured
+```
 
-| | Hyperliquid (actual) | Percolator A/K (simulation) |
-|---|---|---|
-| Mechanism | Queue ADL (sequential) | A/K proportional (O(1)) |
-| Force-closed profitable traders | \$650M (28x excess) | 0 - positions scale equally via A |
-| Liquidations | ~\$10B | 714/run (39.1% of users) |
-| ADL events | Queue overtriggered | 8.0 A-reductions/run |
-| Vault deficit | Unknown bad debt | 0.0 (zero across 200 runs) |
-| Recovery | Did not reclaim | final_h = 1.0000 |
+Insurance is senior to A/K. H is read-only (never modifies insurance).
+H subtracts insurance from vault before computing residual.
 
 ## Focused Tests
 
@@ -59,14 +60,16 @@ BTC \$122K -> \$105K (14%%), 87%% long bias, 50-66x leverage, crank lag 3-5 slot
 | adl_fairness | Loss exactly proportional to position size (1:2:4) |
 | zombie_haircut | Uniform h, overhang clears to 1.0, market clean |
 | adl_saturation | 4094 shorts bankrupt, K within i128, no overflow |
-| adl_fuzz (100 seeds) | 0.00%% fairness error, 492 max liqs/seed, 0 solvency failures |
-| audit | Bilateral fee, risk-reducing exemption, full ADL pipeline all pass |
+| adl_fuzz (100 seeds) | 0.00%% fairness error, 492 max liqs/seed |
+| audit | Bilateral fee, risk-reducing exemption, ADL pipeline pass |
 
-## Key Properties
+## Bugs Fixed in This Audit
 
-1. **Solvency**: vault >= c_tot + insurance in every crank of every run
-2. **A/K fairness**: 0.00%% error with deficit-ordered keeper
-3. **No overhang**: pnl_pos_tot returns to 0 after ADL wind-down
-4. **No overflow**: K uses <0.000001%% of i128
-5. **Protected principal**: flat accounts keep deposits
-6. **OI balance**: OI_eff_long == OI_eff_short maintained throughout
+| Bug | Severity | Impact |
+|---|---|---|
+| Trade direction reversed | Critical | Users were short when intending long |
+| Shorts never opened | Critical | long_bias was broken, all users long-only |
+| `!pos_q == 0` bitwise NOT | Critical | Withdraw/close exercise was dead code |
+| Double haircut on withdrawable | Moderate | withdrawable_ratio was h-squared |
+| Test close trades used negative size_q | Moderate | Tests silently failed |
+| Dead code: funding_schedule, force_closes | Low | Misleading config/metrics |
