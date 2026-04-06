@@ -218,6 +218,8 @@ struct RunSummary {
     seed: u64,
     min_h: f64,
     final_h: f64,
+    /// Max relative fairness error in h*PnL across accounts when h < 1
+    max_h_fairness_err: f64,
     insurance_end: u128,
     c_tot_end: u128,
     pnl_pos_tot_end: u128,
@@ -361,6 +363,8 @@ struct ScenarioSummary {
     drain_only_frac: f64,
     epoch_reset_frac: f64,
     epoch_resets_mean: f64,
+    /// Max h-fairness error across all runs (0.0 = perfect, >0.05 = concern)
+    max_h_fairness_err: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -802,6 +806,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut epoch_resets: u64 = 0;
     let mut prev_epoch_long = engine.adl_epoch_long;
     let mut prev_epoch_short = engine.adl_epoch_short;
+    let mut max_h_fairness_err: f64 = 0.0;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
     let crank_every = cfg.crank_interval.max(1);
@@ -810,12 +815,18 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         let slot = crash_start + slot_offset;
         let mut oracle = price_path(cfg, slot_offset);
 
-        // Oracle manipulation: flash wick (spike then revert)
+        // Oracle manipulation: flash wick in the harmful direction for majority side
         if cfg.wick_slot > 0 && slot_offset >= cfg.wick_slot
             && slot_offset < cfg.wick_slot + cfg.wick_duration
         {
             let base = price_path(cfg, slot_offset);
-            oracle = (base as u128 * (10_000 + cfg.wick_pct_bps as u128) / 10_000) as u64;
+            if cfg.long_bias > 0.5 {
+                // Mostly longs — wick DOWN to amplify their losses
+                oracle = (base as u128 * 10_000u128.saturating_sub(cfg.wick_pct_bps as u128) / 10_000).max(1) as u64;
+            } else {
+                // Mostly shorts — wick UP to amplify their losses
+                oracle = (base as u128 * (10_000 + cfg.wick_pct_bps as u128) / 10_000) as u64;
+            }
         }
 
         // Compute funding rate from schedule
@@ -834,6 +845,24 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
 
             let candidates = build_candidates(&engine, &cfg.candidate_ordering);
             let _ = engine.keeper_crank_not_atomic(slot, oracle, &candidates, 4096, funding_rate);
+
+            // H-fairness check: when h < 1, all accounts with positive
+            // matured PnL should get the same effective h ratio.
+            let (h_num, h_den) = engine.haircut_ratio();
+            if h_num < h_den && h_den > 0 {
+                let global_h = h_num as f64 / h_den as f64;
+                let mut max_err: f64 = 0.0;
+                for user in &users {
+                    if !user.had_position { continue; }
+                    let released = engine.released_pos(user.idx as usize);
+                    if released == 0 { continue; }
+                    let effective = engine.effective_matured_pnl(user.idx as usize);
+                    let per_account_h = effective as f64 / released as f64;
+                    let err = (per_account_h - global_h).abs() / global_h.max(1e-12);
+                    if err > max_err { max_err = err; }
+                }
+                if max_err > max_h_fairness_err { max_h_fairness_err = max_err; }
+            }
 
             // Track ADL events: A decreased = quantity socialization
             if engine.adl_mult_long < pre_a_long || engine.adl_mult_short < pre_a_short {
@@ -1047,6 +1076,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         final_a_short: engine.adl_mult_short,
         drain_only_entered,
         epoch_resets,
+        max_h_fairness_err,
     };
 
     (summary, snapshots)
@@ -1169,6 +1199,7 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         epoch_reset_frac: runs.iter().filter(|r| r.epoch_resets > 0).count() as f64
             / runs.len().max(1) as f64,
         epoch_resets_mean: mean(&sorted(runs.iter().map(|r| r.epoch_resets as f64))),
+        max_h_fairness_err: runs.iter().map(|r| r.max_h_fairness_err).fold(0.0f64, f64::max),
     }
 }
 
@@ -1812,12 +1843,10 @@ fn test_adl_fairness() {
     println!("  OI_long  = {}", engine.oi_eff_long_q);
     println!("  OI_short = {}", engine.oi_eff_short_q);
 
-    // Make bankrupt go deeply underwater — inject negative PnL
+    // Make bankrupt go deeply underwater — inject negative PnL.
+    // Don't adjust LP capital — the deficit routes through ADL/insurance.
     let loss = -(usdc(500_000) as i128); // -$500K, way more than $100K capital
     engine.set_pnl(bankrupt as usize, loss);
-    // LP gains the counterparty profit
-    let lp_cap = engine.accounts[lp as usize].capital.get();
-    engine.set_capital(lp as usize, lp_cap.saturating_add(usdc(500_000)));
 
     println!("\n=== AFTER INJECTING -$500K PNL INTO BANKRUPT LONG ===");
     println!("  bankrupt: cap=${:.0} pnl=${:.0}",
@@ -2463,8 +2492,9 @@ fn test_zombie_haircut() {
     for (name, uid) in [("A", user_a), ("B", user_b), ("C", user_c)] {
         let pos = engine.accounts[uid as usize].position_basis_q;
         if pos != 0 {
-            let close_size = -pos;
-            match engine.execute_trade_not_atomic(uid, lp, oracle, slot2, close_size, oracle, 0) {
+            // Close long: (lp, user, +size) → user gets -size (closes their long)
+            let close_size = pos.unsigned_abs() as i128;
+            match engine.execute_trade_not_atomic(lp, uid, oracle, slot2, close_size, oracle, 0) {
                 Ok(()) => {
                     let cap = engine.accounts[uid as usize].capital.get();
                     let pnl = engine.accounts[uid as usize].pnl;
