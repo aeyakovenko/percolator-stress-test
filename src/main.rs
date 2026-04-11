@@ -19,7 +19,7 @@ use std::{
     time::Instant,
 };
 
-use percolator::{RiskEngine, RiskParams, LiquidationPolicy, I128, U128, POS_SCALE, ADL_ONE, SideMode};
+use percolator::{RiskEngine, RiskParams, LiquidationPolicy, ReserveMode, I128, U128, POS_SCALE, ADL_ONE, SideMode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -762,7 +762,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         // loss, which naturally collapses h.
         let add_pnl = usdc(cfg.zombie_pnl_usdc) as i128;
         let old_pnl = engine.accounts[idx].pnl;
-        engine.set_pnl(idx, old_pnl.saturating_add(add_pnl));
+        engine.set_pnl_with_reserve(idx, old_pnl.saturating_add(add_pnl), ReserveMode::ImmediateRelease).unwrap();
 
         // LP counterparty loss (zero-sum backing)
         let lp_cap = engine.accounts[lp_idx as usize].capital.get();
@@ -1830,7 +1830,7 @@ fn test_adl_fairness() {
     // Make bankrupt go deeply underwater — inject negative PnL.
     // Don't adjust LP capital — the deficit routes through ADL/insurance.
     let loss = -(usdc(500_000) as i128); // -$500K, way more than $100K capital
-    engine.set_pnl(bankrupt as usize, loss);
+    engine.set_pnl_with_reserve(bankrupt as usize, loss, ReserveMode::ImmediateRelease).unwrap();
 
     println!("\n=== AFTER INJECTING -$500K PNL INTO BANKRUPT LONG ===");
     println!("  bankrupt: cap=${:.0} pnl=${:.0}",
@@ -2022,7 +2022,7 @@ fn test_adl_saturation() {
         if engine.accounts[s_idx as usize].position_basis_q == 0 { continue; }
         // Each short loses 10x their capital → deeply bankrupt
         let big_loss = -(usdc(100_000) as i128);
-        engine.set_pnl(s_idx as usize, big_loss);
+        engine.set_pnl_with_reserve(s_idx as usize, big_loss, ReserveMode::ImmediateRelease).unwrap();
     }
 
     println!("  h = {:.6}", haircut_f64(&engine));
@@ -2242,7 +2242,7 @@ fn test_adl_fuzz() {
             // Random bankruptcy depth: 2x to 50x their capital
             let depth_mult: f64 = rng.gen_range(2.0..50.0);
             let loss = (cap as f64 * depth_mult) as i128;
-            engine.set_pnl(idx as usize, -loss);
+            engine.set_pnl_with_reserve(idx as usize, -loss, ReserveMode::ImmediateRelease).unwrap();
         }
 
         // Crank through all liquidations
@@ -2460,7 +2460,7 @@ fn test_zombie_haircut() {
     // LP (counterparty short) absorbs all losses
     let inject = |engine: &mut Box<RiskEngine>, idx: u16, pnl_usdc: u64| {
         let pnl = usdc(pnl_usdc) as i128;
-        engine.set_pnl(idx as usize, pnl);
+        engine.set_pnl_with_reserve(idx as usize, pnl, ReserveMode::ImmediateRelease).unwrap();
     };
     inject(&mut engine, zombie, 5_000_000);   // $5M
     inject(&mut engine, user_a, 10_000_000);  // $10M
@@ -2714,7 +2714,7 @@ fn test_risk_reducing_exemption() {
 
     // Inject negative PnL to push below maintenance margin
     let loss = -(usdc(70_000) as i128); // loses most of capital
-    engine.set_pnl(user as usize, loss);
+    engine.set_pnl_with_reserve(user as usize, loss, ReserveMode::ImmediateRelease).unwrap();
 
     let cap = engine.accounts[user as usize].capital.get();
     let pnl = engine.accounts[user as usize].pnl;
@@ -2794,7 +2794,7 @@ fn test_adl_pipeline_integration() {
 
     // Make shorts deeply bankrupt
     for &idx in &shorts {
-        engine.set_pnl(idx as usize, -(usdc(1_000_000) as i128));
+        engine.set_pnl_with_reserve(idx as usize, -(usdc(1_000_000) as i128), ReserveMode::ImmediateRelease).unwrap();
     }
 
     // Crank to liquidate shorts → ADL fires → K_long changes
