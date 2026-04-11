@@ -1,11 +1,11 @@
 # Percolator Stress Test Audit Results
 
-**Spec:** v11.26  **Engine:** production (MAX_ACCOUNTS=4096)
-**Scenarios:** 35  **Runs:** 7000  **Solvency violations:** 0  **H-fairness violations:** 0
+**Spec:** v12.14.0  **Engine:** production (MAX_ACCOUNTS=4096, 2000 users)
+**Scenarios:** 35 (all with liquidations)  **Runs:** 7000  **Solvency violations:** 0  **H-fairness max error:** 0.000006
 
 ## Summary Table
 
-| Scenario | Liqs | ADL A | Liq%% | true_h p01 | h_fairness | Ins End | deficit |
+| Scenario | Liqs | ADL A | Liq%% | true_h p01 | h_fair | Ins End | deficit |
 |---|---|---|---|---|---|---|---|
 | 10_whale | 793 | 50.0 | 1.9%% | 1.000 | 0.000000 | $11.1M | 0.0 |
 | 11_funding | 792 | 50.0 | 1.9%% | 1.000 | 0.000000 | $10.9M | 0.0 |
@@ -17,7 +17,7 @@
 | 2_flash | 869 | 9.0 | 22.2%% | 1.000 | 0.000000 | $10.9M | 0.0 |
 | 3_slowbleed | 914 | 309.4 | 7.1%% | 1.000 | 0.000000 | $10.9M | 0.0 |
 | 4_noinsurance | 792 | 50.0 | 1.9%% | 1.000 | 0.000000 | $865K | 0.0 |
-| 5_tinylp | 788 | 50.1 | 1.9%% | 1.000 | 0.000000 | $10.9M | 0.0 |
+| 5_tinylp | 788 | 50.1 | 1.9%% | 1.000 | 0.000001 | $10.9M | 0.0 |
 | 6_degens | 585 | 55.8 | 25.0%% | 1.000 | 0.000000 | $11.2M | 0.0 |
 | 7_skew90 | 1425 | 50.0 | 3.4%% | 1.000 | 0.000000 | $11.3M | 0.0 |
 | 8_staircase | 860 | 52.8 | 5.6%% | 1.000 | 0.000000 | $10.9M | 0.0 |
@@ -26,29 +26,19 @@
 | adl_cascade | 1339 | 3.0 | 88.9%% | 0.354 | 0.000000 | $0 | 0.0 |
 | adl_drain_reset | 447 | 1.0 | 89.4%% | 0.121 | 0.000000 | $0 | 0.0 |
 | adl_k_deficit | 1544 | 5.0 | 76.5%% | 0.727 | 0.000000 | $0 | 0.0 |
-| adl_stale | 1705 | 2.0 | 88.9%% | 0.323 | 0.000000 | $0 | 0.0 |
+| adl_stale | 1705 | 2.0 | 88.9%% | 0.323 | 0.000002 | $0 | 0.0 |
 | adl_trigger | 1705 | 2.0 | 88.9%% | 0.323 | 0.000000 | $0 | 0.0 |
 | adversarial_adl_cascade | 1339 | 3.0 | 88.9%% | 0.410 | 0.000000 | $0 | 0.0 |
 | adversarial_adl_cascade_honest | 1339 | 3.0 | 88.9%% | 0.464 | 0.000000 | $0 | 0.0 |
 | adversarial_keeper | 1534 | 7.0 | 75.9%% | 0.801 | 0.000000 | $0 | 0.0 |
 | adversarial_keeper_honest | 1534 | 7.0 | 75.9%% | 0.968 | 0.000000 | $0 | 0.0 |
 | dust_gc | 1215 | 13.9 | 26.4%% | 1.000 | 0.000000 | $2.7M | 0.0 |
-| funding_crash_combo | 1699 | 5.8 | 85.0%% | 0.021 | 0.000000 | $2 | 0.0 |
-| funding_dynamics | 500 | 4.5 | 50.0%% | 0.040 | 0.000000 | $1 | 0.0 |
-| funding_extreme | 1001 | 4.5 | 50.0%% | 0.036 | 0.000000 | $3 | 0.0 |
-| oracle_wick | 768 | 42.7 | 18.0%% | 0.959 | 0.000000 | $10.0M | 0.0 |
+| funding_crash_combo | 1457 | 6.2 | 72.3%% | 0.924 | 0.000000 | $63K | 0.0 |
+| funding_dynamics | 298 | 5.0 | 25.6%% | 1.000 | 0.000000 | $5.0M | 0.0 |
+| funding_extreme | 323 | 22.0 | 9.5%% | 1.000 | 0.000000 | $10.9M | 0.0 |
+| oracle_wick | 768 | 42.7 | 18.0%% | 0.959 | 0.000006 | $10.0M | 0.0 |
 | oracle_wick_adl | 1755 | 7.0 | 87.4%% | 0.733 | 0.000000 | $0 | 0.0 |
 | ten10_alt | 1743 | 6.0 | 87.1%% | 0.609 | 0.000000 | $1 | 0.0 |
 | ten10_btc | 728 | 13.0 | 35.8%% | 1.000 | 0.000000 | $21.2M | 0.0 |
 | ten10_hl | 714 | 8.0 | 34.0%% | 0.996 | 0.000000 | $0 | 0.0 |
 | ten10_sol | 1538 | 14.0 | 76.6%% | 1.000 | 0.000000 | $7.8M | 0.0 |
-
-## Key Result: H is Fair During Stress
-
-When h < 1 (vault stressed), every account with positive matured PnL
-receives the **exact same haircut ratio**. max_h_fairness_err = 0.000000
-across all scenarios, including extreme cases where h drops to 0.021.
-
-This means: during a crash, no user gets preferential access to the vault.
-The floor rounding in `effective_matured_pnl` produces at most 1 atomic
-unit of deviation per account, which is undetectable at f64 precision.
