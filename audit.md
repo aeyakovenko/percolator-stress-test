@@ -1,7 +1,7 @@
 # Percolator Stress Test Audit Results
 
 **Spec:** v12.14.0  **Engine:** production (MAX_ACCOUNTS=4096, 2000 users)
-**Scenarios:** 35 (all with liquidations)  **Runs:** 7000  **Solvency violations:** 0  **H-fairness max error:** 0.000006
+**Scenarios:** 35 (all with liquidations)  **Runs:** 7000  **Solvency violations:** 0  **Max h-fairness error:** 0.000006
 
 ## Summary Table
 
@@ -42,3 +42,13 @@
 | ten10_btc | 728 | 13.0 | 35.8%% | 1.000 | 0.000000 | $21.2M | 0.0 |
 | ten10_hl | 714 | 8.0 | 34.0%% | 0.996 | 0.000000 | $0 | 0.0 |
 | ten10_sol | 1538 | 14.0 | 76.6%% | 1.000 | 0.000000 | $7.8M | 0.0 |
+
+## Focused Tests
+
+| Test | Result |
+|---|---|
+| adl_fairness | Loss exactly proportional to position size (1:2:4) |
+| zombie_haircut | Uniform h, solvency maintained |
+| adl_saturation | 4094 shorts, K within i128, no overflow |
+| adl_fuzz (100 seeds) | 0.00%% fairness error, 492 max liqs/seed, 0 solvency failures |
+| audit | Bilateral fee, risk-reducing exemption, full ADL pipeline all pass |
