@@ -152,9 +152,11 @@ struct Config {
 
     // Admission pair (spec §4.7): engine picks admit_h_min when residual has
     // headroom for fresh PnL (matured + fresh <= residual), else picks admit_h_max
-    // and marks the account sticky. Fast path = no warmup; slow path = long warmup.
-    admit_h_min_slots: u64,   // fast path (default: 0 = immediate release)
-    admit_h_max_slots: u64,   // slow path when stressed (default: 36000 ≈ 4h at 400ms slots)
+    // and marks the account sticky. Fast path = instant withdrawal; slow path = long warmup.
+    // Default admit_h_min=0 gives instant release when system is healthy.
+    // Default admit_h_max=108000 = 12 hours at 400ms slots (upper bound on lockup).
+    admit_h_min_slots: u64,
+    admit_h_max_slots: u64,
 
     // Output
     out_dir: String,
@@ -202,7 +204,7 @@ impl Default for Config {
             wick_pct_bps: 0,
             wick_duration: 0,
             admit_h_min_slots: 0,
-            admit_h_max_slots: 36_000,
+            admit_h_max_slots: 108_000,
             min_liquidation_abs: 1,
             out_dir: "stress_out".into(),
             snapshots: true,
@@ -1816,8 +1818,8 @@ fn print_usage() {
     eprintln!("  --snapshots=BOOL     Record time-series (default: true)");
     eprintln!();
     eprintln!("Admission pair (spec §4.7 — engine picks h_min or h_max per residual):");
-    eprintln!("  --admit_h_min=0        Fast-path horizon (default: 0 = immediate)");
-    eprintln!("  --admit_h_max=36000    Slow-path horizon when stressed (default: 36000 ≈ 4h)");
+    eprintln!("  --admit_h_min=0        Fast-path horizon (default: 0 = instant withdraw)");
+    eprintln!("  --admit_h_max=108000   Slow-path horizon when stressed (default: 108000 ≈ 12h)");
     eprintln!();
     eprintln!("Grid mode (runs scenarios over parameter combinations):");
     eprintln!("  --grid_crash=2000,3000,5000");
