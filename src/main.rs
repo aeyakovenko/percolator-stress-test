@@ -19,7 +19,7 @@ use std::{
     time::Instant,
 };
 
-use percolator::{RiskEngine, RiskParams, LiquidationPolicy, ReserveMode, I128, U128, POS_SCALE, ADL_ONE, SideMode};
+use percolator::{RiskEngine, RiskParams, LiquidationPolicy, ReserveMode, InstructionContext, I128, U128, POS_SCALE, ADL_ONE, SideMode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -150,19 +150,11 @@ struct Config {
     wick_pct_bps: u64,    // wick magnitude in bps (e.g. 5000 = 50% spike)
     wick_duration: u64,   // how many slots the wick lasts before reverting
 
-    // Dynamic warmup: h_lock scales with insurance fund health
-    // When disabled (default), all reserves use ImmediateRelease (h_lock=0).
-    // When enabled, h_lock interpolates between h_min and h_max based on
-    // insurance_fund / insurance_ema ratio:
-    //   ratio >= 0.9 → h_lock = warmup_h_min_slots  (~30s)
-    //   ratio <= 0.2 → h_lock = warmup_h_max_slots  (~4h)
-    //   between: linear interpolation
-    warmup_enabled: bool,
-    warmup_h_min_slots: u64,   // floor h_lock when insurance healthy (default: 75 ≈ 30s)
-    warmup_h_max_slots: u64,   // ceiling h_lock when insurance depleted (default: 36000 ≈ 4h)
-    warmup_ema_window: u64,    // EMA decay window in slots (default: 2250 ≈ 15 min)
-    warmup_healthy_ratio: f64, // ratio above which h_lock = h_min (default: 0.9)
-    warmup_stress_ratio: f64,  // ratio below which h_lock = h_max (default: 0.2)
+    // Admission pair (spec §4.7): engine picks admit_h_min when residual has
+    // headroom for fresh PnL (matured + fresh <= residual), else picks admit_h_max
+    // and marks the account sticky. Fast path = no warmup; slow path = long warmup.
+    admit_h_min_slots: u64,   // fast path (default: 0 = immediate release)
+    admit_h_max_slots: u64,   // slow path when stressed (default: 36000 ≈ 4h at 400ms slots)
 
     // Output
     out_dir: String,
@@ -209,12 +201,8 @@ impl Default for Config {
             wick_slot: 0,
             wick_pct_bps: 0,
             wick_duration: 0,
-            warmup_enabled: false,
-            warmup_h_min_slots: 75,
-            warmup_h_max_slots: 36_000,
-            warmup_ema_window: 2250,
-            warmup_healthy_ratio: 0.9,
-            warmup_stress_ratio: 0.2,
+            admit_h_min_slots: 0,
+            admit_h_max_slots: 36_000,
             min_liquidation_abs: 1,
             out_dir: "stress_out".into(),
             snapshots: true,
@@ -273,10 +261,12 @@ struct RunSummary {
     final_a_short: u128,
     drain_only_entered: bool,
     epoch_resets: u64,
-    /// Dynamic warmup: max h_lock applied during the run
-    max_h_lock: u64,
-    /// Dynamic warmup: min insurance_ema ratio observed
-    min_ins_ema_ratio: f64,
+    /// Admission stress: slots where matured_pos_tot > residual (engine picks admit_h_max)
+    stress_slots: u64,
+    /// First slot where stress regime was entered (u64::MAX if never)
+    stress_first_slot: u64,
+    /// Min headroom observed: residual - matured_pos_tot (negative = stressed)
+    min_headroom: i128,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -382,12 +372,15 @@ struct ScenarioSummary {
     epoch_resets_mean: f64,
     /// Max h-fairness error across all runs (0.0 = perfect, >0.05 = concern)
     max_h_fairness_err: f64,
-    /// Dynamic warmup: max h_lock observed across all runs
-    max_h_lock_p99: f64,
-    max_h_lock_max: f64,
-    /// Dynamic warmup: min insurance/EMA ratio observed
-    min_ins_ema_ratio_p01: f64,
-    min_ins_ema_ratio_p50: f64,
+    /// Admission stress (slots where engine forced admit_h_max path)
+    stress_slots_mean: f64,
+    stress_slots_p50: f64,
+    stress_slots_p99: f64,
+    /// Fraction of runs that entered stress regime at any slot
+    stress_entered_frac: f64,
+    /// Min headroom (residual - matured), negative = stressed
+    min_headroom_p01: f64,
+    min_headroom_p50: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -518,53 +511,15 @@ fn sorted(vals: impl Iterator<Item = f64>) -> Vec<f64> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Dynamic warmup: insurance EMA + h_lock interpolation
+// Admission-pair stress tracking (spec §4.7)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Tracks exponential moving average of insurance fund balance.
-struct InsuranceEma {
-    ema: f64,
-    alpha: f64,
-}
-
-impl InsuranceEma {
-    fn new(initial_balance: u128, window: u64) -> Self {
-        Self {
-            ema: initial_balance as f64,
-            alpha: 2.0 / (window.max(1) as f64 + 1.0),
-        }
-    }
-
-    fn update(&mut self, current_balance: u128) {
-        self.ema = self.alpha * current_balance as f64 + (1.0 - self.alpha) * self.ema;
-    }
-
-    fn ratio(&self, current_balance: u128) -> f64 {
-        if self.ema <= 0.0 { return 0.0; }
-        current_balance as f64 / self.ema
-    }
-}
-
-/// Compute dynamic h_lock based on insurance fund health.
-/// Returns 0 when warmup is disabled.
-fn dynamic_h_lock(cfg: &Config, ins_ema: &InsuranceEma, current_ins: u128) -> u64 {
-    if !cfg.warmup_enabled { return 0; }
-
-    let ratio = ins_ema.ratio(current_ins);
-    let h_min = cfg.warmup_h_min_slots;
-    let h_max = cfg.warmup_h_max_slots;
-
-    if ratio >= cfg.warmup_healthy_ratio {
-        h_min
-    } else if ratio <= cfg.warmup_stress_ratio {
-        h_max
-    } else {
-        // Linear interpolation: stress=0 at healthy, stress=1 at stress_ratio
-        let stress = (cfg.warmup_healthy_ratio - ratio)
-            / (cfg.warmup_healthy_ratio - cfg.warmup_stress_ratio);
-        let h = h_min as f64 + stress * (h_max - h_min) as f64;
-        (h.round() as u64).clamp(h_min, h_max)
-    }
+/// Compute residual - matured. Negative = engine would pick admit_h_max on fresh PnL.
+fn headroom(engine: &RiskEngine) -> i128 {
+    let senior = engine.c_tot.get().saturating_add(engine.insurance_fund.balance.get());
+    let residual = engine.vault.get().saturating_sub(senior) as i128;
+    let matured = engine.pnl_matured_pos_tot as i128;
+    residual - matured
 }
 
 fn haircut_f64(engine: &RiskEngine) -> f64 {
@@ -691,30 +646,30 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
         insurance_floor: U128::new(0),
-        h_min: if cfg.warmup_enabled { cfg.warmup_h_min_slots } else { 0 },
-        h_max: if cfg.warmup_enabled { cfg.warmup_h_max_slots } else { 100 },
+        h_min: cfg.admit_h_min_slots,
+        h_max: cfg.admit_h_max_slots,
         resolve_price_deviation_bps: 1000,
+        max_accrual_dt_slots: 1_000,
+        max_abs_funding_e9_per_slot: 100_000_000,
     };
 
     let mut engine = new_engine_with(params, 0, p0);
+    let admit_h_min = cfg.admit_h_min_slots;
+    let admit_h_max = cfg.admit_h_max_slots;
 
     // ── Seed insurance + LP ─────────────────────────────────────────────
     let _ = engine.top_up_insurance_fund(usdc(cfg.insurance_topup_usdc), 0);
 
-    // ── Insurance EMA for dynamic warmup ───────────────────────────────
-    let mut ins_ema = InsuranceEma::new(
-        engine.insurance_fund.balance.get(),
-        cfg.warmup_ema_window,
-    );
-    let mut max_h_lock: u64 = 0;
-    let mut min_ins_ema_ratio: f64 = 1.0;
+    // ── Admission stress tracking (engine picks admit_h_max when matured > residual) ──
+    let mut stress_slots: u64 = 0;
+    let mut stress_first_slot: u64 = u64::MAX;
+    let mut min_headroom: i128 = i128::MAX;
 
     let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp_idx, usdc(cfg.lp_capital_usdc), p0, 0).unwrap();
+    engine.deposit_not_atomic(lp_idx, usdc(cfg.lp_capital_usdc), p0, 0).unwrap();
 
     // Initial crank at slot 0
-    let h_lock_init = dynamic_h_lock(cfg, &ins_ema, engine.insurance_fund.balance.get());
-    let _ = engine.keeper_crank_not_atomic(0, p0, &all_accounts(&engine), 4096, 0, h_lock_init);
+    let _ = engine.keeper_crank_not_atomic(0, p0, &all_accounts(&engine), 4096, 0, admit_h_min, admit_h_max);
 
     // ── Capital distributions (lognormal mixtures) ──────────────────────
     let retail = LogNormal::new(2_000f64.ln(), 1.0).unwrap();
@@ -725,7 +680,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut users: Vec<UserInfo> = Vec::with_capacity(cfg.n_users + 1);
     if cfg.whale_enabled {
         let whale_idx = engine.add_user(0).unwrap();
-        engine.deposit(whale_idx, usdc(cfg.whale_capital_usdc), p0, 0).unwrap();
+        engine.deposit_not_atomic(whale_idx, usdc(cfg.whale_capital_usdc), p0, 0).unwrap();
         users.push(UserInfo {
             idx: whale_idx,
             initial_capital: usdc(cfg.whale_capital_usdc),
@@ -750,7 +705,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             Ok(i) => i,
             Err(_) => break, // slab full
         };
-        if engine.deposit(user_idx, usdc(cap_usdc), p0, 0).is_err() {
+        if engine.deposit_not_atomic(user_idx, usdc(cap_usdc), p0, 0).is_err() {
             continue;
         }
 
@@ -765,8 +720,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Run cranks through setup phase for full sweep ───────────────────
     for s in 1..=SETUP_SLOTS {
         let candidates = all_accounts(&engine);
-        let hl = dynamic_h_lock(cfg, &ins_ema, engine.insurance_fund.balance.get());
-        let _ = engine.keeper_crank_not_atomic(s, p0, &candidates, 4096, 0, hl);
+        let _ = engine.keeper_crank_not_atomic(s, p0, &candidates, 4096, 0, admit_h_min, admit_h_max);
     }
 
     // ── Open positions via execute_trade ────────────────────────────────
@@ -820,8 +774,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             // For longs: (user, lp, +size) → user gets +size (long)
             // For shorts: (lp, user, +size) → user gets -size (short)
             let (a, b) = if long { (user.idx, lp_idx) } else { (lp_idx, user.idx) };
-            let trade_hl = dynamic_h_lock(cfg, &ins_ema, engine.insurance_fund.balance.get());
-            match engine.execute_trade_not_atomic(a, b, p0, trade_slot, abs_size, ep, 0, trade_hl) {
+            match engine.execute_trade_not_atomic(a, b, p0, trade_slot, abs_size, ep, 0, admit_h_min, admit_h_max) {
                 Ok(()) => { user.had_position = true; ok = true; break; }
                 Err(e) => {
                     *engine = snapshot.as_ref().clone();
@@ -836,8 +789,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Post-trade sweep ────────────────────────────────────────────────
     for s in (SETUP_SLOTS + 1)..=(SETUP_SLOTS + 32) {
         let candidates = all_accounts(&engine);
-        let hl = dynamic_h_lock(cfg, &ins_ema, engine.insurance_fund.balance.get());
-        let _ = engine.keeper_crank_not_atomic(s, p0, &candidates, 4096, 0, hl);
+        let _ = engine.keeper_crank_not_atomic(s, p0, &candidates, 4096, 0, admit_h_min, admit_h_max);
     }
 
     // ── Inject zombies: positive PnL + fee debt ─────────────────────────
@@ -854,18 +806,18 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         // loss, which naturally collapses h.
         let add_pnl = usdc(cfg.zombie_pnl_usdc) as i128;
         let old_pnl = engine.accounts[idx].pnl;
-        let zombie_reserve = if cfg.warmup_enabled {
-            let hl = dynamic_h_lock(cfg, &ins_ema, engine.insurance_fund.balance.get());
-            if hl > 0 { ReserveMode::UseHLock(hl) } else { ReserveMode::ImmediateRelease }
-        } else {
-            ReserveMode::ImmediateRelease
-        };
-        engine.set_pnl_with_reserve(idx, old_pnl.saturating_add(add_pnl), zombie_reserve).unwrap();
+        let mut zombie_ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
+        engine.set_pnl_with_reserve(
+            idx,
+            old_pnl.saturating_add(add_pnl),
+            ReserveMode::UseAdmissionPair(admit_h_min, admit_h_max),
+            Some(&mut zombie_ctx),
+        ).unwrap();
 
         // LP counterparty loss (zero-sum backing)
         let lp_cap = engine.accounts[lp_idx as usize].capital.get();
         let loss = usdc(cfg.zombie_pnl_usdc).min(lp_cap);
-        engine.set_capital(lp_idx as usize, lp_cap.saturating_sub(loss));
+        engine.set_capital(lp_idx as usize, lp_cap.saturating_sub(loss)).unwrap();
 
         // Create fee debt (push fee_credits negative)
         let debt = usdc(cfg.zombie_fee_debt_usdc) as i128;
@@ -934,17 +886,18 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let pre_k_long = engine.adl_coeff_long;
             let pre_k_short = engine.adl_coeff_short;
 
-            // Dynamic warmup: update EMA and compute h_lock for this crank
-            let current_ins = engine.insurance_fund.balance.get();
-            ins_ema.update(current_ins);
-            let crank_h_lock = dynamic_h_lock(cfg, &ins_ema, current_ins);
-            if crank_h_lock > max_h_lock { max_h_lock = crank_h_lock; }
-            let ratio = ins_ema.ratio(current_ins);
-            if ratio < min_ins_ema_ratio { min_ins_ema_ratio = ratio; }
-
             let candidates = build_candidates(&engine, &cfg.candidate_ordering);
-            if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, oracle, &candidates, 4096, funding_rate, crank_h_lock) {
+            if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, oracle, &candidates, 4096, funding_rate, admit_h_min, admit_h_max) {
                 total_liquidations += outcome.num_liquidations as u64;
+            }
+
+            // Admission stress: engine picks admit_h_max when matured >= residual
+            // (any positive fresh PnL would violate matured+fresh <= residual).
+            let hr = headroom(&engine);
+            if hr < min_headroom { min_headroom = hr; }
+            if hr <= 0 {
+                stress_slots += 1;
+                if stress_first_slot == u64::MAX { stress_first_slot = slot_offset; }
             }
 
             // H-fairness check: when h < 1, all accounts with positive
@@ -1020,7 +973,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                         if amt > 0 {
                             withdraw_attempts += 1;
                             let snap = engine.clone();
-                            if engine.withdraw_not_atomic(user.idx, amt, oracle, slot, 0, 0).is_ok() {
+                            if engine.withdraw_not_atomic(user.idx, amt, oracle, slot, 0, admit_h_min, admit_h_max).is_ok() {
                                 withdraw_successes += 1;
                             }
                             *engine = *snap;
@@ -1029,7 +982,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                         // Position liquidated — try closing account
                         close_attempts += 1;
                         let snap = engine.clone();
-                        if engine.close_account_not_atomic(user.idx, slot, oracle, 0, 0).is_ok() {
+                        if engine.close_account_not_atomic(user.idx, slot, oracle, 0, admit_h_min, admit_h_max).is_ok() {
                             close_successes += 1;
                         }
                         *engine = *snap;
@@ -1083,8 +1036,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let final_slot = crash_start + cfg.total_slots;
     let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
     let candidates = build_candidates(&engine, &cfg.candidate_ordering);
-    let final_hl = dynamic_h_lock(cfg, &ins_ema, engine.insurance_fund.balance.get());
-    let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, &candidates, 4096, 0, final_hl);
+    let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, &candidates, 4096, 0, admit_h_min, admit_h_max);
     {
         let vault_val = engine.vault.get();
         let c_tot_val = engine.c_tot.get();
@@ -1179,8 +1131,9 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         drain_only_entered,
         epoch_resets,
         max_h_fairness_err,
-        max_h_lock,
-        min_ins_ema_ratio,
+        stress_slots,
+        stress_first_slot,
+        min_headroom,
     };
 
     (summary, snapshots)
@@ -1305,11 +1258,14 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         epoch_resets_mean: mean(&sorted(runs.iter().map(|r| r.epoch_resets as f64))),
         max_h_fairness_err: runs.iter().map(|r| r.max_h_fairness_err).fold(0.0f64, f64::max),
 
-        // Dynamic warmup aggregates
-        max_h_lock_p99: quantile(&sorted(runs.iter().map(|r| r.max_h_lock as f64)), 0.99),
-        max_h_lock_max: runs.iter().map(|r| r.max_h_lock as f64).fold(0.0f64, f64::max),
-        min_ins_ema_ratio_p01: quantile(&sorted(runs.iter().map(|r| r.min_ins_ema_ratio)), 0.01),
-        min_ins_ema_ratio_p50: quantile(&sorted(runs.iter().map(|r| r.min_ins_ema_ratio)), 0.50),
+        // Admission stress aggregates
+        stress_slots_mean: mean(&sorted(runs.iter().map(|r| r.stress_slots as f64))),
+        stress_slots_p50: quantile(&sorted(runs.iter().map(|r| r.stress_slots as f64)), 0.50),
+        stress_slots_p99: quantile(&sorted(runs.iter().map(|r| r.stress_slots as f64)), 0.99),
+        stress_entered_frac: runs.iter().filter(|r| r.stress_slots > 0).count() as f64
+            / runs.len().max(1) as f64,
+        min_headroom_p01: quantile(&sorted(runs.iter().map(|r| r.min_headroom as f64)), 0.01),
+        min_headroom_p50: quantile(&sorted(runs.iter().map(|r| r.min_headroom as f64)), 0.50),
     }
 }
 
@@ -1343,11 +1299,11 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
          min_true_h,min_residual,\
          withdraw_attempts,withdraw_successes,close_attempts,close_successes,\
          adl_a_reductions,adl_k_changes,min_a_long,min_a_short,epoch_resets,\
-         max_h_lock,min_ins_ema_ratio\n",
+         stress_slots,stress_first_slot,min_headroom\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{:.4}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
@@ -1373,8 +1329,9 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             r.min_a_long,
             r.min_a_short,
             r.epoch_resets,
-            r.max_h_lock,
-            r.min_ins_ema_ratio,
+            r.stress_slots,
+            if r.stress_first_slot == u64::MAX { "never".to_string() } else { r.stress_first_slot.to_string() },
+            r.min_headroom,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
@@ -1829,12 +1786,8 @@ fn parse_args() -> Config {
             "scenario" => apply_scenario_preset(&mut cfg, val),
             "candidate_ordering" => cfg.candidate_ordering = val.to_string(),
             "min_liquidation_abs" => cfg.min_liquidation_abs = val.parse().unwrap(),
-            "warmup" => cfg.warmup_enabled = val.parse().unwrap(),
-            "warmup_h_min" => cfg.warmup_h_min_slots = val.parse().unwrap(),
-            "warmup_h_max" => cfg.warmup_h_max_slots = val.parse().unwrap(),
-            "warmup_ema_window" => cfg.warmup_ema_window = val.parse().unwrap(),
-            "warmup_healthy" => cfg.warmup_healthy_ratio = val.parse().unwrap(),
-            "warmup_stress" => cfg.warmup_stress_ratio = val.parse().unwrap(),
+            "admit_h_min" => cfg.admit_h_min_slots = val.parse().unwrap(),
+            "admit_h_max" => cfg.admit_h_max_slots = val.parse().unwrap(),
             _ => eprintln!("unknown arg: --{}", key),
         }
     }
@@ -1862,13 +1815,9 @@ fn print_usage() {
     eprintln!("  --out=DIR            Output directory (default: stress_out)");
     eprintln!("  --snapshots=BOOL     Record time-series (default: true)");
     eprintln!();
-    eprintln!("Dynamic warmup (h_lock scales with insurance fund health):");
-    eprintln!("  --warmup=true          Enable dynamic warmup (default: false)");
-    eprintln!("  --warmup_h_min=75      Floor h_lock in slots (default: 75 ≈ 30s)");
-    eprintln!("  --warmup_h_max=36000   Ceiling h_lock in slots (default: 36000 ≈ 4h)");
-    eprintln!("  --warmup_ema_window=2250  EMA decay window (default: 2250 ≈ 15min)");
-    eprintln!("  --warmup_healthy=0.9   Ins/EMA ratio above which h_lock=h_min");
-    eprintln!("  --warmup_stress=0.2    Ins/EMA ratio below which h_lock=h_max");
+    eprintln!("Admission pair (spec §4.7 — engine picks h_min or h_max per residual):");
+    eprintln!("  --admit_h_min=0        Fast-path horizon (default: 0 = immediate)");
+    eprintln!("  --admit_h_max=36000    Slow-path horizon when stressed (default: 36000 ≈ 4h)");
     eprintln!();
     eprintln!("Grid mode (runs scenarios over parameter combinations):");
     eprintln!("  --grid_crash=2000,3000,5000");
@@ -1902,47 +1851,49 @@ fn test_adl_fairness() {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
+        max_accrual_dt_slots: 1_000,
+        max_abs_funding_e9_per_slot: 100_000_000,
     };
     let mut engine = new_engine(params);
 
     // No insurance — forces deficit through K-index socialization
     // (admin controls insurance; zero here to isolate ADL fairness)
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, usdc(5_000_000), oracle, 0).unwrap();
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0);
+    engine.deposit_not_atomic(lp, usdc(5_000_000), oracle, 0).unwrap();
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
 
     // Bankrupt account: goes LONG, will be liquidated
     let bankrupt = engine.add_user(0).unwrap();
-    engine.deposit(bankrupt, usdc(100_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(bankrupt, usdc(100_000), oracle, 0).unwrap();
 
     // 3 SHORT accounts with different sizes — these receive ADL
     let short_a = engine.add_user(0).unwrap();
-    engine.deposit(short_a, usdc(500_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(short_a, usdc(500_000), oracle, 0).unwrap();
 
     let short_b = engine.add_user(0).unwrap();
-    engine.deposit(short_b, usdc(1_000_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(short_b, usdc(1_000_000), oracle, 0).unwrap();
 
     let short_c = engine.add_user(0).unwrap();
-    engine.deposit(short_c, usdc(2_000_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(short_c, usdc(2_000_000), oracle, 0).unwrap();
 
-    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     // Open positions
     // execute_trade(a, b, ..., size_q, ...): a gets +size_q, b gets -size_q
     let slot = 64;
     // Bankrupt goes LONG (a=bankrupt gets +size)
     let bankrupt_q = (usdc(1_000_000) * POS_SCALE / oracle as u128) as i128; // 10x lev
-    engine.execute_trade_not_atomic(bankrupt, lp, oracle, slot, bankrupt_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(bankrupt, lp, oracle, slot, bankrupt_q, oracle, 0, 0, 1).unwrap();
 
     // Shorts with different sizes: a=LP gets +size (long), b=short gets -size (SHORT)
     let sa_q = (usdc(1_000_000) * POS_SCALE / oracle as u128) as i128;
     let sb_q = (usdc(2_000_000) * POS_SCALE / oracle as u128) as i128;
     let sc_q = (usdc(4_000_000) * POS_SCALE / oracle as u128) as i128;
-    engine.execute_trade_not_atomic(lp, short_a, oracle, slot, sa_q, oracle, 0, 0).unwrap();
-    engine.execute_trade_not_atomic(lp, short_b, oracle, slot, sb_q, oracle, 0, 0).unwrap();
-    engine.execute_trade_not_atomic(lp, short_c, oracle, slot, sc_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(lp, short_a, oracle, slot, sa_q, oracle, 0, 0, 1).unwrap();
+    engine.execute_trade_not_atomic(lp, short_b, oracle, slot, sb_q, oracle, 0, 0, 1).unwrap();
+    engine.execute_trade_not_atomic(lp, short_c, oracle, slot, sc_q, oracle, 0, 0, 1).unwrap();
 
-    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     // Record pre-ADL effective positions for shorts
     let pre_a = engine.accounts[short_a as usize].position_basis_q;
@@ -1965,7 +1916,7 @@ fn test_adl_fairness() {
     // Make bankrupt go deeply underwater — inject negative PnL.
     // Don't adjust LP capital — the deficit routes through ADL/insurance.
     let loss = -(usdc(500_000) as i128); // -$500K, way more than $100K capital
-    engine.set_pnl_with_reserve(bankrupt as usize, loss, ReserveMode::ImmediateRelease).unwrap();
+    engine.set_pnl_with_reserve(bankrupt as usize, loss, ReserveMode::NoPositiveIncreaseAllowed, None).unwrap();
 
     println!("\n=== AFTER INJECTING -$500K PNL INTO BANKRUPT LONG ===");
     println!("  bankrupt: cap=${:.0} pnl=${:.0}",
@@ -1979,7 +1930,7 @@ fn test_adl_fairness() {
     let pre_k_short = engine.adl_coeff_short;
 
     let mut total_liqs = 0u64;
-    for s in 97..=160 { let candidates = deficit_ordered_candidates(&engine); if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0) { total_liqs += outcome.num_liquidations as u64; } }
+    for s in 97..=160 { let candidates = deficit_ordered_candidates(&engine); if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += outcome.num_liquidations as u64; } }
 
     println!("\n=== AFTER CRANK (liquidation + ADL) ===");
     println!("  liquidations = {}", total_liqs);
@@ -1999,7 +1950,7 @@ fn test_adl_fairness() {
     // Touch each short account to settle ADL effects
     // We need to trigger touch_account_full via a no-op operation
     // Using withdraw(0) or just reading effective_pos after a crank that touches them
-    for s in 161..=200 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 161..=200 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     // Read post-ADL state
     let post_pnl_a = engine.accounts[short_a as usize].pnl;
@@ -2097,18 +2048,20 @@ fn test_adl_saturation() {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
+        max_accrual_dt_slots: 1_000,
+        max_abs_funding_e9_per_slot: 100_000_000,
     };
     let mut engine = new_engine(params);
 
     // No insurance — all deficit goes through K
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
     // Massive LP capital so it can be counterparty to everyone
-    engine.deposit(lp, usdc(1_000_000_000), oracle, 0).unwrap(); // $1B LP
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0);
+    engine.deposit_not_atomic(lp, usdc(1_000_000_000), oracle, 0).unwrap(); // $1B LP
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
 
     // The single long — will receive all ADL
     let the_long = engine.add_user(0).unwrap();
-    engine.deposit(the_long, usdc(10_000_000), oracle, 0).unwrap(); // $10M
+    engine.deposit_not_atomic(the_long, usdc(10_000_000), oracle, 0).unwrap(); // $10M
 
     // Create as many shorts as possible
     let max_shorts = (percolator::MAX_ACCOUNTS - 2) as u16; // all slots except LP + the_long
@@ -2116,17 +2069,17 @@ fn test_adl_saturation() {
     println!("Creating {} short accounts...", max_shorts);
     for _ in 0..max_shorts {
         let idx = engine.add_user(0).unwrap();
-        engine.deposit(idx, usdc(10_000), oracle, 0).unwrap(); // $10K each
+        engine.deposit_not_atomic(idx, usdc(10_000), oracle, 0).unwrap(); // $10K each
         shorts.push(idx);
     }
 
-    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     // The long opens a huge position
     let slot = 64;
     let long_notional = usdc(200_000_000); // $200M notional
     let long_q = (long_notional * POS_SCALE / oracle as u128) as i128;
-    engine.execute_trade_not_atomic(the_long, lp, oracle, slot, long_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(the_long, lp, oracle, slot, long_q, oracle, 0, 0, 1).unwrap();
 
     // Each short opens max leverage position
     println!("Opening {} short positions...", shorts.len());
@@ -2135,14 +2088,14 @@ fn test_adl_saturation() {
         let cap = engine.accounts[s_idx as usize].capital.get();
         let notional = cap * 15; // ~15x leverage
         let short_q = (notional * POS_SCALE / oracle as u128) as i128;
-        match engine.execute_trade_not_atomic(lp, s_idx, oracle, slot, short_q, oracle, 0, 0) {
+        match engine.execute_trade_not_atomic(lp, s_idx, oracle, slot, short_q, oracle, 0, 0, 1) {
             Ok(()) => opened += 1,
             Err(_) => {} // some may fail margin check
         }
     }
     println!("  opened {}/{} short positions", opened, shorts.len());
 
-    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     println!("\n=== INITIAL STATE ===");
     println!("  accounts = {} shorts + 1 long + LP", opened);
@@ -2158,7 +2111,7 @@ fn test_adl_saturation() {
         if engine.accounts[s_idx as usize].position_basis_q == 0 { continue; }
         // Each short loses 10x their capital → deeply bankrupt
         let big_loss = -(usdc(100_000) as i128);
-        engine.set_pnl_with_reserve(s_idx as usize, big_loss, ReserveMode::ImmediateRelease).unwrap();
+        engine.set_pnl_with_reserve(s_idx as usize, big_loss, ReserveMode::NoPositiveIncreaseAllowed, None).unwrap();
     }
 
     println!("  h = {:.6}", haircut_f64(&engine));
@@ -2177,7 +2130,7 @@ fn test_adl_saturation() {
         let pre_a = engine.adl_mult_long;
 
         let candidates = deficit_ordered_candidates(&engine);
-        let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0)
+        let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1)
             .map(|o| o.num_liquidations as u64).unwrap_or(0);
         if new_liqs > 0 {
             total_liqs += new_liqs;
@@ -2300,20 +2253,22 @@ fn test_adl_fuzz() {
             h_min: 0,
             h_max: 100,
             resolve_price_deviation_bps: 1000,
+            max_accrual_dt_slots: 1_000,
+            max_abs_funding_e9_per_slot: 100_000_000,
         };
         let mut engine = new_engine(params);
 
         // No insurance — deficit goes through K
         let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-        engine.deposit(lp, usdc(1_000_000_000), oracle, 0).unwrap();
-        let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0);
+        engine.deposit_not_atomic(lp, usdc(1_000_000_000), oracle, 0).unwrap();
+        let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
 
         // Create longs with random capitalizations ($10K - $10M)
         let mut longs: Vec<(u16, u128)> = Vec::new(); // (idx, capital)
         for _ in 0..n_longs {
             let cap_usdc: u64 = rng.gen_range(10_000..=10_000_000);
             let idx = engine.add_user(0).unwrap();
-            engine.deposit(idx, usdc(cap_usdc), oracle, 0).unwrap();
+            engine.deposit_not_atomic(idx, usdc(cap_usdc), oracle, 0).unwrap();
             longs.push((idx, usdc(cap_usdc)));
         }
 
@@ -2322,11 +2277,11 @@ fn test_adl_fuzz() {
         for _ in 0..n_shorts {
             let cap_usdc: u64 = rng.gen_range(1_000..=100_000);
             let idx = engine.add_user(0).unwrap();
-            engine.deposit(idx, usdc(cap_usdc), oracle, 0).unwrap();
+            engine.deposit_not_atomic(idx, usdc(cap_usdc), oracle, 0).unwrap();
             shorts.push(idx);
         }
 
-        for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+        for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
         // Open positions with random leverage
         let slot = 64;
@@ -2336,7 +2291,7 @@ fn test_adl_fuzz() {
             let notional = (cap as f64 * lev) as u128;
             let size_q = (notional * POS_SCALE / oracle as u128) as i128;
             if size_q > 0 {
-                match engine.execute_trade_not_atomic(idx, lp, oracle, slot, size_q, oracle, 0, 0) {
+                match engine.execute_trade_not_atomic(idx, lp, oracle, slot, size_q, oracle, 0, 0, 1) {
                     Ok(()) => long_positions.push((idx, size_q)),
                     Err(_) => {}
                 }
@@ -2350,7 +2305,7 @@ fn test_adl_fuzz() {
             let notional = (cap as f64 * lev) as u128;
             let size_q = (notional * POS_SCALE / oracle as u128) as i128;
             if size_q > 0 {
-                match engine.execute_trade_not_atomic(lp, idx, oracle, slot, size_q, oracle, 0, 0) {
+                match engine.execute_trade_not_atomic(lp, idx, oracle, slot, size_q, oracle, 0, 0, 1) {
                     Ok(()) => short_opened += 1,
                     Err(_) => {}
                 }
@@ -2361,7 +2316,7 @@ fn test_adl_fuzz() {
             continue; // skip degenerate seeds
         }
 
-        for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+        for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
         // Record pre-ADL state for each long (capital, pnl, effective position)
         let pre_state: Vec<(u16, u128, i128, i128)> = long_positions.iter().map(|&(idx, _)| {
@@ -2376,7 +2331,7 @@ fn test_adl_fuzz() {
             // Random bankruptcy depth: 2x to 50x their capital
             let depth_mult: f64 = rng.gen_range(2.0..50.0);
             let loss = (cap as f64 * depth_mult) as i128;
-            engine.set_pnl_with_reserve(idx as usize, -loss, ReserveMode::ImmediateRelease).unwrap();
+            engine.set_pnl_with_reserve(idx as usize, -loss, ReserveMode::NoPositiveIncreaseAllowed, None).unwrap();
         }
 
         // Crank through all liquidations
@@ -2387,7 +2342,7 @@ fn test_adl_fuzz() {
 
         for s in 97..=2000 {
             let candidates = deficit_ordered_candidates(&engine);
-            let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0)
+            let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1)
                 .map(|o| o.num_liquidations as u64).unwrap_or(0);
             seed_liqs += new_liqs;
 
@@ -2422,7 +2377,7 @@ fn test_adl_fuzz() {
         // Check fairness: each surviving long should have absorbed K-deficit
         // proportionally to their position size.
         // Touch all longs to settle final state.
-        for s in 2001..=2100 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+        for s in 2001..=2100 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
         // Collect equity change for surviving longs.
         // Separate into: same-epoch (position still open, settled mid-cascade)
@@ -2525,28 +2480,30 @@ fn test_zombie_haircut() {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
+        max_accrual_dt_slots: 1_000,
+        max_abs_funding_e9_per_slot: 100_000_000,
     };
     let mut engine = new_engine(params);
 
     // Setup: LP + zombie (long) + 3 profit holders (long) who will exit
     let _ = engine.top_up_insurance_fund(usdc(1_000_000), 0);
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, usdc(10_000_000), oracle, 0).unwrap(); // $10M LP (less than total PnL)
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0);
+    engine.deposit_not_atomic(lp, usdc(10_000_000), oracle, 0).unwrap(); // $10M LP (less than total PnL)
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
 
     let zombie = engine.add_user(0).unwrap();
-    engine.deposit(zombie, usdc(100_000), oracle, 0).unwrap(); // $100K
+    engine.deposit_not_atomic(zombie, usdc(100_000), oracle, 0).unwrap(); // $100K
 
     let user_a = engine.add_user(0).unwrap();
-    engine.deposit(user_a, usdc(200_000), oracle, 0).unwrap(); // $200K
+    engine.deposit_not_atomic(user_a, usdc(200_000), oracle, 0).unwrap(); // $200K
 
     let user_b = engine.add_user(0).unwrap();
-    engine.deposit(user_b, usdc(300_000), oracle, 0).unwrap(); // $300K
+    engine.deposit_not_atomic(user_b, usdc(300_000), oracle, 0).unwrap(); // $300K
 
     let user_c = engine.add_user(0).unwrap();
-    engine.deposit(user_c, usdc(400_000), oracle, 0).unwrap(); // $400K
+    engine.deposit_not_atomic(user_c, usdc(400_000), oracle, 0).unwrap(); // $400K
 
-    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     // All go long against LP (LP takes short side)
     let slot = 64u64;
@@ -2555,12 +2512,12 @@ fn test_zombie_haircut() {
     let ub_size_q = (usdc(1_500_000) * POS_SCALE / oracle as u128) as i128;    // 5x lev
     let uc_size_q = (usdc(2_000_000) * POS_SCALE / oracle as u128) as i128;    // 5x lev
 
-    engine.execute_trade_not_atomic(zombie, lp, oracle, slot, zombie_size_q, oracle, 0, 0).unwrap();
-    engine.execute_trade_not_atomic(user_a, lp, oracle, slot, ua_size_q, oracle, 0, 0).unwrap();
-    engine.execute_trade_not_atomic(user_b, lp, oracle, slot, ub_size_q, oracle, 0, 0).unwrap();
-    engine.execute_trade_not_atomic(user_c, lp, oracle, slot, uc_size_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(zombie, lp, oracle, slot, zombie_size_q, oracle, 0, 0, 1).unwrap();
+    engine.execute_trade_not_atomic(user_a, lp, oracle, slot, ua_size_q, oracle, 0, 0, 1).unwrap();
+    engine.execute_trade_not_atomic(user_b, lp, oracle, slot, ub_size_q, oracle, 0, 0, 1).unwrap();
+    engine.execute_trade_not_atomic(user_c, lp, oracle, slot, uc_size_q, oracle, 0, 0, 1).unwrap();
 
-    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0); }
+    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
 
     let mut total_liqs = 0u64;
 
@@ -2595,7 +2552,8 @@ fn test_zombie_haircut() {
     // LP (counterparty short) absorbs all losses
     let inject = |engine: &mut Box<RiskEngine>, idx: u16, pnl_usdc: u64| {
         let pnl = usdc(pnl_usdc) as i128;
-        engine.set_pnl_with_reserve(idx as usize, pnl, ReserveMode::ImmediateRelease).unwrap();
+        let mut ctx = InstructionContext::new_with_admission(0, 1);
+        engine.set_pnl_with_reserve(idx as usize, pnl, ReserveMode::UseAdmissionPair(0, 1), Some(&mut ctx)).unwrap();
     };
     inject(&mut engine, zombie, 5_000_000);   // $5M
     inject(&mut engine, user_a, 10_000_000);  // $10M
@@ -2603,7 +2561,7 @@ fn test_zombie_haircut() {
     inject(&mut engine, user_c, 20_000_000);  // $20M
     // LP loses $50M counterparty capital
     let lp_cap = engine.accounts[lp as usize].capital.get();
-    engine.set_capital(lp as usize, lp_cap.saturating_sub(usdc(50_000_000)));
+    engine.set_capital(lp as usize, lp_cap.saturating_sub(usdc(50_000_000))).unwrap();
 
     print_state(&engine, "AFTER PNL INJECTION ($50M total: zombie=$5M, A=$10M, B=$15M, C=$20M)", total_liqs);
 
@@ -2615,7 +2573,7 @@ fn test_zombie_haircut() {
         if pos != 0 {
             // Close long: (lp, user, +size) → user gets -size (closes their long)
             let close_size = pos.unsigned_abs() as i128;
-            match engine.execute_trade_not_atomic(lp, uid, oracle, slot2, close_size, oracle, 0, 0) {
+            match engine.execute_trade_not_atomic(lp, uid, oracle, slot2, close_size, oracle, 0, 0, 1) {
                 Ok(()) => {
                     let cap = engine.accounts[uid as usize].capital.get();
                     let pnl = engine.accounts[uid as usize].pnl;
@@ -2631,14 +2589,14 @@ fn test_zombie_haircut() {
         }
     }
 
-    for s in 98..=130 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0) { total_liqs += o.num_liquidations as u64; } }
+    for s in 98..=130 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     // Users withdraw what they can and close accounts
     for (name, uid) in [("A", user_a), ("B", user_b), ("C", user_c)] {
         let cap = engine.accounts[uid as usize].capital.get();
         if cap > 0 {
             let snap = engine.clone();
-            match engine.withdraw_not_atomic(uid, cap, oracle, 131, 0, 0) {
+            match engine.withdraw_not_atomic(uid, cap, oracle, 131, 0, 0, 1) {
                 Ok(()) => println!("  {} withdrew ${:.0}", name, cap as f64 / 1e6),
                 Err(e) => {
                     println!("  {} withdraw failed: {:?}", name, e);
@@ -2648,22 +2606,22 @@ fn test_zombie_haircut() {
         }
     }
     for uid in [user_a, user_b, user_c] {
-        let _ = engine.close_account_not_atomic(uid, 132, oracle, 0, 0);
+        let _ = engine.close_account_not_atomic(uid, 132, oracle, 0, 0, 1);
     }
 
-    for s in 133..=160 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0) { total_liqs += o.num_liquidations as u64; } }
+    for s in 133..=160 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     print_state(&engine, "AFTER A/B/C EXIT (zombie still OPEN with $5M PnL)", total_liqs);
 
     // ── Phase: Crank forward — LP bankruptcy → ADL winds down zombie ──
     println!("\n--- Cranking forward (LP bankruptcy → ADL on zombie's position) ---");
-    for s in 161..=500 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0) { total_liqs += o.num_liquidations as u64; } }
+    for s in 161..=500 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     print_state(&engine, "AFTER ADL WIND-DOWN", total_liqs);
 
     // ── Phase: Fast-forward past warmup ──
     println!("\n--- Fast-forward past warmup ---");
-    for s in 501..=1200 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0) { total_liqs += o.num_liquidations as u64; } }
+    for s in 501..=1200 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     print_state(&engine, "AFTER WARMUP ELAPSES (final state)", total_liqs);
 
@@ -2713,12 +2671,14 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
+        max_accrual_dt_slots: 1_000,
+        max_abs_funding_e9_per_slot: 100_000_000,
     };
     let mut engine = new_engine(params);
     let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-    engine.deposit(lp, usdc(50_000_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(lp, usdc(50_000_000), oracle, 0).unwrap();
     let cands = all_accounts(&engine);
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &cands, 4096, 0, 0);
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &cands, 4096, 0, 0, 1);
     (engine, lp)
 }
 
@@ -2730,12 +2690,12 @@ fn test_fee_asymmetry() {
     let (mut engine, lp) = make_test_engine();
 
     let user_a = engine.add_user(0).unwrap();
-    engine.deposit(user_a, usdc(1_000_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(user_a, usdc(1_000_000), oracle, 0).unwrap();
     let user_b = engine.add_user(0).unwrap();
-    engine.deposit(user_b, usdc(1_000_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(user_b, usdc(1_000_000), oracle, 0).unwrap();
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
 
     let cap_a_pre = engine.accounts[user_a as usize].capital.get();
     let cap_b_pre = engine.accounts[user_b as usize].capital.get();
@@ -2743,7 +2703,7 @@ fn test_fee_asymmetry() {
 
     // Trade: a buys from b. size_q > 0 means a gets +size, b gets -size.
     let size_q = (usdc(500_000) * POS_SCALE / oracle as u128) as i128;
-    engine.execute_trade_not_atomic(user_a, user_b, oracle, 64, size_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(user_a, user_b, oracle, 64, size_q, oracle, 0, 0, 1).unwrap();
 
     let cap_a_post = engine.accounts[user_a as usize].capital.get();
     let cap_b_post = engine.accounts[user_b as usize].capital.get();
@@ -2775,29 +2735,29 @@ fn test_close_account_fee_forgiveness() {
     let (mut engine, lp) = make_test_engine();
 
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, usdc(100_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(user, usdc(100_000), oracle, 0).unwrap();
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
 
     // Open a position
     let size_q = (usdc(200_000) * POS_SCALE / oracle as u128) as i128;
-    engine.execute_trade_not_atomic(user, lp, oracle, 64, size_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(user, lp, oracle, 64, size_q, oracle, 0, 0, 1).unwrap();
 
     // Crank for many slots to accumulate maintenance fee debt
     for s in 65..=1000 {
         let cands = all_accounts(&engine);
-        let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0);
+        let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1);
     }
 
     // Close the position (sell back to LP)
     let pos = engine.accounts[user as usize].position_basis_q;
     if pos != 0 {
-        let _ = engine.execute_trade_not_atomic(lp, user, oracle, 1000, pos, oracle, 0, 0);
+        let _ = engine.execute_trade_not_atomic(lp, user, oracle, 1000, pos, oracle, 0, 0, 1);
     }
 
     let cands = all_accounts(&engine);
-    for s in 1001..=1010 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0); }
+    for s in 1001..=1010 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
 
     let fee_credits_pre = engine.accounts[user as usize].fee_credits.get();
     let capital_pre = engine.accounts[user as usize].capital.get();
@@ -2811,7 +2771,7 @@ fn test_close_account_fee_forgiveness() {
     println!("    fee_credits  = {}", fee_credits_pre);
     println!("    position     = {}", pos_pre);
 
-    match engine.close_account_not_atomic(user, 1011, oracle, 0, 0) {
+    match engine.close_account_not_atomic(user, 1011, oracle, 0, 0, 1) {
         Ok(refund) => {
             println!("  close_account returned ${:.0}", refund as f64 / 1e6);
             if fee_credits_pre < 0 && refund > 0 {
@@ -2838,18 +2798,18 @@ fn test_risk_reducing_exemption() {
     let (mut engine, lp) = make_test_engine();
 
     let user = engine.add_user(0).unwrap();
-    engine.deposit(user, usdc(100_000), oracle, 0).unwrap();
+    engine.deposit_not_atomic(user, usdc(100_000), oracle, 0).unwrap();
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
 
     // Open a leveraged long position
     let size_q = (usdc(800_000) * POS_SCALE / oracle as u128) as i128; // ~8x leverage
-    engine.execute_trade_not_atomic(user, lp, oracle, 64, size_q, oracle, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(user, lp, oracle, 64, size_q, oracle, 0, 0, 1).unwrap();
 
     // Inject negative PnL to push below maintenance margin
     let loss = -(usdc(70_000) as i128); // loses most of capital
-    engine.set_pnl_with_reserve(user as usize, loss, ReserveMode::ImmediateRelease).unwrap();
+    engine.set_pnl_with_reserve(user as usize, loss, ReserveMode::NoPositiveIncreaseAllowed, None).unwrap();
 
     let cap = engine.accounts[user as usize].capital.get();
     let pnl = engine.accounts[user as usize].pnl;
@@ -2864,7 +2824,7 @@ fn test_risk_reducing_exemption() {
     // Try a strictly risk-reducing trade: close half the position
     let half_close = pos / 2;
     println!("  Attempting risk-reducing trade: close half position (size={})", half_close);
-    match engine.execute_trade_not_atomic(lp, user, oracle, 64, half_close, oracle, 0, 0) {
+    match engine.execute_trade_not_atomic(lp, user, oracle, 64, half_close, oracle, 0, 0, 1) {
         Ok(()) => {
             let new_pos = engine.accounts[user as usize].position_basis_q;
             println!("  SUCCESS: position reduced {} → {}", pos, new_pos);
@@ -2879,7 +2839,7 @@ fn test_risk_reducing_exemption() {
     // Try a risk-INCREASING trade (should fail)
     let increase = size_q / 4;
     println!("  Attempting risk-increasing trade: add to position (size={})", increase);
-    match engine.execute_trade_not_atomic(user, lp, oracle, 64, increase, oracle, 0, 0) {
+    match engine.execute_trade_not_atomic(user, lp, oracle, 64, increase, oracle, 0, 0, 1) {
         Ok(()) => println!("  BUG: risk-increasing trade accepted while below maintenance!"),
         Err(e) => println!("  Correctly rejected: {:?} ✓", e),
     }
@@ -2898,29 +2858,29 @@ fn test_adl_pipeline_integration() {
     let mut shorts: Vec<u16> = Vec::new();
     for cap in [200_000, 500_000, 1_000_000] {
         let idx = engine.add_user(0).unwrap();
-        engine.deposit(idx, usdc(cap), oracle, 0).unwrap();
+        engine.deposit_not_atomic(idx, usdc(cap), oracle, 0).unwrap();
         longs.push(idx);
     }
     for cap in [100_000, 300_000, 600_000] {
         let idx = engine.add_user(0).unwrap();
-        engine.deposit(idx, usdc(cap), oracle, 0).unwrap();
+        engine.deposit_not_atomic(idx, usdc(cap), oracle, 0).unwrap();
         shorts.push(idx);
     }
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
 
     // Open positions
     let slot = 64;
     for &idx in &longs {
         let cap = engine.accounts[idx as usize].capital.get();
         let size_q = (cap * 5 * POS_SCALE / oracle as u128) as i128; // 5x long
-        let _ = engine.execute_trade_not_atomic(idx, lp, oracle, slot, size_q, oracle, 0, 0);
+        let _ = engine.execute_trade_not_atomic(idx, lp, oracle, slot, size_q, oracle, 0, 0, 1);
     }
     for &idx in &shorts {
         let cap = engine.accounts[idx as usize].capital.get();
         let size_q = (cap * 8 * POS_SCALE / oracle as u128) as i128; // 8x short
-        let _ = engine.execute_trade_not_atomic(lp, idx, oracle, slot, size_q, oracle, 0, 0);
+        let _ = engine.execute_trade_not_atomic(lp, idx, oracle, slot, size_q, oracle, 0, 0, 1);
     }
 
     println!("\n=== ISSUE 4: Full ADL Pipeline Integration ===");
@@ -2929,7 +2889,7 @@ fn test_adl_pipeline_integration() {
 
     // Make shorts deeply bankrupt
     for &idx in &shorts {
-        engine.set_pnl_with_reserve(idx as usize, -(usdc(1_000_000) as i128), ReserveMode::ImmediateRelease).unwrap();
+        engine.set_pnl_with_reserve(idx as usize, -(usdc(1_000_000) as i128), ReserveMode::NoPositiveIncreaseAllowed, None).unwrap();
     }
 
     // Crank to liquidate shorts → ADL fires → K_long changes
@@ -2941,7 +2901,7 @@ fn test_adl_pipeline_integration() {
     let mut total_liqs = 0u64;
     for s in 65..=200 {
         let cands = deficit_ordered_candidates(&engine);
-        if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0) {
+        if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1) {
             total_liqs += outcome.num_liquidations as u64;
         }
         // OI balance must hold after every crank
@@ -2961,12 +2921,12 @@ fn test_adl_pipeline_integration() {
     // Now try a SUBSEQUENT trade on the post-ADL state
     println!("\n  Attempting post-ADL trade...");
     let new_user = engine.add_user(0).unwrap();
-    engine.deposit(new_user, usdc(500_000), oracle, 200).unwrap();
+    engine.deposit_not_atomic(new_user, usdc(500_000), oracle, 200).unwrap();
     let cands = all_accounts(&engine);
-    let _ = engine.keeper_crank_not_atomic(201, oracle, &cands, 4096, 0, 0);
+    let _ = engine.keeper_crank_not_atomic(201, oracle, &cands, 4096, 0, 0, 1);
 
     let new_size = (usdc(1_000_000) * POS_SCALE / oracle as u128) as i128;
-    match engine.execute_trade_not_atomic(new_user, lp, oracle, 201, new_size, oracle, 0, 0) {
+    match engine.execute_trade_not_atomic(new_user, lp, oracle, 201, new_size, oracle, 0, 0, 1) {
         Ok(()) => {
             println!("    Post-ADL trade succeeded ✓");
             assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q,
