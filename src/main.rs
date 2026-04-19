@@ -513,6 +513,32 @@ fn sorted(vals: impl Iterator<Item = f64>) -> Vec<f64> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Account materialization (v12.18.1 API)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// v12.18.1 removed add_user / add_lp / new_account_fee. Accounts materialize
+// via deposit_not_atomic(amount >= cfg_min_initial_deposit). We mirror the
+// test helpers: pick the free-list head, call materialize_at (stress-visible
+// backdoor) to allocate a slot without moving capital, then deposit.
+
+fn add_user(engine: &mut RiskEngine) -> Result<u16, percolator::RiskError> {
+    let idx = engine.free_head;
+    if idx == u16::MAX || (idx as usize) >= percolator::MAX_ACCOUNTS {
+        return Err(percolator::RiskError::Overflow);
+    }
+    engine.materialize_at(idx, 0)?;
+    Ok(idx)
+}
+
+fn add_lp(engine: &mut RiskEngine, matcher_program: [u8; 32], matcher_context: [u8; 32]) -> Result<u16, percolator::RiskError> {
+    let idx = add_user(engine)?;
+    engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
+    engine.accounts[idx as usize].matcher_program = matcher_program;
+    engine.accounts[idx as usize].matcher_context = matcher_context;
+    Ok(idx)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Admission-pair stress tracking (spec §4.7)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -639,7 +665,6 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         initial_margin_bps: cfg.im_bps,
         trading_fee_bps: cfg.trading_fee_bps,
         max_accounts: percolator::MAX_ACCOUNTS as u64,
-        new_account_fee: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: cfg.liquidation_fee_bps,
         liquidation_fee_cap: U128::new(usdc(50_000)),
@@ -653,6 +678,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
+        max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
     };
 
     let mut engine = new_engine_with(params, 0, p0);
@@ -667,11 +694,14 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut stress_first_slot: u64 = u64::MAX;
     let mut min_headroom: i128 = i128::MAX;
 
-    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp_idx = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
     engine.deposit_not_atomic(lp_idx, usdc(cfg.lp_capital_usdc), p0, 0).unwrap();
 
-    // Initial crank at slot 0
-    let _ = engine.keeper_crank_not_atomic(0, p0, &all_accounts(&engine), 4096, 0, admit_h_min, admit_h_max);
+    // Initial crank at slot 0 — batch across all accounts (64 per crank)
+    let init_candidates = all_accounts(&engine);
+    for chunk in init_candidates.chunks(64) {
+        let _ = engine.keeper_crank_not_atomic(0, p0, chunk, 64, 0, admit_h_min, admit_h_max);
+    }
 
     // ── Capital distributions (lognormal mixtures) ──────────────────────
     let retail = LogNormal::new(2_000f64.ln(), 1.0).unwrap();
@@ -681,7 +711,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Add whale account if enabled ────────────────────────────────────
     let mut users: Vec<UserInfo> = Vec::with_capacity(cfg.n_users + 1);
     if cfg.whale_enabled {
-        let whale_idx = engine.add_user(0).unwrap();
+        let whale_idx = add_user(&mut engine).unwrap();
         engine.deposit_not_atomic(whale_idx, usdc(cfg.whale_capital_usdc), p0, 0).unwrap();
         users.push(UserInfo {
             idx: whale_idx,
@@ -703,7 +733,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         };
         let cap_usdc = cap_f.max(50.0).min(50_000_000.0) as u64;
 
-        let user_idx = match engine.add_user(0) {
+        let user_idx = match add_user(&mut engine) {
             Ok(i) => i,
             Err(_) => break, // slab full
         };
@@ -720,9 +750,13 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     }
 
     // ── Run cranks through setup phase for full sweep ───────────────────
+    // Each crank can only touch 64 accounts (MAX_TOUCHED_PER_INSTRUCTION),
+    // so we batch candidates into chunks of 64 and issue one crank per chunk.
     for s in 1..=SETUP_SLOTS {
         let candidates = all_accounts(&engine);
-        let _ = engine.keeper_crank_not_atomic(s, p0, &candidates, 4096, 0, admit_h_min, admit_h_max);
+        for chunk in candidates.chunks(64) {
+            let _ = engine.keeper_crank_not_atomic(s, p0, chunk, 64, 0, admit_h_min, admit_h_max);
+        }
     }
 
     // ── Open positions via execute_trade ────────────────────────────────
@@ -791,7 +825,9 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Post-trade sweep ────────────────────────────────────────────────
     for s in (SETUP_SLOTS + 1)..=(SETUP_SLOTS + 32) {
         let candidates = all_accounts(&engine);
-        let _ = engine.keeper_crank_not_atomic(s, p0, &candidates, 4096, 0, admit_h_min, admit_h_max);
+        for chunk in candidates.chunks(64) {
+            let _ = engine.keeper_crank_not_atomic(s, p0, chunk, 64, 0, admit_h_min, admit_h_max);
+        }
     }
 
     // ── Inject zombies: positive PnL + fee debt ─────────────────────────
@@ -888,9 +924,18 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let pre_k_long = engine.adl_coeff_long;
             let pre_k_short = engine.adl_coeff_short;
 
+            // Batch cranks across all candidates (64 per instruction, the
+            // MAX_TOUCHED_PER_INSTRUCTION cap). Funding accrues only on the
+            // first crank of a given slot — subsequent cranks pass rate=0
+            // so we don't double-charge funding.
             let candidates = build_candidates(&engine, &cfg.candidate_ordering);
-            if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, oracle, &candidates, 4096, funding_rate, admit_h_min, admit_h_max) {
-                total_liquidations += outcome.num_liquidations as u64;
+            let mut first = true;
+            for chunk in candidates.chunks(64) {
+                let rate = if first { funding_rate } else { 0 };
+                if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, oracle, chunk, 64, rate, admit_h_min, admit_h_max) {
+                    total_liquidations += outcome.num_liquidations as u64;
+                }
+                first = false;
             }
 
             // Admission stress: engine picks admit_h_max when matured >= residual
@@ -1038,7 +1083,9 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let final_slot = crash_start + cfg.total_slots;
     let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
     let candidates = build_candidates(&engine, &cfg.candidate_ordering);
-    let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, &candidates, 4096, 0, admit_h_min, admit_h_max);
+    for chunk in candidates.chunks(64) {
+        let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, chunk, 64, 0, admit_h_min, admit_h_max);
+    }
     {
         let vault_val = engine.vault.get();
         let c_tot_val = engine.c_tot.get();
@@ -1841,7 +1888,6 @@ fn test_adl_fairness() {
         initial_margin_bps: 1000,
         trading_fee_bps: 0,
         max_accounts: percolator::MAX_ACCOUNTS as u64,
-        new_account_fee: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::new(usdc(50_000)),
@@ -1855,30 +1901,32 @@ fn test_adl_fairness() {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
+        max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
     };
     let mut engine = new_engine(params);
 
     // No insurance — forces deficit through K-index socialization
     // (admin controls insurance; zero here to isolate ADL fairness)
-    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
     engine.deposit_not_atomic(lp, usdc(5_000_000), oracle, 0).unwrap();
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 64, 0, 0, 1);
 
     // Bankrupt account: goes LONG, will be liquidated
-    let bankrupt = engine.add_user(0).unwrap();
+    let bankrupt = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(bankrupt, usdc(100_000), oracle, 0).unwrap();
 
     // 3 SHORT accounts with different sizes — these receive ADL
-    let short_a = engine.add_user(0).unwrap();
+    let short_a = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(short_a, usdc(500_000), oracle, 0).unwrap();
 
-    let short_b = engine.add_user(0).unwrap();
+    let short_b = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(short_b, usdc(1_000_000), oracle, 0).unwrap();
 
-    let short_c = engine.add_user(0).unwrap();
+    let short_c = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(short_c, usdc(2_000_000), oracle, 0).unwrap();
 
-    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     // Open positions
     // execute_trade(a, b, ..., size_q, ...): a gets +size_q, b gets -size_q
@@ -1895,7 +1943,7 @@ fn test_adl_fairness() {
     engine.execute_trade_not_atomic(lp, short_b, oracle, slot, sb_q, oracle, 0, 0, 1).unwrap();
     engine.execute_trade_not_atomic(lp, short_c, oracle, slot, sc_q, oracle, 0, 0, 1).unwrap();
 
-    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     // Record pre-ADL effective positions for shorts
     let pre_a = engine.accounts[short_a as usize].position_basis_q;
@@ -1932,7 +1980,7 @@ fn test_adl_fairness() {
     let pre_k_short = engine.adl_coeff_short;
 
     let mut total_liqs = 0u64;
-    for s in 97..=160 { let candidates = deficit_ordered_candidates(&engine); if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += outcome.num_liquidations as u64; } }
+    for s in 97..=160 { let candidates = deficit_ordered_candidates(&engine); if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1) { total_liqs += outcome.num_liquidations as u64; } }
 
     println!("\n=== AFTER CRANK (liquidation + ADL) ===");
     println!("  liquidations = {}", total_liqs);
@@ -1952,7 +2000,7 @@ fn test_adl_fairness() {
     // Touch each short account to settle ADL effects
     // We need to trigger touch_account_full via a no-op operation
     // Using withdraw(0) or just reading effective_pos after a crank that touches them
-    for s in 161..=200 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 161..=200 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     // Read post-ADL state
     let post_pnl_a = engine.accounts[short_a as usize].pnl;
@@ -2038,7 +2086,6 @@ fn test_adl_saturation() {
         initial_margin_bps: 500,        // 5% IM → 20x max
         trading_fee_bps: 0,
         max_accounts: percolator::MAX_ACCOUNTS as u64,
-        new_account_fee: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::new(usdc(50_000)),
@@ -2052,17 +2099,19 @@ fn test_adl_saturation() {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
+        max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
     };
     let mut engine = new_engine(params);
 
     // No insurance — all deficit goes through K
-    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
     // Massive LP capital so it can be counterparty to everyone
     engine.deposit_not_atomic(lp, usdc(1_000_000_000), oracle, 0).unwrap(); // $1B LP
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 64, 0, 0, 1);
 
     // The single long — will receive all ADL
-    let the_long = engine.add_user(0).unwrap();
+    let the_long = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(the_long, usdc(10_000_000), oracle, 0).unwrap(); // $10M
 
     // Create as many shorts as possible
@@ -2070,12 +2119,12 @@ fn test_adl_saturation() {
     let mut shorts: Vec<u16> = Vec::with_capacity(max_shorts as usize);
     println!("Creating {} short accounts...", max_shorts);
     for _ in 0..max_shorts {
-        let idx = engine.add_user(0).unwrap();
+        let idx = add_user(&mut engine).unwrap();
         engine.deposit_not_atomic(idx, usdc(10_000), oracle, 0).unwrap(); // $10K each
         shorts.push(idx);
     }
 
-    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     // The long opens a huge position
     let slot = 64;
@@ -2097,7 +2146,7 @@ fn test_adl_saturation() {
     }
     println!("  opened {}/{} short positions", opened, shorts.len());
 
-    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     println!("\n=== INITIAL STATE ===");
     println!("  accounts = {} shorts + 1 long + LP", opened);
@@ -2132,7 +2181,7 @@ fn test_adl_saturation() {
         let pre_a = engine.adl_mult_long;
 
         let candidates = deficit_ordered_candidates(&engine);
-        let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1)
+        let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1)
             .map(|o| o.num_liquidations as u64).unwrap_or(0);
         if new_liqs > 0 {
             total_liqs += new_liqs;
@@ -2243,7 +2292,6 @@ fn test_adl_fuzz() {
             initial_margin_bps: im_bps,
             trading_fee_bps: 0,
             max_accounts: percolator::MAX_ACCOUNTS as u64,
-            new_account_fee: U128::new(0),
             max_crank_staleness_slots: u64::MAX,
             liquidation_fee_bps: 0,
             liquidation_fee_cap: U128::new(usdc(50_000)),
@@ -2257,19 +2305,21 @@ fn test_adl_fuzz() {
             resolve_price_deviation_bps: 1000,
             max_accrual_dt_slots: 1_000,
             max_abs_funding_e9_per_slot: 100_000_000,
+            min_funding_lifetime_slots: 1_000,
+            max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
         };
         let mut engine = new_engine(params);
 
         // No insurance — deficit goes through K
-        let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+        let lp = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
         engine.deposit_not_atomic(lp, usdc(1_000_000_000), oracle, 0).unwrap();
-        let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
+        let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 64, 0, 0, 1);
 
         // Create longs with random capitalizations ($10K - $10M)
         let mut longs: Vec<(u16, u128)> = Vec::new(); // (idx, capital)
         for _ in 0..n_longs {
             let cap_usdc: u64 = rng.gen_range(10_000..=10_000_000);
-            let idx = engine.add_user(0).unwrap();
+            let idx = add_user(&mut engine).unwrap();
             engine.deposit_not_atomic(idx, usdc(cap_usdc), oracle, 0).unwrap();
             longs.push((idx, usdc(cap_usdc)));
         }
@@ -2278,12 +2328,12 @@ fn test_adl_fuzz() {
         let mut shorts: Vec<u16> = Vec::new();
         for _ in 0..n_shorts {
             let cap_usdc: u64 = rng.gen_range(1_000..=100_000);
-            let idx = engine.add_user(0).unwrap();
+            let idx = add_user(&mut engine).unwrap();
             engine.deposit_not_atomic(idx, usdc(cap_usdc), oracle, 0).unwrap();
             shorts.push(idx);
         }
 
-        for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+        for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
         // Open positions with random leverage
         let slot = 64;
@@ -2318,7 +2368,7 @@ fn test_adl_fuzz() {
             continue; // skip degenerate seeds
         }
 
-        for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+        for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
         // Record pre-ADL state for each long (capital, pnl, effective position)
         let pre_state: Vec<(u16, u128, i128, i128)> = long_positions.iter().map(|&(idx, _)| {
@@ -2344,7 +2394,7 @@ fn test_adl_fuzz() {
 
         for s in 97..=2000 {
             let candidates = deficit_ordered_candidates(&engine);
-            let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1)
+            let new_liqs = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1)
                 .map(|o| o.num_liquidations as u64).unwrap_or(0);
             seed_liqs += new_liqs;
 
@@ -2379,7 +2429,7 @@ fn test_adl_fuzz() {
         // Check fairness: each surviving long should have absorbed K-deficit
         // proportionally to their position size.
         // Touch all longs to settle final state.
-        for s in 2001..=2100 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+        for s in 2001..=2100 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
         // Collect equity change for surviving longs.
         // Separate into: same-epoch (position still open, settled mid-cascade)
@@ -2470,7 +2520,6 @@ fn test_zombie_haircut() {
         initial_margin_bps: 1000,
         trading_fee_bps: 0,
         max_accounts: percolator::MAX_ACCOUNTS as u64,
-        new_account_fee: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::new(usdc(50_000)),
@@ -2484,28 +2533,30 @@ fn test_zombie_haircut() {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
+        max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
     };
     let mut engine = new_engine(params);
 
     // Setup: LP + zombie (long) + 3 profit holders (long) who will exit
     let _ = engine.top_up_insurance_fund(usdc(1_000_000), 0);
-    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
     engine.deposit_not_atomic(lp, usdc(10_000_000), oracle, 0).unwrap(); // $10M LP (less than total PnL)
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 4096, 0, 0, 1);
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &all_accounts(&engine), 64, 0, 0, 1);
 
-    let zombie = engine.add_user(0).unwrap();
+    let zombie = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(zombie, usdc(100_000), oracle, 0).unwrap(); // $100K
 
-    let user_a = engine.add_user(0).unwrap();
+    let user_a = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user_a, usdc(200_000), oracle, 0).unwrap(); // $200K
 
-    let user_b = engine.add_user(0).unwrap();
+    let user_b = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user_b, usdc(300_000), oracle, 0).unwrap(); // $300K
 
-    let user_c = engine.add_user(0).unwrap();
+    let user_c = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user_c, usdc(400_000), oracle, 0).unwrap(); // $400K
 
-    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 1..=64 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     // All go long against LP (LP takes short side)
     let slot = 64u64;
@@ -2519,7 +2570,7 @@ fn test_zombie_haircut() {
     engine.execute_trade_not_atomic(user_b, lp, oracle, slot, ub_size_q, oracle, 0, 0, 1).unwrap();
     engine.execute_trade_not_atomic(user_c, lp, oracle, slot, uc_size_q, oracle, 0, 0, 1).unwrap();
 
-    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1); }
+    for s in 65..=96 { let candidates = all_accounts(&engine); let _ = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1); }
 
     let mut total_liqs = 0u64;
 
@@ -2591,7 +2642,7 @@ fn test_zombie_haircut() {
         }
     }
 
-    for s in 98..=130 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
+    for s in 98..=130 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     // Users withdraw what they can and close accounts
     for (name, uid) in [("A", user_a), ("B", user_b), ("C", user_c)] {
@@ -2611,19 +2662,19 @@ fn test_zombie_haircut() {
         let _ = engine.close_account_not_atomic(uid, 132, oracle, 0, 0, 1);
     }
 
-    for s in 133..=160 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
+    for s in 133..=160 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     print_state(&engine, "AFTER A/B/C EXIT (zombie still OPEN with $5M PnL)", total_liqs);
 
     // ── Phase: Crank forward — LP bankruptcy → ADL winds down zombie ──
     println!("\n--- Cranking forward (LP bankruptcy → ADL on zombie's position) ---");
-    for s in 161..=500 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
+    for s in 161..=500 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     print_state(&engine, "AFTER ADL WIND-DOWN", total_liqs);
 
     // ── Phase: Fast-forward past warmup ──
     println!("\n--- Fast-forward past warmup ---");
-    for s in 501..=1200 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 4096, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
+    for s in 501..=1200 { let candidates = all_accounts(&engine); if let Ok(o) = engine.keeper_crank_not_atomic(s, oracle, &candidates, 64, 0, 0, 1) { total_liqs += o.num_liquidations as u64; } }
 
     print_state(&engine, "AFTER WARMUP ELAPSES (final state)", total_liqs);
 
@@ -2661,7 +2712,6 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         initial_margin_bps: 1000,
         trading_fee_bps: 100, // 1% trading fee
         max_accounts: percolator::MAX_ACCOUNTS as u64,
-        new_account_fee: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 50,
         liquidation_fee_cap: U128::new(usdc(50_000)),
@@ -2675,12 +2725,14 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
+        max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
     };
     let mut engine = new_engine(params);
-    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
     engine.deposit_not_atomic(lp, usdc(50_000_000), oracle, 0).unwrap();
     let cands = all_accounts(&engine);
-    let _ = engine.keeper_crank_not_atomic(0, oracle, &cands, 4096, 0, 0, 1);
+    let _ = engine.keeper_crank_not_atomic(0, oracle, &cands, 64, 0, 0, 1);
     (engine, lp)
 }
 
@@ -2691,13 +2743,13 @@ fn test_fee_asymmetry() {
     let oracle = price_e6(60_000);
     let (mut engine, lp) = make_test_engine();
 
-    let user_a = engine.add_user(0).unwrap();
+    let user_a = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user_a, usdc(1_000_000), oracle, 0).unwrap();
-    let user_b = engine.add_user(0).unwrap();
+    let user_b = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user_b, usdc(1_000_000), oracle, 0).unwrap();
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1); }
 
     let cap_a_pre = engine.accounts[user_a as usize].capital.get();
     let cap_b_pre = engine.accounts[user_b as usize].capital.get();
@@ -2736,11 +2788,11 @@ fn test_close_account_fee_forgiveness() {
     let oracle = price_e6(60_000);
     let (mut engine, lp) = make_test_engine();
 
-    let user = engine.add_user(0).unwrap();
+    let user = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user, usdc(100_000), oracle, 0).unwrap();
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1); }
 
     // Open a position
     let size_q = (usdc(200_000) * POS_SCALE / oracle as u128) as i128;
@@ -2749,7 +2801,7 @@ fn test_close_account_fee_forgiveness() {
     // Crank for many slots to accumulate maintenance fee debt
     for s in 65..=1000 {
         let cands = all_accounts(&engine);
-        let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1);
+        let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1);
     }
 
     // Close the position (sell back to LP)
@@ -2759,7 +2811,7 @@ fn test_close_account_fee_forgiveness() {
     }
 
     let cands = all_accounts(&engine);
-    for s in 1001..=1010 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
+    for s in 1001..=1010 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1); }
 
     let fee_credits_pre = engine.accounts[user as usize].fee_credits.get();
     let capital_pre = engine.accounts[user as usize].capital.get();
@@ -2799,11 +2851,11 @@ fn test_risk_reducing_exemption() {
     let oracle = price_e6(60_000);
     let (mut engine, lp) = make_test_engine();
 
-    let user = engine.add_user(0).unwrap();
+    let user = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(user, usdc(100_000), oracle, 0).unwrap();
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1); }
 
     // Open a leveraged long position
     let size_q = (usdc(800_000) * POS_SCALE / oracle as u128) as i128; // ~8x leverage
@@ -2859,18 +2911,18 @@ fn test_adl_pipeline_integration() {
     let mut longs: Vec<u16> = Vec::new();
     let mut shorts: Vec<u16> = Vec::new();
     for cap in [200_000, 500_000, 1_000_000] {
-        let idx = engine.add_user(0).unwrap();
+        let idx = add_user(&mut engine).unwrap();
         engine.deposit_not_atomic(idx, usdc(cap), oracle, 0).unwrap();
         longs.push(idx);
     }
     for cap in [100_000, 300_000, 600_000] {
-        let idx = engine.add_user(0).unwrap();
+        let idx = add_user(&mut engine).unwrap();
         engine.deposit_not_atomic(idx, usdc(cap), oracle, 0).unwrap();
         shorts.push(idx);
     }
 
     let cands = all_accounts(&engine);
-    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1); }
+    for s in 1..=64 { let _ = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1); }
 
     // Open positions
     let slot = 64;
@@ -2903,7 +2955,7 @@ fn test_adl_pipeline_integration() {
     let mut total_liqs = 0u64;
     for s in 65..=200 {
         let cands = deficit_ordered_candidates(&engine);
-        if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &cands, 4096, 0, 0, 1) {
+        if let Ok(outcome) = engine.keeper_crank_not_atomic(s, oracle, &cands, 64, 0, 0, 1) {
             total_liqs += outcome.num_liquidations as u64;
         }
         // OI balance must hold after every crank
@@ -2922,10 +2974,10 @@ fn test_adl_pipeline_integration() {
 
     // Now try a SUBSEQUENT trade on the post-ADL state
     println!("\n  Attempting post-ADL trade...");
-    let new_user = engine.add_user(0).unwrap();
+    let new_user = add_user(&mut engine).unwrap();
     engine.deposit_not_atomic(new_user, usdc(500_000), oracle, 200).unwrap();
     let cands = all_accounts(&engine);
-    let _ = engine.keeper_crank_not_atomic(201, oracle, &cands, 4096, 0, 0, 1);
+    let _ = engine.keeper_crank_not_atomic(201, oracle, &cands, 64, 0, 0, 1);
 
     let new_size = (usdc(1_000_000) * POS_SCALE / oracle as u128) as i128;
     match engine.execute_trade_not_atomic(new_user, lp, oracle, 201, new_size, oracle, 0, 0, 1) {
