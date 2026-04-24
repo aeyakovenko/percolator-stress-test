@@ -539,6 +539,31 @@ fn add_lp(engine: &mut RiskEngine, matcher_program: [u8; 32], matcher_context: [
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Oracle clamp for the v12.19 price-move envelope (wrapper-side policy)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The engine rejects any crank whose oracle delta exceeds
+//   max_price_move_bps_per_slot * dt * P_last / 10_000.
+// A real keeper should CLAMP the oracle to the envelope rather than freeze the
+// market: the cascade walks through prices at envelope-max per crank, the
+// consumption counter accumulates each step, and the threshold gate trips
+// `admit_h_max` once cumulative consumption reaches 1/leverage. This gives
+// catch-up liveness without letting the engine mark positions at unrealistic
+// prices.
+
+fn clamp_oracle(real_oracle: u64, last_engine_price: u64, max_move_bps: u64, dt: u64) -> u64 {
+    // Per-call allowed delta in atomic units.
+    // max_move_bps * dt fits u64 for realistic values (≤ MAX_MARGIN_BPS * reasonable dt).
+    let budget_num = (last_engine_price as u128)
+        .saturating_mul(max_move_bps as u128)
+        .saturating_mul(dt as u128);
+    let budget = (budget_num / 10_000) as u64;
+    let lower = last_engine_price.saturating_sub(budget);
+    let upper = last_engine_price.saturating_add(budget).min(percolator::MAX_ORACLE_PRICE);
+    real_oracle.clamp(lower.max(1), upper)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Admission-pair stress tracking (spec §4.7)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -674,17 +699,18 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         h_min: cfg.admit_h_min_slots,
         h_max: cfg.admit_h_max_slots,
         resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: 1,
+        max_accrual_dt_slots: cfg.crank_interval.max(1) * 2,
         max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: 1,
+        min_funding_lifetime_slots: cfg.crank_interval.max(1) * 2,
         max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
         // Solvency envelope (v12.19): max_price_move*dt + funding_budget + liq <= mm.
-        // With dt=1 and rate=10_000 → funding_budget = 0 bps (floor(10000*10000/1e9)=0), so:
-        //   max_price_move <= mm - liq.
-        // We pick max_price_move = (mm - liq - 1).max(1) to leave 1 bps slack.
-        // Scenarios whose natural crash rate (crash_pct / crash_len) exceeds this
-        // will see cranks rejected during the crash window.
-        max_price_move_bps_per_slot: cfg.mm_bps.saturating_sub(cfg.liquidation_fee_bps).saturating_sub(1).max(1),
+        // We size max_accrual_dt_slots = 2*crank_interval (headroom for keeper lag)
+        // and derive max_price_move to satisfy the envelope:
+        //   max_price_move_bps_per_slot <= (mm - liq - 1) / max_accrual_dt_slots
+        // Real oracle moves exceeding this rate get CLAMPED by clamp_oracle()
+        // in the crash loop; the cascade walks through at envelope-max per crank.
+        max_price_move_bps_per_slot: (cfg.mm_bps.saturating_sub(cfg.liquidation_fee_bps).saturating_sub(1)
+            / (cfg.crank_interval.max(1) * 2)).max(1),
     };
 
     let mut engine = new_engine_with(params, 0, p0);
@@ -895,11 +921,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut max_h_fairness_err: f64 = 0.0;
     let mut snapshots: Vec<SlotSnapshot> = Vec::new();
 
-    // v12.19 envelope: max_accrual_dt_slots=1 means cranks must advance slot-by-slot.
-    // We override crank_interval=1 to keep the engine envelope satisfied, losing
-    // the "keeper lag" simulation but gaining realistic oracle-rate bounds.
-    let crank_every: u64 = 1;
-    let _ = cfg.crank_interval; // retained for config compatibility
+    // v12.19: max_accrual_dt_slots = 2 * crank_interval lets cranks run at the
+    // scenario's natural cadence (keeper-lag preserved). Real oracle moves faster
+    // than the envelope are CLAMPED via clamp_oracle() before being passed to
+    // the crank, so the cascade walks through at envelope-max rather than freezing.
+    let crank_every = cfg.crank_interval.max(1);
 
     for slot_offset in 0..cfg.total_slots {
         let slot = crash_start + slot_offset;
@@ -933,6 +959,17 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let pre_k_long = engine.adl_coeff_long;
             let pre_k_short = engine.adl_coeff_short;
 
+            // Clamp the real oracle to the engine's price-move envelope so
+            // fast crashes walk through at envelope-max per crank instead of
+            // freezing the market. dt = slots since last successful crank.
+            let dt = slot.saturating_sub(engine.last_market_slot);
+            let clamped_oracle = clamp_oracle(
+                oracle,
+                engine.last_oracle_price,
+                engine.params.max_price_move_bps_per_slot,
+                dt,
+            );
+
             // Batch cranks across all candidates. Phase1 + Phase2 budgets
             // (max_revalidations + rr_window_size) must fit MAX_TOUCHED=256.
             // We use 64+192 per crank. Funding rate applied only to first
@@ -941,7 +978,7 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             let mut first = true;
             for chunk in candidates.chunks(64) {
                 let rate = if first { funding_rate } else { 0 };
-                if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, oracle, chunk, 64, rate, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192) {
+                if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, clamped_oracle, chunk, 64, rate, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192) {
                     total_liquidations += outcome.num_liquidations as u64;
                 }
                 first = false;
@@ -1089,8 +1126,18 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     }
 
     // ── Final crank to settle all state (especially important with crank lag) ──
+    // Clamp the final oracle too — if the crash ended with price beyond the
+    // envelope relative to the last-marked price, this lets the final sweep
+    // finish walking toward it.
     let final_slot = crash_start + cfg.total_slots;
-    let final_oracle = price_path(cfg, cfg.total_slots.saturating_sub(1));
+    let final_oracle_raw = price_path(cfg, cfg.total_slots.saturating_sub(1));
+    let final_dt = final_slot.saturating_sub(engine.last_market_slot);
+    let final_oracle = clamp_oracle(
+        final_oracle_raw,
+        engine.last_oracle_price,
+        engine.params.max_price_move_bps_per_slot,
+        final_dt,
+    );
     let candidates = build_candidates(&engine, &cfg.candidate_ordering);
     for chunk in candidates.chunks(64) {
         let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192);
@@ -1906,9 +1953,9 @@ fn test_adl_fairness() {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: 1,
+        max_accrual_dt_slots: 10,
         max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: 1,
+        min_funding_lifetime_slots: 10,
         max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
         max_price_move_bps_per_slot: 10,
     };
@@ -2103,9 +2150,9 @@ fn test_adl_saturation() {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: 1,
+        max_accrual_dt_slots: 10,
         max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: 1,
+        min_funding_lifetime_slots: 10,
         max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
         max_price_move_bps_per_slot: 10,
     };
@@ -2535,9 +2582,9 @@ fn test_zombie_haircut() {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: 1,
+        max_accrual_dt_slots: 10,
         max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: 1,
+        min_funding_lifetime_slots: 10,
         max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
         max_price_move_bps_per_slot: 10,
     };
@@ -2726,9 +2773,9 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: 1,
+        max_accrual_dt_slots: 10,
         max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: 1,
+        min_funding_lifetime_slots: 10,
         max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
         max_price_move_bps_per_slot: 10,
     };
