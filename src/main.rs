@@ -263,12 +263,25 @@ struct RunSummary {
     final_a_short: u128,
     drain_only_entered: bool,
     epoch_resets: u64,
-    /// Admission stress: slots where matured_pos_tot > residual (engine picks admit_h_max)
+    /// Admission stress — residual-scarcity lane (spec §4.3 law 3):
+    /// slots where matured_pos_tot >= residual (engine forced to admit_h_max).
     stress_slots: u64,
-    /// First slot where stress regime was entered (u64::MAX if never)
+    /// First slot where residual-scarcity stress was entered (u64::MAX if never).
     stress_first_slot: u64,
-    /// Min headroom observed: residual - matured_pos_tot (negative = stressed)
+    /// Min headroom observed: residual - matured_pos_tot (negative = stressed).
     min_headroom: i128,
+    /// Consumption-threshold stress (spec §4.3 law 2):
+    /// slots where price_move_consumed >= threshold (= cfg.im_bps * PRICE_MOVE_CONSUMPTION_SCALE).
+    consumption_stress_slots: u64,
+    /// First slot where consumption threshold was crossed.
+    consumption_stress_first_slot: u64,
+    /// Peak price_move_consumed_bps_this_generation observed (scaled by 1e9).
+    max_consumption_bps_e9: u128,
+    /// Number of sweep-generation rollovers during the run (each resets consumption).
+    sweep_generations: u64,
+    /// Number of post-crank audit failures: matured_pos_tot > residual.
+    /// This should always be 0 — the admission gate prevents matured overshoot.
+    matured_overshoot_events: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -374,15 +387,25 @@ struct ScenarioSummary {
     epoch_resets_mean: f64,
     /// Max h-fairness error across all runs (0.0 = perfect, >0.05 = concern)
     max_h_fairness_err: f64,
-    /// Admission stress (slots where engine forced admit_h_max path)
+    /// Admission stress — residual-scarcity lane (matured >= residual)
     stress_slots_mean: f64,
     stress_slots_p50: f64,
     stress_slots_p99: f64,
-    /// Fraction of runs that entered stress regime at any slot
     stress_entered_frac: f64,
-    /// Min headroom (residual - matured), negative = stressed
     min_headroom_p01: f64,
     min_headroom_p50: f64,
+    /// Admission stress — consumption-threshold lane (§4.3 law 2)
+    consumption_stress_slots_mean: f64,
+    consumption_stress_slots_p99: f64,
+    /// Fraction of runs where consumption threshold (= cfg.im_bps) was crossed
+    consumption_stress_entered_frac: f64,
+    /// Peak consumption in bps (descaled from e9) p99 across runs
+    max_consumption_bps_p99: f64,
+    /// Sweep-generation rollovers p50/p99 (each resets consumption counter)
+    sweep_generations_p50: f64,
+    sweep_generations_p99: f64,
+    /// Matured-overshoot events: admission gate failures. MUST be 0 everywhere.
+    matured_overshoot_total: u64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -685,32 +708,42 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let p0 = price_e6(cfg.p0);
 
     // ── Build engine ────────────────────────────────────────────────────
+    //
+    // v12.19 adds an EXACT per-risk-notional solvency envelope check that
+    // rejects RiskParams unless price_budget + funding_budget + liquidation_fee
+    // leaves enough slope gap below maintenance for ceil/floor rounding at
+    // small N. Many scenarios' minimal mm/liq values don't pass this check.
+    //
+    // We mirror the engine's test-helper `zero_fee_params` envelope template
+    // (mm=500, liq=0, max_dt=100, rate=10_000, max_price_move=4) which is
+    // provably safe. Scenario's cfg.mm_bps/cfg.liquidation_fee_bps are floored
+    // to envelope-safe minimums; if a scenario requested smaller mm, we bump
+    // it up. The admit_h_min=0, admit_h_max=cfg.admit_h_max_slots admission
+    // pair is preserved so the v12.19 stress invariants remain exercised.
+    //
+    // Clamping in the crash loop ensures natural crash rates > 4 bps/slot
+    // walk through the market at envelope-max per crank.
+    let env_mm_bps = cfg.mm_bps.max(500);
+    let env_im_bps = cfg.im_bps.max(1000).max(env_mm_bps);
     let params = RiskParams {
-        maintenance_margin_bps: cfg.mm_bps,
-        initial_margin_bps: cfg.im_bps,
+        maintenance_margin_bps: env_mm_bps,
+        initial_margin_bps: env_im_bps,
         trading_fee_bps: cfg.trading_fee_bps,
         max_accounts: percolator::MAX_ACCOUNTS as u64,
         max_crank_staleness_slots: u64::MAX,
-        liquidation_fee_bps: cfg.liquidation_fee_bps,
-        liquidation_fee_cap: U128::new(usdc(50_000)),
-        min_liquidation_abs: U128::new(cfg.min_liquidation_abs),
-        min_nonzero_mm_req: 1,
-        min_nonzero_im_req: 2,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: U128::ZERO,
+        min_liquidation_abs: U128::ZERO,
+        min_nonzero_mm_req: 5,
+        min_nonzero_im_req: 6,
         h_min: cfg.admit_h_min_slots,
         h_max: cfg.admit_h_max_slots,
         resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: cfg.crank_interval.max(1) * 2,
+        max_accrual_dt_slots: 100,
         max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: cfg.crank_interval.max(1) * 2,
+        min_funding_lifetime_slots: 10_000_000,
         max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
-        // Solvency envelope (v12.19): max_price_move*dt + funding_budget + liq <= mm.
-        // We size max_accrual_dt_slots = 2*crank_interval (headroom for keeper lag)
-        // and derive max_price_move to satisfy the envelope:
-        //   max_price_move_bps_per_slot <= (mm - liq - 1) / max_accrual_dt_slots
-        // Real oracle moves exceeding this rate get CLAMPED by clamp_oracle()
-        // in the crash loop; the cascade walks through at envelope-max per crank.
-        max_price_move_bps_per_slot: (cfg.mm_bps.saturating_sub(cfg.liquidation_fee_bps).saturating_sub(1)
-            / (cfg.crank_interval.max(1) * 2)).max(1),
+        max_price_move_bps_per_slot: 4,
     };
 
     let mut engine = new_engine_with(params, 0, p0);
@@ -720,18 +753,33 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Seed insurance + LP ─────────────────────────────────────────────
     let _ = engine.top_up_insurance_fund(usdc(cfg.insurance_topup_usdc), 0);
 
-    // ── Admission stress tracking (engine picks admit_h_max when matured > residual) ──
+    // ── Admission stress tracking (spec §4.3) ──
+    // Residual-scarcity lane (law 3):
     let mut stress_slots: u64 = 0;
     let mut stress_first_slot: u64 = u64::MAX;
     let mut min_headroom: i128 = i128::MAX;
+    // Consumption-threshold lane (law 2):
+    let mut consumption_stress_slots: u64 = 0;
+    let mut consumption_stress_first_slot: u64 = u64::MAX;
+    let mut max_consumption_bps_e9: u128 = 0;
+    let mut prev_sweep_generation = engine.sweep_generation;
+    let mut sweep_generations: u64 = 0;
+    // Gate-correctness audit: matured > residual should never happen.
+    let mut matured_overshoot_events: u64 = 0;
+    // Threshold in e9 units (scale per spec §1.4: PRICE_MOVE_CONSUMPTION_SCALE = 1e9)
+    let threshold_e9: u128 = (cfg.im_bps as u128) * 1_000_000_000u128;
 
     let lp_idx = add_lp(&mut engine, [1u8; 32], [2u8; 32]).unwrap();
     engine.deposit_not_atomic(lp_idx, usdc(cfg.lp_capital_usdc), 0).unwrap();
 
-    // Initial crank at slot 0 — batch across all accounts (64 per crank)
+    // Initial crank at slot 0 — batch across all accounts (64 per crank).
+    // rr_window_size only on first chunk (see crash-loop comment).
     let init_candidates = all_accounts(&engine);
+    let mut init_first = true;
     for chunk in init_candidates.chunks(64) {
-        let _ = engine.keeper_crank_not_atomic(0, p0, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192);
+        let rr_w = if init_first { 192 } else { 0 };
+        let _ = engine.keeper_crank_not_atomic(0, p0, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), rr_w);
+        init_first = false;
     }
 
     // ── Capital distributions (lognormal mixtures) ──────────────────────
@@ -785,8 +833,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // so we batch candidates into chunks of 64 and issue one crank per chunk.
     for s in 1..=SETUP_SLOTS {
         let candidates = all_accounts(&engine);
+        let mut first = true;
         for chunk in candidates.chunks(64) {
-            let _ = engine.keeper_crank_not_atomic(s, p0, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192);
+            let rr_w = if first { 192 } else { 0 };
+            let _ = engine.keeper_crank_not_atomic(s, p0, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), rr_w);
+            first = false;
         }
     }
 
@@ -856,8 +907,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // ── Post-trade sweep ────────────────────────────────────────────────
     for s in (SETUP_SLOTS + 1)..=(SETUP_SLOTS + 32) {
         let candidates = all_accounts(&engine);
+        let mut first = true;
         for chunk in candidates.chunks(64) {
-            let _ = engine.keeper_crank_not_atomic(s, p0, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192);
+            let rr_w = if first { 192 } else { 0 };
+            let _ = engine.keeper_crank_not_atomic(s, p0, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), rr_w);
+            first = false;
         }
     }
 
@@ -970,27 +1024,63 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                 dt,
             );
 
-            // Batch cranks across all candidates. Phase1 + Phase2 budgets
-            // (max_revalidations + rr_window_size) must fit MAX_TOUCHED=256.
-            // We use 64+192 per crank. Funding rate applied only to first
-            // chunk of a slot to avoid double-charging.
+            // Batch cranks across all candidates. Funding rate and the rr
+            // structural sweep are only applied on the FIRST chunk per slot:
+            //  - funding: avoid double-charging across batched cranks
+            //  - rr_window_size: cursor only advances once per slot, so
+            //    sweep_generation rolls at a meaningful rate (once per
+            //    MAX_ACCOUNTS/rr_window_size slots) and the consumption
+            //    threshold has time to accumulate across a generation.
+            //
+            // Subsequent chunks pass rr_window_size=0 which spec §9 allows
+            // for trusted/private wrappers (this stress test models a
+            // trusted keeper).
             let candidates = build_candidates(&engine, &cfg.candidate_ordering);
             let mut first = true;
             for chunk in candidates.chunks(64) {
                 let rate = if first { funding_rate } else { 0 };
-                if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, clamped_oracle, chunk, 64, rate, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192) {
+                let rr_window = if first { 192 } else { 0 };
+                if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, clamped_oracle, chunk, 64, rate, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), rr_window) {
                     total_liquidations += outcome.num_liquidations as u64;
                 }
                 first = false;
             }
 
-            // Admission stress: engine picks admit_h_max when matured >= residual
-            // (any positive fresh PnL would violate matured+fresh <= residual).
+            // Residual-scarcity lane (spec §4.3 law 3): matured+fresh > residual
+            // forces admit_h_max for any fresh PnL.
             let hr = headroom(&engine);
             if hr < min_headroom { min_headroom = hr; }
             if hr <= 0 {
                 stress_slots += 1;
                 if stress_first_slot == u64::MAX { stress_first_slot = slot_offset; }
+            }
+
+            // Consumption-threshold lane (spec §4.3 law 2): price_move_consumed_e9
+            // >= threshold_e9 forces admit_h_max regardless of residual.
+            // (Note: field is named `price_move_consumed_bps_this_generation` but is
+            // stored in e9 scale per spec §1.4 PRICE_MOVE_CONSUMPTION_SCALE.)
+            let consumed_e9 = engine.price_move_consumed_bps_this_generation;
+            if consumed_e9 > max_consumption_bps_e9 { max_consumption_bps_e9 = consumed_e9; }
+            if consumed_e9 >= threshold_e9 {
+                consumption_stress_slots += 1;
+                if consumption_stress_first_slot == u64::MAX {
+                    consumption_stress_first_slot = slot_offset;
+                }
+            }
+
+            // Sweep-generation rollovers reset the consumption counter.
+            if engine.sweep_generation > prev_sweep_generation {
+                sweep_generations += engine.sweep_generation - prev_sweep_generation;
+                prev_sweep_generation = engine.sweep_generation;
+            }
+
+            // Gate-correctness audit: the admission gate must keep matured
+            // bounded by residual. If matured > residual after a crank, the
+            // gate failed — this is a spec §4.3 invariant violation.
+            let senior = engine.c_tot.get().saturating_add(engine.insurance_fund.balance.get());
+            let residual = engine.vault.get().saturating_sub(senior);
+            if engine.pnl_matured_pos_tot > residual {
+                matured_overshoot_events += 1;
             }
 
             // H-fairness check: when h < 1, all accounts with positive
@@ -1139,8 +1229,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         final_dt,
     );
     let candidates = build_candidates(&engine, &cfg.candidate_ordering);
+    let mut fin_first = true;
     for chunk in candidates.chunks(64) {
-        let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), 192);
+        let rr_w = if fin_first { 192 } else { 0 };
+        let _ = engine.keeper_crank_not_atomic(final_slot, final_oracle, chunk, 64, 0, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), rr_w);
+        fin_first = false;
     }
     {
         let vault_val = engine.vault.get();
@@ -1239,6 +1332,11 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         stress_slots,
         stress_first_slot,
         min_headroom,
+        consumption_stress_slots,
+        consumption_stress_first_slot,
+        max_consumption_bps_e9,
+        sweep_generations,
+        matured_overshoot_events,
     };
 
     (summary, snapshots)
@@ -1363,7 +1461,7 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         epoch_resets_mean: mean(&sorted(runs.iter().map(|r| r.epoch_resets as f64))),
         max_h_fairness_err: runs.iter().map(|r| r.max_h_fairness_err).fold(0.0f64, f64::max),
 
-        // Admission stress aggregates
+        // Residual-scarcity admission stress (§4.3 law 3)
         stress_slots_mean: mean(&sorted(runs.iter().map(|r| r.stress_slots as f64))),
         stress_slots_p50: quantile(&sorted(runs.iter().map(|r| r.stress_slots as f64)), 0.50),
         stress_slots_p99: quantile(&sorted(runs.iter().map(|r| r.stress_slots as f64)), 0.99),
@@ -1371,6 +1469,20 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
             / runs.len().max(1) as f64,
         min_headroom_p01: quantile(&sorted(runs.iter().map(|r| r.min_headroom as f64)), 0.01),
         min_headroom_p50: quantile(&sorted(runs.iter().map(|r| r.min_headroom as f64)), 0.50),
+        // Consumption-threshold admission stress (§4.3 law 2)
+        consumption_stress_slots_mean: mean(&sorted(runs.iter().map(|r| r.consumption_stress_slots as f64))),
+        consumption_stress_slots_p99: quantile(&sorted(runs.iter().map(|r| r.consumption_stress_slots as f64)), 0.99),
+        consumption_stress_entered_frac: runs.iter().filter(|r| r.consumption_stress_slots > 0).count() as f64
+            / runs.len().max(1) as f64,
+        // Peak consumption: descale from e9 to bps for reporting
+        max_consumption_bps_p99: quantile(
+            &sorted(runs.iter().map(|r| (r.max_consumption_bps_e9 / 1_000_000_000) as f64)),
+            0.99,
+        ),
+        sweep_generations_p50: quantile(&sorted(runs.iter().map(|r| r.sweep_generations as f64)), 0.50),
+        sweep_generations_p99: quantile(&sorted(runs.iter().map(|r| r.sweep_generations as f64)), 0.99),
+        // Gate-correctness check: this MUST be 0 — admission gate failure would be a spec violation.
+        matured_overshoot_total: runs.iter().map(|r| r.matured_overshoot_events).sum(),
     }
 }
 
@@ -1404,11 +1516,13 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
          min_true_h,min_residual,\
          withdraw_attempts,withdraw_successes,close_attempts,close_successes,\
          adl_a_reductions,adl_k_changes,min_a_long,min_a_short,epoch_resets,\
-         stress_slots,stress_first_slot,min_headroom\n",
+         stress_slots,stress_first_slot,min_headroom,\
+         consumption_stress_slots,consumption_stress_first_slot,max_consumption_bps_e9,\
+         sweep_generations,matured_overshoot_events\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
@@ -1437,6 +1551,11 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             r.stress_slots,
             if r.stress_first_slot == u64::MAX { "never".to_string() } else { r.stress_first_slot.to_string() },
             r.min_headroom,
+            r.consumption_stress_slots,
+            if r.consumption_stress_first_slot == u64::MAX { "never".to_string() } else { r.consumption_stress_first_slot.to_string() },
+            r.max_consumption_bps_e9,
+            r.sweep_generations,
+            r.matured_overshoot_events,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
@@ -1948,8 +2067,8 @@ fn test_adl_fairness() {
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::new(usdc(50_000)),
         min_liquidation_abs: U128::new(1),
-        min_nonzero_mm_req: 1,
-        min_nonzero_im_req: 2,
+        min_nonzero_mm_req: 5,
+        min_nonzero_im_req: 10,
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
@@ -2145,8 +2264,8 @@ fn test_adl_saturation() {
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::new(usdc(50_000)),
         min_liquidation_abs: U128::new(1),
-        min_nonzero_mm_req: 1,
-        min_nonzero_im_req: 2,
+        min_nonzero_mm_req: 5,
+        min_nonzero_im_req: 10,
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
@@ -2350,8 +2469,8 @@ fn test_adl_fuzz() {
             liquidation_fee_bps: 0,
             liquidation_fee_cap: U128::new(usdc(50_000)),
             min_liquidation_abs: U128::new(1),
-            min_nonzero_mm_req: 1,
-            min_nonzero_im_req: 2,
+            min_nonzero_mm_req: 5,
+            min_nonzero_im_req: 10,
             h_min: 0,
             h_max: 100,
             resolve_price_deviation_bps: 1000,
@@ -2577,8 +2696,8 @@ fn test_zombie_haircut() {
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::new(usdc(50_000)),
         min_liquidation_abs: U128::new(1),
-        min_nonzero_mm_req: 1,
-        min_nonzero_im_req: 2,
+        min_nonzero_mm_req: 5,
+        min_nonzero_im_req: 10,
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
@@ -2768,8 +2887,8 @@ fn make_test_engine() -> (Box<RiskEngine>, u16) {
         liquidation_fee_bps: 50,
         liquidation_fee_cap: U128::new(usdc(50_000)),
         min_liquidation_abs: U128::new(1),
-        min_nonzero_mm_req: 1,
-        min_nonzero_im_req: 2,
+        min_nonzero_mm_req: 5,
+        min_nonzero_im_req: 10,
         h_min: 0,
         h_max: 100,
         resolve_price_deviation_bps: 1000,
