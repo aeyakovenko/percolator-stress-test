@@ -158,6 +158,13 @@ struct Config {
     admit_h_min_slots: u64,
     admit_h_max_slots: u64,
 
+    // When true, run_one uses raw cfg.mm_bps/im_bps/liquidation_fee_bps for the
+    // engine RiskParams instead of the env-safe template (mm>=500). The bounty
+    // preset uses this to test its actual deployment mm=200 envelope.
+    // Other scenarios pre-date v12.19's exact-N solvency check and rely on
+    // the template to validate.
+    raw_engine_params: bool,
+
     // Output
     out_dir: String,
     snapshots: bool,
@@ -205,6 +212,7 @@ impl Default for Config {
             wick_duration: 0,
             admit_h_min_slots: 0,
             admit_h_max_slots: 108_000,
+            raw_engine_params: false,
             min_liquidation_abs: 1,
             out_dir: "stress_out".into(),
             snapshots: true,
@@ -735,26 +743,61 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     //
     // Clamping in the crash loop ensures natural crash rates > 4 bps/slot
     // walk through the market at envelope-max per crank.
-    let env_mm_bps = cfg.mm_bps.max(500);
-    let env_im_bps = cfg.im_bps.max(1000).max(env_mm_bps);
-    let params = RiskParams {
-        maintenance_margin_bps: env_mm_bps,
-        initial_margin_bps: env_im_bps,
-        trading_fee_bps: cfg.trading_fee_bps,
-        max_accounts: percolator::MAX_ACCOUNTS as u64,
-        liquidation_fee_bps: 0,
-        liquidation_fee_cap: U128::ZERO,
-        min_liquidation_abs: U128::ZERO,
-        min_nonzero_mm_req: 5,
-        min_nonzero_im_req: 6,
-        h_min: cfg.admit_h_min_slots,
-        h_max: cfg.admit_h_max_slots,
-        resolve_price_deviation_bps: 1000,
-        max_accrual_dt_slots: 100,
-        max_abs_funding_e9_per_slot: 10_000,
-        min_funding_lifetime_slots: 10_000_000,
-        max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
-        max_price_move_bps_per_slot: 4,
+    let params = if cfg.raw_engine_params {
+        // Use scenario's actual mm/im/liq directly. Compute max_price_move
+        // conservatively so the v12.19 exact-N solvency check validates.
+        //
+        // Envelope: max_price_move*max_dt + funding_budget + liq_fee < mm.
+        // The exact-N tail check at floor_region_end (= (min_nonzero_mm_req+1)*10000/mm)
+        // requires: loss(N) + liq_fee(N) <= mm_req. We pick max_price_move = (mm-liq)/20
+        // (half the linear budget) to leave headroom for the small-N ceil/floor
+        // rounding without inflating min_nonzero_mm_req.
+        let max_dt = 10u64;
+        let max_price_move = (cfg.mm_bps.saturating_sub(cfg.liquidation_fee_bps) / 20).max(1);
+        RiskParams {
+            maintenance_margin_bps: cfg.mm_bps,
+            initial_margin_bps: cfg.im_bps,
+            trading_fee_bps: cfg.trading_fee_bps,
+            max_accounts: percolator::MAX_ACCOUNTS as u64,
+            liquidation_fee_bps: cfg.liquidation_fee_bps,
+            liquidation_fee_cap: U128::new(usdc(50_000)),
+            min_liquidation_abs: U128::ZERO,  // wrapper-side min position size instead
+            min_nonzero_mm_req: 20,
+            min_nonzero_im_req: 30,
+            h_min: cfg.admit_h_min_slots,
+            h_max: cfg.admit_h_max_slots,
+            resolve_price_deviation_bps: 1000,
+            max_accrual_dt_slots: max_dt,
+            max_abs_funding_e9_per_slot: 10_000,
+            min_funding_lifetime_slots: max_dt,
+            max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
+            max_price_move_bps_per_slot: max_price_move,
+        }
+    } else {
+        // Envelope-safe template (mirrors engine's zero_fee_params):
+        //   mm=500, liq=0, max_dt=100, rate=10_000, max_price_move=4.
+        // Scenario's cfg.mm/im are floored up to fit envelope.
+        let env_mm_bps = cfg.mm_bps.max(500);
+        let env_im_bps = cfg.im_bps.max(1000).max(env_mm_bps);
+        RiskParams {
+            maintenance_margin_bps: env_mm_bps,
+            initial_margin_bps: env_im_bps,
+            trading_fee_bps: cfg.trading_fee_bps,
+            max_accounts: percolator::MAX_ACCOUNTS as u64,
+            liquidation_fee_bps: 0,
+            liquidation_fee_cap: U128::ZERO,
+            min_liquidation_abs: U128::ZERO,
+            min_nonzero_mm_req: 5,
+            min_nonzero_im_req: 6,
+            h_min: cfg.admit_h_min_slots,
+            h_max: cfg.admit_h_max_slots,
+            resolve_price_deviation_bps: 1000,
+            max_accrual_dt_slots: 100,
+            max_abs_funding_e9_per_slot: 10_000,
+            min_funding_lifetime_slots: 10_000_000,
+            max_active_positions_per_side: percolator::MAX_ACCOUNTS as u64,
+            max_price_move_bps_per_slot: 4,
+        }
     };
 
     let mut engine = new_engine_with(params, 0, p0);
@@ -2098,6 +2141,44 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             ];
             cfg.admit_h_min_slots = 0;              // instant withdrawals
             cfg.admit_h_max_slots = 18_000_000;     // ~83 days, near MAX_WARMUP
+        }
+        // ── Public bug bounty: inverted SOL/USD, 50x leverage, $1000 prize ──
+        // Matches config.md `bounty_sol_50x_v1` deployment params. Uses
+        // raw_engine_params=true so the engine actually validates with
+        // mm=200 (50x leverage), unlike scenarios that fall back to the
+        // mm=500 envelope-safe template.
+        "bounty_sol_50x" => {
+            cfg.raw_engine_params = true;
+            cfg.p0 = 200;                           // SOL ~$200
+            // 50x leverage: im_bps = 1/50 = 200 bps = 2%
+            // Liquidation buffer: mm = im/2 = 100 bps = 1% (typical perp convention)
+            cfg.mm_bps = 100;                       // 1% maintenance — liquidation at 1% equity
+            cfg.im_bps = 200;                       // 2% initial = 50x max leverage
+            cfg.trading_fee_bps = 4;                // 0.04%, beats Binance
+            cfg.liquidation_fee_bps = 20;           // 0.20%, half of Binance
+            cfg.n_users = 2000;
+            cfg.n_zombies = 100;                    // lighter zombie load — bounty market is real
+            cfg.zombie_pnl_usdc = 5_000;            // $5K each — modest pre-existing imbalance
+            cfg.zombie_fee_debt_usdc = 100;
+            cfg.lp_capital_usdc = 100_000;          // $100K LP float
+            cfg.insurance_topup_usdc = 1_000;       // $1000 BOUNTY TARGET
+            cfg.crash_pct_bps = 4000;               // 40% drawdown stress
+            cfg.crash_len = 250;                    // ~16 bps/slot, fits envelope
+            cfg.bounce_pct_bps = 1500;              // 15% bounce
+            cfg.bounce_len = 100;
+            cfg.total_slots = 1500;                 // ~10 minutes at 400ms slots
+            cfg.long_bias = 0.85;                   // crypto-realistic long bias
+            cfg.crank_interval = 5;
+            cfg.candidate_ordering = "deficit".into();
+            cfg.slippage_bps = 30;                  // 0.3% slippage
+            cfg.min_liquidation_abs = 0;            // wrapper enforces min position size
+            cfg.funding_schedule = vec![
+                (0, 5_000),                         // moderate funding pressure
+                (500, -5_000),
+                (1000, 5_000),
+            ];
+            cfg.admit_h_min_slots = 0;              // INSTANT WITHDRAWALS
+            cfg.admit_h_max_slots = 86_400;         // ~9.6h ceiling
         }
         _ => eprintln!("unknown scenario: {}", name),
     }
