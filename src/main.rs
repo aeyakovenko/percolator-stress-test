@@ -1131,6 +1131,96 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
                 "SOLVENCY VIOLATION seed={} slot_offset={}: vault={} < c_tot={} + insurance={}",
                 seed, slot_offset, vault_val, c_tot_val, ins_val
             );
+
+            // ── Bounty-fuzz invariant battery ──────────────────────────────
+            // 1. matured ≤ pnl_pos_tot (subset relation)
+            assert!(
+                engine.pnl_matured_pos_tot <= engine.pnl_pos_tot,
+                "INVARIANT-1 seed={} slot={}: pnl_matured_pos_tot ({}) > pnl_pos_tot ({})",
+                seed, slot_offset, engine.pnl_matured_pos_tot, engine.pnl_pos_tot
+            );
+
+            // 3. K-index headroom — neither side may cross ±i128::MAX/2
+            // (gives accrue_market_to room for one more max-step without overflow)
+            let k_bound = i128::MAX / 2;
+            assert!(
+                engine.adl_coeff_long.abs() <= k_bound,
+                "INVARIANT-3a seed={} slot={}: K_long ({}) past i128::MAX/2",
+                seed, slot_offset, engine.adl_coeff_long
+            );
+            assert!(
+                engine.adl_coeff_short.abs() <= k_bound,
+                "INVARIANT-3b seed={} slot={}: K_short ({}) past i128::MAX/2",
+                seed, slot_offset, engine.adl_coeff_short
+            );
+
+            // 4. F-index headroom (same bound)
+            assert!(
+                engine.f_long_num.abs() <= k_bound,
+                "INVARIANT-4a seed={} slot={}: F_long ({}) past i128::MAX/2",
+                seed, slot_offset, engine.f_long_num
+            );
+            assert!(
+                engine.f_short_num.abs() <= k_bound,
+                "INVARIANT-4b seed={} slot={}: F_short ({}) past i128::MAX/2",
+                seed, slot_offset, engine.f_short_num
+            );
+
+            // 5. ADL multiplier floor — must not go below MIN_A_SIDE
+            //    (engine triggers DrainOnly+epoch reset when this would happen)
+            let min_a = percolator::MIN_A_SIDE;
+            if engine.side_mode_long != SideMode::DrainOnly {
+                assert!(
+                    engine.adl_mult_long >= min_a,
+                    "INVARIANT-5a seed={} slot={}: A_long ({}) < MIN_A_SIDE ({}) without DrainOnly",
+                    seed, slot_offset, engine.adl_mult_long, min_a
+                );
+            }
+            if engine.side_mode_short != SideMode::DrainOnly {
+                assert!(
+                    engine.adl_mult_short >= min_a,
+                    "INVARIANT-5b seed={} slot={}: A_short ({}) < MIN_A_SIDE ({}) without DrainOnly",
+                    seed, slot_offset, engine.adl_mult_short, min_a
+                );
+            }
+
+            // 6. neg_pnl_account_count consistency — explicit recount
+            let neg_count: u64 = (0..percolator::MAX_ACCOUNTS)
+                .filter(|&i| engine.is_used(i))
+                .filter(|&i| engine.accounts[i].pnl < 0)
+                .count() as u64;
+            assert!(
+                engine.neg_pnl_account_count == neg_count,
+                "INVARIANT-6 seed={} slot={}: neg_pnl_account_count ({}) != actual ({})",
+                seed, slot_offset, engine.neg_pnl_account_count, neg_count
+            );
+
+            // 7. sum(account.capital) == c_tot
+            let cap_sum: u128 = (0..percolator::MAX_ACCOUNTS)
+                .filter(|&i| engine.is_used(i))
+                .map(|i| engine.accounts[i].capital.get())
+                .sum();
+            assert!(
+                cap_sum == c_tot_val,
+                "INVARIANT-7 seed={} slot={}: sum(capital) ({}) != c_tot ({})",
+                seed, slot_offset, cap_sum, c_tot_val
+            );
+
+            // 8. sum(account.reserved_pnl) <= sum(max(0, pnl))
+            let reserved_sum: u128 = (0..percolator::MAX_ACCOUNTS)
+                .filter(|&i| engine.is_used(i))
+                .map(|i| engine.accounts[i].reserved_pnl)
+                .sum();
+            let pos_pnl_sum: u128 = (0..percolator::MAX_ACCOUNTS)
+                .filter(|&i| engine.is_used(i))
+                .map(|i| if engine.accounts[i].pnl > 0 { engine.accounts[i].pnl as u128 } else { 0 })
+                .sum();
+            assert!(
+                reserved_sum <= pos_pnl_sum,
+                "INVARIANT-8 seed={} slot={}: sum(reserved_pnl) ({}) > sum(max(0,pnl)) ({})",
+                seed, slot_offset, reserved_sum, pos_pnl_sum
+            );
+
             // Note: check_conservation(oracle) is too strict here — it verifies
             // the extended identity vault >= sum(capital) + sum(pnl) + insurance,
             // which the zombie injection (direct set_pnl/set_capital) violates.
@@ -1933,6 +2023,49 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.trading_fee_bps = 0;
             cfg.liquidation_fee_bps = 0;
             cfg.candidate_ordering = "deficit".into();
+        }
+        // ── Bug-bounty config: maximally stressed inverted-SOL market ──
+        // Pushes every dimension to the construction envelope edge with
+        // admit_h_min=0 (instant withdrawals when healthy). Designed to
+        // probe edge cases not covered by realistic-rate scenarios.
+        "bounty_inverted_sol" => {
+            cfg.p0 = 20;                            // low absolute price (rounding stress)
+            cfg.mm_bps = 500;
+            cfg.im_bps = 1000;                      // 10x — envelope-tight
+            cfg.trading_fee_bps = 10;
+            cfg.liquidation_fee_bps = 100;
+            cfg.n_users = 2000;
+            cfg.n_zombies = 1000;                   // half the slab is zombies
+            cfg.zombie_pnl_usdc = 2_000_000;        // $2M each = $2B unbacked
+            cfg.zombie_fee_debt_usdc = 50_000;      // pre-existing fee debt
+            cfg.lp_capital_usdc = 500_000;          // tiny LP cap vs zombie load
+            cfg.insurance_topup_usdc = 0;           // no cushion
+            cfg.whale_enabled = true;
+            cfg.whale_capital_usdc = 50_000_000;
+            cfg.whale_leverage = 10.0;              // single-account dominance
+            cfg.crash_pct_bps = 9000;               // 90% crash
+            cfg.crash_len = 230;                    // ~39 bps/slot — at envelope edge
+            cfg.bounce_pct_bps = 4000;              // 40% bounce
+            cfg.bounce_len = 50;                    // 80 bps/slot reverse — clamping forces walk
+            cfg.total_slots = 3000;                 // long enough for F-saturation + warmup expiry
+            cfg.wick_slot = 80;
+            cfg.wick_pct_bps = 3900;                // single-slot envelope-max wick
+            cfg.wick_duration = 1;
+            cfg.long_bias = 0.97;                   // near-pure long bias
+            cfg.candidate_ordering = "adversarial".into(); // touch profitable first
+            cfg.crank_interval = 10;                // significant keeper lag
+            cfg.slippage_bps = 100;                 // 1% exec deviation → trade_pnl != 0
+            cfg.min_liquidation_abs = 1;            // dust-allowed (N=1 ceil rounding)
+            // Alternating max funding rate every 600 slots → K-index oscillation
+            cfg.funding_schedule = vec![
+                (0, 10000),
+                (600, -10000),
+                (1200, 10000),
+                (1800, -10000),
+                (2400, 10000),
+            ];
+            cfg.admit_h_min_slots = 0;              // instant withdrawals
+            cfg.admit_h_max_slots = 18_000_000;     // ~83 days, near MAX_WARMUP
         }
         _ => eprintln!("unknown scenario: {}", name),
     }
