@@ -282,6 +282,12 @@ struct RunSummary {
     /// Number of post-crank audit failures: matured_pos_tot > residual.
     /// This should always be 0 — the admission gate prevents matured overshoot.
     matured_overshoot_events: u64,
+    /// Gross insurance OUTFLOW: sum of every insurance balance decrease per crank.
+    /// Distinct from `insurance_end - insurance_start` (net), which can stay
+    /// positive even if outflow occurred when fees > losses.
+    insurance_paid_out: u128,
+    /// Number of cranks where insurance balance decreased (= bankrupt-deficit absorption events)
+    insurance_payout_events: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -406,6 +412,12 @@ struct ScenarioSummary {
     sweep_generations_p99: f64,
     /// Matured-overshoot events: admission gate failures. MUST be 0 everywhere.
     matured_overshoot_total: u64,
+    /// Gross insurance outflow across all runs (atomic USDC).
+    /// Distinct from net change — captures dollars actually paid out to bankrupt-deficit absorption.
+    insurance_paid_out_total: u128,
+    insurance_paid_out_max_per_run: u128,
+    insurance_payout_runs_frac: f64,
+    insurance_payout_events_p99: f64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -761,6 +773,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     let mut consumption_stress_slots: u64 = 0;
     let mut consumption_stress_first_slot: u64 = u64::MAX;
     let mut max_consumption_bps_e9: u128 = 0;
+    let mut insurance_paid_out: u128 = 0;
+    let mut insurance_payout_events: u64 = 0;
     let mut prev_sweep_generation = engine.sweep_generation;
     let mut sweep_generations: u64 = 0;
     // Gate-correctness audit: matured > residual should never happen.
@@ -1039,8 +1053,15 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             for chunk in candidates.chunks(64) {
                 let rate = if first { funding_rate } else { 0 };
                 let rr_window = if first { 192 } else { 0 };
+                // Snapshot insurance pre-crank to detect outflow (= bankrupt-deficit absorption)
+                let ins_pre = engine.insurance_fund.balance.get();
                 if let Ok(outcome) = engine.keeper_crank_not_atomic(slot, clamped_oracle, chunk, 64, rate, admit_h_min, admit_h_max, Some(cfg.im_bps as u128), rr_window) {
                     total_liquidations += outcome.num_liquidations as u64;
+                }
+                let ins_post = engine.insurance_fund.balance.get();
+                if ins_post < ins_pre {
+                    insurance_paid_out += ins_pre - ins_post;
+                    insurance_payout_events += 1;
                 }
                 first = false;
             }
@@ -1426,6 +1447,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
         max_consumption_bps_e9,
         sweep_generations,
         matured_overshoot_events,
+        insurance_paid_out,
+        insurance_payout_events,
     };
 
     (summary, snapshots)
@@ -1572,6 +1595,15 @@ fn aggregate(label: &str, runs: &[RunSummary]) -> ScenarioSummary {
         sweep_generations_p99: quantile(&sorted(runs.iter().map(|r| r.sweep_generations as f64)), 0.99),
         // Gate-correctness check: this MUST be 0 — admission gate failure would be a spec violation.
         matured_overshoot_total: runs.iter().map(|r| r.matured_overshoot_events).sum(),
+        // Gross insurance outflow (bankrupt-deficit absorption events)
+        insurance_paid_out_total: runs.iter().map(|r| r.insurance_paid_out).sum(),
+        insurance_paid_out_max_per_run: runs.iter().map(|r| r.insurance_paid_out).max().unwrap_or(0),
+        insurance_payout_runs_frac: runs.iter().filter(|r| r.insurance_paid_out > 0).count() as f64
+            / runs.len().max(1) as f64,
+        insurance_payout_events_p99: quantile(
+            &sorted(runs.iter().map(|r| r.insurance_payout_events as f64)),
+            0.99,
+        ),
     }
 }
 
