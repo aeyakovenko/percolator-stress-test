@@ -165,6 +165,14 @@ struct Config {
     // the template to validate.
     raw_engine_params: bool,
 
+    // Explicit envelope knobs used when raw_engine_params=true.
+    // 0 = use the conservative auto formula (max_price_move = (mm-liq)/20).
+    // Non-zero = use these literal values.
+    raw_max_price_move_bps_per_slot: u64,
+    raw_max_accrual_dt_slots: u64,
+    raw_min_nonzero_mm_req: u128,
+    raw_min_nonzero_im_req: u128,
+
     // Output
     out_dir: String,
     snapshots: bool,
@@ -213,6 +221,10 @@ impl Default for Config {
             admit_h_min_slots: 0,
             admit_h_max_slots: 108_000,
             raw_engine_params: false,
+            raw_max_price_move_bps_per_slot: 0,
+            raw_max_accrual_dt_slots: 0,
+            raw_min_nonzero_mm_req: 0,
+            raw_min_nonzero_im_req: 0,
             min_liquidation_abs: 1,
             out_dir: "stress_out".into(),
             snapshots: true,
@@ -744,16 +756,19 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
     // Clamping in the crash loop ensures natural crash rates > 4 bps/slot
     // walk through the market at envelope-max per crank.
     let params = if cfg.raw_engine_params {
-        // Use scenario's actual mm/im/liq directly. Compute max_price_move
-        // conservatively so the v12.19 exact-N solvency check validates.
-        //
-        // Envelope: max_price_move*max_dt + funding_budget + liq_fee < mm.
-        // The exact-N tail check at floor_region_end (= (min_nonzero_mm_req+1)*10000/mm)
-        // requires: loss(N) + liq_fee(N) <= mm_req. We pick max_price_move = (mm-liq)/20
-        // (half the linear budget) to leave headroom for the small-N ceil/floor
-        // rounding without inflating min_nonzero_mm_req.
-        let max_dt = 10u64;
-        let max_price_move = (cfg.mm_bps.saturating_sub(cfg.liquidation_fee_bps) / 20).max(1);
+        // Use scenario's actual mm/im/liq directly. Either honor explicit
+        // raw_* envelope knobs (preset specified them) or fall back to the
+        // conservative auto formula.
+        let max_dt = if cfg.raw_max_accrual_dt_slots > 0 {
+            cfg.raw_max_accrual_dt_slots
+        } else { 10 };
+        let max_price_move = if cfg.raw_max_price_move_bps_per_slot > 0 {
+            cfg.raw_max_price_move_bps_per_slot
+        } else {
+            (cfg.mm_bps.saturating_sub(cfg.liquidation_fee_bps) / 20).max(1)
+        };
+        let mm_req = if cfg.raw_min_nonzero_mm_req > 0 { cfg.raw_min_nonzero_mm_req } else { 20 };
+        let im_req = if cfg.raw_min_nonzero_im_req > 0 { cfg.raw_min_nonzero_im_req } else { 30 };
         RiskParams {
             maintenance_margin_bps: cfg.mm_bps,
             initial_margin_bps: cfg.im_bps,
@@ -762,8 +777,8 @@ fn run_one(cfg: &Config, seed: u64) -> (RunSummary, Vec<SlotSnapshot>) {
             liquidation_fee_bps: cfg.liquidation_fee_bps,
             liquidation_fee_cap: U128::new(usdc(50_000)),
             min_liquidation_abs: U128::ZERO,  // wrapper-side min position size instead
-            min_nonzero_mm_req: 20,
-            min_nonzero_im_req: 30,
+            min_nonzero_mm_req: mm_req,
+            min_nonzero_im_req: im_req,
             h_min: cfg.admit_h_min_slots,
             h_max: cfg.admit_h_max_slots,
             resolve_price_deviation_bps: 1000,
@@ -2179,6 +2194,45 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             ];
             cfg.admit_h_min_slots = 0;              // INSTANT WITHDRAWALS
             cfg.admit_h_max_slots = 86_400;         // ~9.6h ceiling
+        }
+        // ── Public bug bounty: matches config.md `bounty_sol_20x` exactly ──
+        // 20x leverage with mm=im=500 (no opening buffer convention). Uses
+        // the §1.4 envelope's full move budget — max_price_move=47 bps/slot
+        // gives 4.7% per-accrual-window oracle tolerance, ~95% of the budget.
+        "bounty_sol_20x" => {
+            cfg.raw_engine_params = true;
+            cfg.p0 = 200;                           // SOL ~$200
+            cfg.mm_bps = 500;                       // = im (no opening buffer)
+            cfg.im_bps = 500;                       // 5% initial = 20x max leverage
+            cfg.trading_fee_bps = 2;                // 0.02% — undercuts HL's top tier
+            cfg.liquidation_fee_bps = 25;           // 0.25% (HL has none explicit)
+            cfg.raw_max_price_move_bps_per_slot = 47;  // ~95% of §1.4 budget
+            cfg.raw_max_accrual_dt_slots = 10;      // 4 sec keeper-lag tolerance
+            cfg.raw_min_nonzero_mm_req = 500;       // = mm — gives exact-N proof room
+            cfg.raw_min_nonzero_im_req = 600;
+            cfg.n_users = 2000;
+            cfg.n_zombies = 100;
+            cfg.zombie_pnl_usdc = 5_000;
+            cfg.zombie_fee_debt_usdc = 100;
+            cfg.lp_capital_usdc = 100_000;          // $100K LP float
+            cfg.insurance_topup_usdc = 1_000;       // $1000 BOUNTY TARGET
+            cfg.crash_pct_bps = 4000;               // 40% drawdown
+            cfg.crash_len = 100;                    // 40 bps/slot (within 47 cap)
+            cfg.bounce_pct_bps = 1500;
+            cfg.bounce_len = 50;
+            cfg.total_slots = 1500;                 // ~10 minutes
+            cfg.long_bias = 0.85;
+            cfg.crank_interval = 5;
+            cfg.candidate_ordering = "deficit".into();
+            cfg.slippage_bps = 30;                  // 0.3% slippage
+            cfg.min_liquidation_abs = 0;            // wrapper enforces $10 min order
+            cfg.funding_schedule = vec![
+                (0, 5_000),
+                (500, -5_000),
+                (1000, 5_000),
+            ];
+            cfg.admit_h_min_slots = 0;              // INSTANT WITHDRAWALS
+            cfg.admit_h_max_slots = 86_400;         // ~9.6h
         }
         _ => eprintln!("unknown scenario: {}", name),
     }

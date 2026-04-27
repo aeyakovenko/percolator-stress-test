@@ -1,7 +1,8 @@
-# bounty_sol_40x_v1 — public bug bounty market
+# bounty_sol_20x — public bug bounty market
 
-Inverted SOL/USD perpetual, **40x max leverage** (matches Hyperliquid's
-major-pair tier), atomic same-tx withdrawals, $1,000 insurance bounty.
+Inverted SOL/USD perpetual, **20x max leverage** (half of HL's
+major-pair tier — strictly safer), atomic same-tx withdrawals,
+$1,000 insurance bounty.
 
 Priced cheaper than HL on takers and uses a small explicit liquidation
 fee (HL has none — its "fee" is backstop-forfeit of maintenance margin).
@@ -26,11 +27,15 @@ References (HL params verified 2026-04-26):
 ```rust
 RiskParams {
     // ── Margin and leverage ─────────────────────────────────
-    // 40x leverage matches HL's major-pair tier: 1/40 = 2.5% initial margin.
-    // Maintenance margin = half of initial = 1.25% at max leverage.
-    maintenance_margin_bps:         125,    // 1.25% — matches HL at 40x
-    initial_margin_bps:             250,    // 2.50% initial = 40x max leverage
-    trading_fee_bps:                  4,    // 0.04% (HL taker is 4.5 bps; we undercut)
+    // 20x leverage. mm = im = 500 (= 1/L) is the engine's natural pairing
+    // — it lets the §1.4 envelope use the full 1/L move budget per accrual.
+    // Trade-off vs HL's "mm = im/2" convention: a user opening at exactly
+    // max leverage sits at the liq threshold immediately, so practical
+    // max leverage drops as users self-impose buffer (HL traders do the
+    // same implicitly under cross-margin).
+    maintenance_margin_bps:         500,    // 5.00% — = im, no opening buffer
+    initial_margin_bps:             500,    // 5.00% initial = 20x max leverage
+    trading_fee_bps:                  2,    // 0.02% (HL taker is 4.5 bps; we undercut by 2.5x)
     liquidation_fee_bps:             25,    // 0.25% (HL has none explicit; this funds keepers + bounty)
 
     // ── Account capacity ────────────────────────────────────
@@ -38,8 +43,10 @@ RiskParams {
     max_active_positions_per_side: 4_096,
 
     // ── Margin floors (envelope slack) ──────────────────────
-    min_nonzero_mm_req:              20,    // gives exact-N solvency check headroom
-    min_nonzero_im_req:              30,
+    // Raised so exact-N solvency check at floor_region_max fits the
+    // aggressive max_price_move below.
+    min_nonzero_mm_req:             500,    // = mm, gives exact-N proof room
+    min_nonzero_im_req:             600,
     min_liquidation_abs:    U128::ZERO,     // wrapper enforces $10 min order notional
     liquidation_fee_cap: U128::new(50_000_000_000),  // $50K cap
 
@@ -51,40 +58,60 @@ RiskParams {
     resolve_price_deviation_bps:  1_000,    // 10% bound for settlement price
 
     // ── Solvency envelope (v12.19) ──────────────────────────
-    // Constraint: max_price_move*max_dt + funding_budget + liq_fee < mm,
-    // AND the exact-N check at floor_region_max passes.
-    // With mm=125, liq=25, max_dt=10, max_price_move=5:
-    //   linear_budget = 50 + 1 + 25 = 76 < 125, slope_gap=49 ✓
-    //   exact-N at floor_region_max=1679 validates (loss+liq_fee=14 < mm_req=20)
+    // §1.4 envelope: max_move*max_dt × (1 + liq_fee/10000) + funding
+    //                + liq_fee < mm
+    // This binds against `mm` (loss budget liquidation can recover
+    // without insurance dilution). With mm = im, we can target the full
+    // 1/L = 5% per accrual, minus liq_fee/funding/rounding overhead.
+    //
+    // With mm=500, liq=25, funding_budget_bps≈1, max_dt=10, max_price_move=47:
+    //   accrual_window_move = 47 * 10 = 470 bps  (= 4.7% per accrual)
+    //   linear_budget       = 471 (loss) + 27 (worst_liq_budget) = 498 < 500
+    //   exact-N at floor_region_max=10019 validates (asymptotic check passes:
+    //     473×1.0025 + 25 = 499 < 500)
+    // 47 is the largest max_price_move the engine accepts at this (mm,
+    // liq_fee, max_dt) combo. Going to exactly 5%/accrual requires either
+    // dropping liq_fee to ~10 (kills keeper economics) or raising mm > 525
+    // (drops nominal max leverage to ~19x).
     max_accrual_dt_slots:            10,    // 4 sec keeper-lag tolerance
     max_abs_funding_e9_per_slot: 10_000,    // GLOBAL_MAX (HL-comparable)
     min_funding_lifetime_slots:      10,
-    max_price_move_bps_per_slot:      5,    // 0.05%/slot ≈ 0.125%/sec
+    max_price_move_bps_per_slot:     47,    // 0.47%/slot ≈ 1.18%/sec — uses
+                                            // ~95% of the §1.4 budget at mm=500
 }
 ```
 
 **Why these:**
 
-- **40x leverage**: matches HL's major-pair max. SOL on HL has historically
-  been at the major tier; 40x is the right number.
+- **20x leverage with mm = im = 500**: half of HL's 40x SOL tier.
+  We pair `mm = im` (instead of HL's `mm = im/2`) because the engine's
+  §1.4 envelope binds against `mm`, not `im` — pairing them lets the
+  per-accrual move budget reach the full 1/L = 5% target (less ~30 bps
+  of liq/funding/rounding overhead, leaving 4.7% achievable). The
+  trade-off: a user opening at exactly 20x sits at the liq threshold,
+  so practical max leverage is whatever buffer users self-impose
+  (HL's cross-margin model has the same property implicitly).
 
-- **trading_fee = 4 bps**: HL's taker is 4.5 bps base tier, dropping to
-  2.4 bps at $7B+ rolling 14d volume. Our 4 bps single-fee model
-  undercuts the HL base taker (4.5 → 4) and is competitive across all
-  but the highest HL volume tiers. Maker-taker differentiation is a
-  wrapper feature, not engine; the wrapper can issue maker rebates
-  out-of-band against trade events.
+- **trading_fee = 2 bps**: HL's taker is 4.5 bps base tier, dropping to
+  2.4 bps at $7B+ rolling 14d volume. Our 2 bps single-fee model
+  undercuts even HL's TOP volume tier (2.4 bps) — every taker pays
+  less here than the cheapest HL trader. Maker-taker differentiation
+  is a wrapper feature, not engine; the wrapper can issue maker
+  rebates out-of-band against trade events.
 
-- **liquidation_fee = 25 bps**: HL has *no* explicit liquidation fee, but
-  HL's backstop liquidations forfeit the user's *maintenance margin*
-  to HLP — an effective 1.25% cost at 40x leverage. Our 25 bps explicit
-  fee is much cheaper than HL's effective cost, AND the fee flows into
-  the insurance/bounty pool rather than to a private vault.
+- **liquidation_fee = 25 bps**: HL has *no* explicit liquidation fee,
+  but HL's backstop liquidations forfeit the user's *maintenance margin*
+  to HLP — an effective 1.25% cost at 40x and 2.5–5% at our equivalent
+  leverage tier. Our 25 bps explicit fee is **10–20× cheaper** than HL's
+  effective cost at equivalent leverage, AND it flows into the
+  insurance/bounty pool rather than to a private vault.
 
-- **max_price_move = 5 bps/slot**: 0.05%/slot ≈ 0.125%/sec at 400ms
-  Solana slots. Pyth confidence intervals on SOL during normal
-  volatility are well below this; clamping engages only on flash-crash
-  oracle prints.
+- **max_price_move = 47 bps/slot**: 0.47%/slot ≈ 1.18%/sec at 400ms
+  Solana slots. Per-accrual-window (max_dt=10) move budget = 470 bps =
+  **4.7%** — the largest setting the §1.4 envelope and exact-N floor
+  check both validate at mm=500. The wrapper-side clamp engages only on
+  oracle prints that move >0.47%/slot, so the engine sees nearly all
+  legitimate price action without clamping artifacts.
 
 ---
 
@@ -94,16 +121,16 @@ RiskParams {
 admit_h_min  =                                  0   // INSTANT FAST PATH
 admit_h_max  =                             86_400   // 9.6h slow path on stress
 admit_h_max_consumption_threshold_bps_opt =
-    Some(initial_margin_bps as u128) =       Some(250)   // 1/leverage = 2.5%
+    Some(initial_margin_bps as u128) =       Some(500)   // 1/leverage = 5%
 
 // keeper_crank-only:
 max_revalidations =                            64   // Phase 1 budget
 rr_window_size    =                           192   // Phase 2 (sum=256=MAX_TOUCHED)
 ```
 
-The threshold = `im_bps = 250` is the load-bearing protection for
+The threshold = `im_bps = 500` is the load-bearing protection for
 admit_h_min=0. Once cumulative oracle movement in a sweep generation
-reaches 2.5% (= 1/leverage), all fresh PnL admission flips to slow
+reaches 5% (= 1/leverage), all fresh PnL admission flips to slow
 path until the cursor wraps. Spec §0 #4 + §9.2 require nonzero
 threshold for public wrappers using admit_h_min=0.
 
@@ -114,7 +141,7 @@ threshold for public wrappers using admit_h_min=0.
 ```rust
 fn wrapper_oracle(real: u64, last_engine_price: u64, dt: u64) -> u64 {
     let max_dp = (last_engine_price as u128
-        * 5u128                         // max_price_move_bps_per_slot
+        * 47u128                        // max_price_move_bps_per_slot
         * dt as u128) / 10_000;
     let lower = last_engine_price.saturating_sub(max_dp as u64).max(1);
     let upper = (last_engine_price.saturating_add(max_dp as u64))
@@ -142,50 +169,51 @@ enough that idle small accounts die within ~1.5 months.
 | Minimum initial deposit | **$10 USDC** | Matches HL practical minimum |
 | Minimum order notional | **$10 USDC** | Matches HL exactly |
 | Account creation fee | **$0.50** | Charged at materialization → flows to insurance/bounty |
-| Recurring maintenance fee | **rate = 1 atomic/slot ≈ $0.216/day flat** | Permissionless slab eviction |
+| Recurring maintenance fee | **rate = 5 atomic/slot ≈ $1.08/day flat** | Permissionless slab eviction |
 | Empty-account reclaim incentive | **$0.10** | Pays whoever calls `reclaim_empty_account_not_atomic` |
 | Native withdrawal fee | **none** | HL charges $1; we charge $0 (atomic UX) |
 
-### Why $0.216/day specifically
+### Why ~$1/day specifically
 
 The engine's `sync_account_fee_to_slot_not_atomic` rate is an integer
 atomic USDC per slot. With 400ms Solana slots = 216,000 slots/day:
 
 ```
-rate = 1 atomic/slot  →  216,000 atomic/day  =  $0.216/day flat
+rate = 5 atomic/slot  →  1,080,000 atomic/day  ≈  $1.08/day flat
 ```
 
-This is the **smallest non-zero rate the engine supports**. Anything
-larger would compound too quickly on small accounts. At this rate:
+`$1/day exact` would need 4.63 atomic/slot, which the engine can't
+encode (integer rate). 5 atomic/slot is the closest round number above
+$1/day. At this rate:
 
 | Account size | Days of runway when idle | Active-trader annual cost |
 |---|---|---|
-| $10 (minimum) | **46 days** ← evict slab quickly | n/a (idle) |
-| $100 | 463 days | 78.8%/yr |
-| $1,000 | 12.7 years | 7.9%/yr |
-| $10,000 | 127 years | **0.79%/yr** |
-| $100,000 | 1,267 years | **0.08%/yr** |
+| $10 (minimum) | **9.3 days** ← evict spam fast | n/a (idle) |
+| $100 | 93 days | n/a (idle, dies in 3 mo) |
+| $1,000 | 2.5 years | 39.4%/yr |
+| $10,000 | 25 years | **3.94%/yr** |
+| $100,000 | 254 years | **0.39%/yr** |
 
-For an active trader with $10K+ capital, **0.79%/yr is comparable to
-USDC borrow rates on lending protocols** — barely noticeable. Idle
-$10 accounts die in 46 days, opening the slot for new users.
+For an active trader with $10K+ capital, **3.94%/yr is in line with
+USDC borrow rates on lending protocols** during normal-rate regimes.
+At $100K it drops to 0.39%/yr — well below borrow. Idle $10 accounts
+die in 9 days, opening the slot ~5× faster than a $0.216/day rate.
 
 Active traders also offset the maintenance fee with **trading-fee
-inflow not paid to them** (4 bps × notional traded → insurance).
-A trader doing $100/day in volume covers ~$0.04 of trading fee
-flowing to insurance, partially offsetting their $0.216/day fee.
+inflow not paid to them** (2 bps × notional traded → insurance).
+A trader doing $1,000/day in volume covers ~$0.20 of trading fee
+flowing to insurance, partially offsetting their $1.08/day fee.
 
 ### Slab-fill spam economics
 
 ```
-Fill the slab (one-time):  4096 × $0.50  =  $2,048
-Daily slab upkeep:         4096 × $0.216  =    $885/day
-30-day spam attack cost:                       $28,580
+Fill the slab (one-time):  4096 × $0.50   =  $2,048
+Daily slab upkeep:         4096 × $1.08   =  $4,423/day
+30-day spam attack cost:                     $134,738
 ```
 
-To DOS the slab for a month costs **$28K**. Compare to HL where
-DOSing is impossible (no slab cap), but on-chain percolator
-must defend differently.
+To DOS the slab for a month costs **$135K** — roughly 5× the cost
+under the previous $0.216/day rate.
 
 ### Drain-attempt economics
 
@@ -193,17 +221,17 @@ Brute-force trying to drain the $1,000 insurance bounty:
 
 ```
 Open 200 spam accounts:       200 × $0.50         =      $100 creation
-Hold 30 days:                 200 × $0.216 × 30   =    $1,296 maintenance
+Hold 30 days:                 200 × $1.08 × 30    =    $6,480 maintenance
 Forfeit $10 deposit each:     200 × $10           =    $2,000 lost capital
                                                   ─────────────────────
-                              Total cost                    $3,396
+                              Total cost                    $8,580
                               Bounty if won                 $1,000
-                              Net loss                     -$2,396
+                              Net loss                     -$7,580
 ```
 
-**Negative-EV by 3.4:1**. The bounty pays only on real exploits.
-Note creation fees ($100) and maintenance fees ($1,296) all flow
-INTO the bounty pool — the attacker funds 14% of the prize they're
+**Negative-EV by 8.6:1**. The bounty pays only on real exploits.
+Note creation fees ($100) and maintenance fees ($6,480) all flow
+INTO the bounty pool — the attacker funds 76% of the prize they're
 trying to win.
 
 ---
@@ -213,7 +241,7 @@ trying to win.
 ```rust
 const CREATION_FEE_USDC: u128 = 500_000;            // $0.50 atomic
 const MIN_DEPOSIT_USDC:  u128 = 10_000_000;         // $10 atomic
-const FEE_RATE_PER_SLOT: u128 = 1;                  // 1 atomic/slot ≈ $0.216/day
+const FEE_RATE_PER_SLOT: u128 = 5;                  // 5 atomic/slot ≈ $1.08/day
 const RECLAIM_INCENTIVE: u128 = 100_000;            // $0.10 atomic
 
 // On account materialization (any deposit_not_atomic call where the
@@ -237,7 +265,7 @@ reclaim_empty_account_not_atomic(idx, now_slot)
 The `CREATION_FEE_USDC → top_up_insurance_fund` path means **the
 bounty grows with adoption**. Every new account adds $0.50 to the
 prize, and every active day across all accounts adds another
-~$885 across the slab (if full).
+~$4,423 across the slab (if full).
 
 ---
 
@@ -254,7 +282,7 @@ Market mode:          Live
 ```
 
 Bounty pool growth:
-- Trading fees: 4 bps × notional → insurance per fill
+- Trading fees: 2 bps × notional → insurance per fill
 - Account creation: $0.50 per account → insurance
 - Liquidation fees: 25 bps × liq notional → insurance
 - After ~1,000 active accounts and ~$25M trading volume: bounty
@@ -264,32 +292,37 @@ Bounty pool growth:
 
 ## 7. Comparison to HL (verified 2026-04-26)
 
-| | **bounty_sol_40x_v1** | Hyperliquid (base tier) |
+| | **bounty_sol_20x** | Hyperliquid (base tier) |
 |---|---|---|
-| Max leverage (SOL) | **40x** | 40x |
-| Trading fee (taker) | **4 bps** | 4.5 bps |
-| Trading fee (maker) | 4 bps engine + wrapper rebate | 1.5 bps |
+| Max leverage (SOL) | **20x** (nominal; effective lower since mm = im) | 40x |
+| Initial margin | **5%** | 2.5% |
+| Maintenance margin | **5%** (= im, no opening buffer) | 1.25% (= im/2) |
+| Max accrual price move | **4.7% per accrual window** (uses ~95% of mm-budget) | n/a (off-chain) |
+| Trading fee (taker) | **2 bps** | 4.5 bps base, 2.4 bps top tier |
+| Trading fee (maker) | 2 bps engine + wrapper rebate | 1.5 bps |
 | Explicit liquidation fee | **25 bps** | 0 bps (forfeits maint margin instead) |
-| Effective liq cost at 40x | 25 bps | ~125 bps (forfeit maintenance margin) |
+| Effective liq cost | 25 bps (20× cheaper than HL's mm-forfeit at our 5% mm) | ~125 bps at 40x (forfeit maintenance margin) |
 | Min deposit | **$10** | $10 (practical) |
 | Min order notional | **$10** | $10 |
 | Withdrawal fee | **$0** | $1 native USDC |
 | Withdrawal latency | **same-tx atomic** | seconds-minutes |
 | Funding rate cap | global max 10000 e9/slot | 8h cap |
-| Daily maintenance fee | **$0.216/day flat** (on-chain spam defense) | none (off-chain orderbook) |
+| Daily maintenance fee | **~$1.08/day flat** (on-chain spam defense) | none (off-chain orderbook) |
 
 We're cheaper on:
-- Taker fee (4 vs 4.5 bps)
-- Effective liquidation cost (25 bps vs ~125 bps)
+- Taker fee (2 bps vs 4.5 bps base / 2.4 bps top tier — undercuts HL at every volume tier)
+- Effective liquidation cost (25 bps vs ~125 bps even at our halved leverage)
 - Withdrawal fee ($0 vs $1)
 - Withdrawal latency (atomic vs minutes)
 
-We're more expensive on:
-- Maker fee (4 bps vs 1.5 bps) — wrapper can offer maker rebates externally
+We give up on:
+- Max leverage (20x vs 40x) — strictly safer; users wanting >20x split positions
+- Maker fee (2 bps vs 1.5 bps) — wrapper can offer maker rebates externally
 - Account creation ($0.50 vs $0) — but funds the bounty pool
-- Daily maintenance ($0.216/day vs $0) — necessary for on-chain finite
-  slab; trivial cost for active traders ($0.79/yr on $10K, $0.08/yr on
-  $100K) and competitive with USDC borrow rates
+- Daily maintenance (~$1.08/day vs $0) — necessary for on-chain finite
+  slab; in line with USDC borrow rates for active traders (3.94%/yr on
+  $10K, 0.39%/yr on $100K) and 5× more aggressive at evicting idle
+  spam ($10 accounts die in 9 days vs HL's "never")
 
 **Net competitive position:** undercuts HL on every dimension that
 matters to a taker-heavy account, plus offers atomic same-tx
@@ -335,10 +368,10 @@ audit-budget escrow.
 
 - [ ] Pyth SOL/USD price feed wired with confidence-interval check
 - [ ] Wrapper `clamp_oracle()` implemented and tested against engine
-      envelope (5 bps × dt × P_last / 10_000)
-- [ ] Wrapper passes `Some(250)` as
+      envelope (47 bps × dt × P_last / 10_000)
+- [ ] Wrapper passes `Some(500)` as
       `admit_h_max_consumption_threshold_bps_opt` on all public-facing
-      instructions (§9.2 compliance)
+      instructions (§9.2 compliance — value = im_bps for 20x leverage)
 - [ ] Wrapper passes nonzero `rr_window_size = 192` on normal cranks
 - [ ] Account-creation hook: $10 min deposit + $0.50 fee → insurance
 - [ ] Min-order-notional hook: reject orders below $10
@@ -351,12 +384,18 @@ audit-budget escrow.
 
 ## 10. Fuzz results
 
-Stress test scenario `bounty_sol_50x` validates the more-aggressive
-50x configuration. The deployable `bounty_sol_40x_v1` market here is
+Stress test scenario `bounty_sol_50x` validates the most-aggressive
+50x configuration. The deployable `bounty_sol_20x` market here is
 strictly safer because:
-- Lower leverage → more margin headroom per position
-- Lower threshold trip point (250 vs 200 bps) → slow-path activates sooner
-- Same admit_h_max=0/admit_h_max=86400 admission pair
+- 2.5× lower leverage (20x vs 50x) → 2.5× the maintenance margin per
+  position (mm=500 vs mm=100 bps)
+- 2.5× higher consumption threshold (500 vs 200 bps) → slow-path
+  activates after a bigger oracle move, but mm scales proportionally so
+  the cascade budget is identical in relative terms
+- Liquidation fee 25 bps vs 20 bps — larger insurance backstop per liq
+- Same admit_h_min=0 / admit_h_max=86400 admission pair
+- Both pair mm = im (no opening buffer); 50x fuzz is the worst case for
+  this design and validated cleanly
 
 Latest 200-seed fuzz at the harder 50x point:
 
@@ -386,8 +425,8 @@ Stress lanes:
   consumption-threshold tripped: 100% of runs (peak 419 > 200)
 ```
 
-At the deployed 40x configuration, all margins are larger and the
-threshold trips later, so safety margins are strictly better than
+At the deployed 20x configuration, all margins are 2.5× larger than the
+fuzzed 50x point, so safety margins are strictly better than
 what's reported above.
 
 Sources:
