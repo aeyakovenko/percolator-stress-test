@@ -2237,6 +2237,50 @@ fn apply_scenario_preset(cfg: &mut Config, name: &str) {
             cfg.admit_h_min_slots = 0;              // INSTANT WITHDRAWALS
             cfg.admit_h_max_slots = 86_400;         // ~9.6h
         }
+        // ── SUPER-MAX-AGGRESSIVE: every engine dimension at envelope edge ──
+        // Differs from bounty_sol_20x in:
+        //   - max_price_move: 49 (envelope ceiling vs 47, +0.2% per accrual)
+        //   - liq_fee:         5 (5× cheaper, frees envelope room for max_move)
+        //   - trading_fee:     1 (half — undercuts every CEX/DEX globally)
+        //   - crash:           50% over 100 slots (50 bps/slot — at clamp boundary)
+        //   - n_zombies:       500 (5× more pre-existing imbalance)
+        //   - adversarial_keeper ordering (touch profitable accounts first)
+        // Threshold stays at im_bps=500 for spec §0 #4 / §9.2 compliance.
+        "bounty_sol_20x_max" => {
+            cfg.raw_engine_params = true;
+            cfg.p0 = 200;
+            cfg.mm_bps = 500;                       // = im
+            cfg.im_bps = 500;                       // 20x max leverage
+            cfg.trading_fee_bps = 1;                // half of bounty_sol_20x — most aggressive possible
+            cfg.liquidation_fee_bps = 5;            // 5× cheaper, frees envelope for more max_move
+            cfg.raw_max_price_move_bps_per_slot = 49;  // §1.4 envelope ceiling
+            cfg.raw_max_accrual_dt_slots = 10;
+            cfg.raw_min_nonzero_mm_req = 500;
+            cfg.raw_min_nonzero_im_req = 600;
+            cfg.n_users = 2000;
+            cfg.n_zombies = 500;                    // 5× more pre-existing matured PnL pressure
+            cfg.zombie_pnl_usdc = 5_000;
+            cfg.zombie_fee_debt_usdc = 100;
+            cfg.lp_capital_usdc = 100_000;
+            cfg.insurance_topup_usdc = 1_000;       // BOUNTY TARGET
+            cfg.crash_pct_bps = 5000;               // 50% crash (vs 40%)
+            cfg.crash_len = 105;                    // 47.6 bps/slot — just at envelope ceiling
+            cfg.bounce_pct_bps = 2000;              // bigger bounce, more reversal stress
+            cfg.bounce_len = 50;
+            cfg.total_slots = 1500;
+            cfg.long_bias = 0.90;                   // even more lopsided
+            cfg.crank_interval = 5;
+            cfg.candidate_ordering = "adversarial".into();  // touch profitable first
+            cfg.slippage_bps = 50;                  // 0.5% slippage
+            cfg.min_liquidation_abs = 0;
+            cfg.funding_schedule = vec![
+                (0, 10_000),                        // GLOBAL_MAX funding (8h cap)
+                (500, -10_000),
+                (1000, 10_000),
+            ];
+            cfg.admit_h_min_slots = 0;              // INSTANT WITHDRAWALS
+            cfg.admit_h_max_slots = 86_400;         // ~9.6h
+        }
         _ => eprintln!("unknown scenario: {}", name),
     }
 }
