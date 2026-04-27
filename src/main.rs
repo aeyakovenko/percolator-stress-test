@@ -1700,11 +1700,12 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
          adl_a_reductions,adl_k_changes,min_a_long,min_a_short,epoch_resets,\
          stress_slots,stress_first_slot,min_headroom,\
          consumption_stress_slots,consumption_stress_first_slot,max_consumption_bps_e9,\
-         sweep_generations,matured_overshoot_events\n",
+         sweep_generations,matured_overshoot_events,\
+         insurance_paid_out,insurance_payout_events\n",
     );
     for r in &runs {
         csv.push_str(&format!(
-            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.seed,
             r.min_h,
             r.min_h_slot,
@@ -1738,6 +1739,8 @@ fn run_scenario(cfg: &Config, label: &str, out_dir: &PathBuf) -> ScenarioSummary
             r.max_consumption_bps_e9,
             r.sweep_generations,
             r.matured_overshoot_events,
+            r.insurance_paid_out,
+            r.insurance_payout_events,
         ));
     }
     fs::write(scenario_dir.join("runs.csv"), csv).unwrap();
