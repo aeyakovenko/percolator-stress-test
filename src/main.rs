@@ -608,14 +608,17 @@ fn add_lp(engine: &mut RiskEngine, matcher_program: [u8; 32], matcher_context: [
 
 fn clamp_oracle(real_oracle: u64, last_engine_price: u64, max_move_bps: u64, dt: u64) -> u64 {
     // Per-call allowed delta in atomic units.
-    // max_move_bps * dt fits u64 for realistic values (≤ MAX_MARGIN_BPS * reasonable dt).
+    // budget_num = P_last × max_move × dt ≤ 1e12 × 1e4 × 1e10 = 1e26 (fits u128 ≈ 3.4e38).
+    // After /10_000, can still exceed u64 in pathological cases — saturate to u64::MAX
+    // before truncating cast.
     let budget_num = (last_engine_price as u128)
         .saturating_mul(max_move_bps as u128)
         .saturating_mul(dt as u128);
-    let budget = (budget_num / 10_000) as u64;
-    let lower = last_engine_price.saturating_sub(budget);
+    let budget_u128 = budget_num / 10_000;
+    let budget = budget_u128.min(u64::MAX as u128) as u64;
+    let lower = last_engine_price.saturating_sub(budget).max(1);
     let upper = last_engine_price.saturating_add(budget).min(percolator::MAX_ORACLE_PRICE);
-    real_oracle.clamp(lower.max(1), upper)
+    real_oracle.clamp(lower, upper)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
