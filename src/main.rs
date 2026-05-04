@@ -386,7 +386,7 @@ fn engine_trace_state(engine: &RiskEngine) -> serde_json::Value {
         "oi_eff_long_q": u128s(engine.oi_eff_long_q),
         "oi_eff_short_q": u128s(engine.oi_eff_short_q),
         "sweep_generation": engine.sweep_generation,
-        "price_move_consumed_e9": u128s(engine.price_move_consumed_bps_this_generation),
+        "price_move_consumed_e9": u128s(engine.stress_consumed_bps_e9_since_envelope),
         "adl_mult_long": u128s(engine.adl_mult_long),
         "adl_mult_short": u128s(engine.adl_mult_short),
         "adl_coeff_long": i128s(engine.adl_coeff_long),
@@ -1631,11 +1631,9 @@ fn run_one(cfg: &Config, seed: u64, trace_dir: &Path) -> (RunSummary, Vec<SlotSn
                 }
             }
 
-            // Consumption-threshold lane (spec §4.3 law 2): price_move_consumed_e9
+            // Consumption-threshold lane (spec §4.3 law 2): consumption-since-envelope
             // >= threshold_e9 forces admit_h_max regardless of residual.
-            // (Note: field is named `price_move_consumed_bps_this_generation` but is
-            // stored in e9 scale per spec §1.4 PRICE_MOVE_CONSUMPTION_SCALE.)
-            let consumed_e9 = engine.price_move_consumed_bps_this_generation;
+            let consumed_e9 = engine.stress_consumed_bps_e9_since_envelope;
             if consumed_e9 > max_consumption_bps_e9 {
                 max_consumption_bps_e9 = consumed_e9;
             }
