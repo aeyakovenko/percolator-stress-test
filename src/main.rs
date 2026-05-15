@@ -440,13 +440,102 @@ fn run_fuzz(n_seeds: usize) {
     println!("  max |user pnl|:         ${}", max_pnl / 1_000_000);
 }
 
+/// V13 port of v12 exec_price_attack test. Engine v13 also doesn't bound
+/// exec_price vs oracle directly; defense is the post-trade IM check.
+fn test_exec_price_attack_v13() -> V13Result<()> {
+    println!("=== v13 exec_price attack: bounty_sol_20x_max ===");
+    let cfg = make_bounty_sol_20x_max_config();
+    let oracle = price_e6(200);
+
+    for deviation_bps in [100u64, 1000, 5000, 9999] {
+        let mut engine = V13Engine::new(cfg)?;
+        let lp = engine.add_account(1)?;
+        let attacker = engine.add_account(2)?;
+        engine.deposit(lp, usdc(10_000_000))?;
+        engine.deposit(attacker, usdc(1_000))?;
+        engine.accrue_asset(SOL_ASSET, 1, oracle, 0)?;
+
+        // Adversarial exec: attacker (long) buys at exec << oracle. Gets PnL
+        // = size × (oracle - exec) / POS_SCALE if it goes through.
+        let exec_price = (oracle as u128 * (10_000 - deviation_bps) as u128 / 10_000).max(1) as u64;
+        let notional = usdc(5_000); // 5x leverage, well within IM (10% = $500)
+        let size_q = notional * POS_SCALE / exec_price as u128;
+
+        let result = engine.trade(attacker, lp, SOL_ASSET, size_q, exec_price, 1);
+        let outcome = match result {
+            Ok(_) => {
+                let a = &engine.accounts[attacker];
+                format!("OK | attacker pnl=${} cap=${}", a.pnl / 1_000_000, a.capital / USDC_DECIMALS)
+            }
+            Err(e) => format!("REJECTED ({:?}) — engine defended", e),
+        };
+        println!("  dev={:4} bps  exec=${}  : {}", deviation_bps, exec_price / 1_000_000, outcome);
+    }
+    Ok(())
+}
+
+/// V13 port of v12 sybil_close_attack: open A↔B at fair price, then close
+/// at adversarial exec to dump loss onto one side.
+fn test_sybil_close_v13() -> V13Result<()> {
+    println!("=== v13 sybil close: bounty_sol_20x_max ===");
+    let cfg = make_bounty_sol_20x_max_config();
+    let oracle = price_e6(200);
+
+    for deviation_bps in [100u64, 1000, 5000, 9999] {
+        let mut engine = V13Engine::new(cfg)?;
+        let lp = engine.add_account(1)?;
+        let a = engine.add_account(2)?;
+        let b = engine.add_account(3)?;
+        engine.deposit(lp, usdc(10_000_000))?;
+        engine.deposit(a, usdc(1_000))?;
+        engine.deposit(b, usdc(1_000))?;
+        engine.accrue_asset(SOL_ASSET, 1, oracle, 0)?;
+
+        let notional = usdc(5_000);
+        let size_q = notional * POS_SCALE / oracle as u128;
+
+        // Step 1: A long, B short, at fair price
+        let r1 = engine.trade(a, b, SOL_ASSET, size_q, oracle, 1);
+        if let Err(e) = r1 {
+            println!("  dev={:4} bps: STEP 1 failed ({:?})", deviation_bps, e);
+            continue;
+        }
+
+        // Step 2: reverse trade A↔B with adversarial exec — A flat, B flat,
+        // but pnl shifted by the deviation
+        let bad_exec = ((oracle as u128 * (10_000 + deviation_bps) as u128 / 10_000)
+            .min(MAX_ORACLE_PRICE as u128)) as u64;
+        let r2 = engine.trade(b, a, SOL_ASSET, size_q, bad_exec, 1);
+        match r2 {
+            Err(e) => {
+                println!("  dev={:4} bps: STEP 2 REJECTED ({:?})", deviation_bps, e);
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let pre_insurance = engine.group.insurance;
+        let acc_a = engine.accounts[a];
+        let acc_b = engine.accounts[b];
+        let _ = engine.assert_invariants();
+
+        println!("  dev={:4} bps OK | A pnl=${} cap=${} | B pnl=${} cap=${}  insurance=${}",
+            deviation_bps,
+            acc_a.pnl / 1_000_000, acc_a.capital / USDC_DECIMALS,
+            acc_b.pnl / 1_000_000, acc_b.capital / USDC_DECIMALS,
+            pre_insurance / USDC_DECIMALS);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Usage:");
-        println!("  --test=smoke           single smoke run");
-        println!("  --test=probe_configs   show which configs validate");
-        println!("  --fuzz=N               run N-seed bounty fuzz");
+        println!("  --test=smoke              single smoke run");
+        println!("  --test=probe_configs      show which configs validate");
+        println!("  --test=exec_price_attack  v13 exec_price deviation");
+        println!("  --test=sybil_close        v13 sybil two-step exec_price");
+        println!("  --fuzz=N                  run N-seed bounty fuzz");
         return;
     }
     if args.iter().any(|a| a == "--test=smoke") {
@@ -461,6 +550,20 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=probe_configs") {
         probe_bounty_variants();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=exec_price_attack") {
+        match test_exec_price_attack_v13() {
+            Ok(()) => {},
+            Err(e) => println!("FAILED: {:?}", e),
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--test=sybil_close") {
+        match test_sybil_close_v13() {
+            Ok(()) => {},
+            Err(e) => println!("FAILED: {:?}", e),
+        }
         return;
     }
     if let Some(arg) = args.iter().find(|a| a.starts_with("--fuzz=")) {
