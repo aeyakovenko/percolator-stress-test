@@ -186,8 +186,12 @@ fn probe_bounty_variants() {
 /// envelope reserves more headroom, max it accepts is 45.
 /// Effective per-accrual oracle tolerance: 45 × 10 = 450 bps = 4.5%.
 fn make_bounty_sol_20x_max_config() -> V13Config {
+    make_bounty_config(1)
+}
+
+fn make_bounty_config(n_assets: u8) -> V13Config {
     V13Config {
-        max_portfolio_assets: 1,
+        max_portfolio_assets: n_assets,
         min_nonzero_mm_req: 20,
         min_nonzero_im_req: 30,
         h_min: 0,
@@ -777,6 +781,176 @@ fn run_probes() {
     probe_long_funding_drain();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v13-specific probes (not portable to v12 — exercise new attack surface)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Multi-asset portfolio probe: open hedged long+short across 2 assets,
+/// crash one. Hedge should NOT mask losses on the crashed leg.
+fn probe_multi_asset_crash() {
+    println!("  Multi-asset: 2 assets, hedged long-short, one crashes");
+    let cfg = make_bounty_config(2);
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(2_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // User: long asset 0, long asset 1 (so a crash on either hits them)
+    let notional = usdc(5_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    if engine.trade(user, lp, 0, size_q, oracle, 1).is_err() {
+        println!("    open asset 0 failed"); return;
+    }
+    if engine.trade(user, lp, 1, size_q, oracle, 1).is_err() {
+        println!("    open asset 1 failed"); return;
+    }
+    println!("    opened long on assets 0 + 1 ($5k each)");
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let o1 = oracle;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    let mut total_residual = 0u128;
+
+    for _ in 0..200 {
+        // crash asset 0, leave asset 1 flat
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+            // Find biggest leg and liquidate
+            let mut best = (0usize, 0u128);
+            for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+                let leg = engine.accounts[user].legs[li];
+                if leg.active {
+                    let a = leg.basis_pos_q.unsigned_abs();
+                    if a > best.1 { best = (li, a); }
+                }
+            }
+            if best.1 > 0 {
+                let mut acc = engine.accounts[user];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV13 { asset_index: best.0, close_q: best.1, fee_bps: 5 },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                    total_residual += out.residual_booked;
+                }
+                engine.accounts[user] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    liquidations:      {}", total_liquidations);
+    println!("    insurance used:    {}", total_insurance_used);
+    println!("    residual booked:   {}", total_residual);
+    println!("    user pnl: {}  cap: {}", engine.accounts[user].pnl, engine.accounts[user].capital);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Stale-account probe: open position, mark account stale, try to extract
+/// via favorable action. Should be rejected.
+fn probe_stale_extract() {
+    println!("  Stale-state extraction: mark stale, try convert/withdraw");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let notional = usdc(5_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+
+    // Mark account stale
+    let mut acc = engine.accounts[user];
+    let _ = engine.group.mark_account_stale(&mut acc);
+    engine.accounts[user] = acc;
+    println!("    marked stale; account.stale_state={}", engine.accounts[user].stale_state);
+
+    // Try to convert PnL while stale
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[user];
+    let r = engine.group.convert_released_pnl_to_capital_not_atomic(&mut acc);
+    engine.accounts[user] = acc;
+    println!("    convert while stale: {:?}", r.err());
+
+    // Try to withdraw capital while stale
+    let mut acc = engine.accounts[user];
+    let r = engine.group.withdraw_not_atomic(&mut acc, usdc(100), &prices);
+    engine.accounts[user] = acc;
+    println!("    withdraw while stale: {:?}", r.err());
+
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Withdraw-mid-position probe: open large position, try to withdraw a lot
+/// of capital so IM is violated. Should be rejected.
+fn probe_withdraw_undercollateralize() {
+    println!("  Withdraw undercollateralize: open 15x, try to withdraw down to IM violation");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let notional = usdc(15_000); // 15x
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+    println!("    opened 15x position; cap=${}", engine.accounts[user].capital / USDC_DECIMALS);
+
+    let prices = engine.effective_prices();
+    for w in [10u128, 100, 500, 990, 999, 1000] {
+        let mut acc = engine.accounts[user];
+        let r = engine.group.withdraw_not_atomic(&mut acc, usdc(w), &prices);
+        match &r {
+            Ok(()) => {
+                engine.accounts[user] = acc;
+                println!("    withdraw ${:>4}: OK; cap=${}",
+                    w, engine.accounts[user].capital / USDC_DECIMALS);
+            }
+            Err(e) => println!("    withdraw ${:>4}: {:?}", w, e),
+        }
+    }
+    println!("    final cap: ${}  pnl: {}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_v13_extra() {
+    println!("=== v13-specific probes ===");
+    probe_multi_asset_crash();
+    println!();
+    probe_stale_extract();
+    println!();
+    probe_withdraw_undercollateralize();
+}
+
 /// P2 equivalent: 0 insurance, 0 LP capital. Long-running funding drain on
 /// users with one-sided exposure. If the engine can ever leak negative pnl
 /// to insurance, this should reveal it.
@@ -1165,6 +1339,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=probes") {
         run_probes();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=probes_v13") {
+        run_probes_v13_extra();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {
