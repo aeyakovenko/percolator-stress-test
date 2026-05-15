@@ -312,6 +312,8 @@ enum Scenario {
     Crash10,
     Crash20,
     FundingDrain,
+    OracleWick,
+    HighLev,
 }
 
 impl Scenario {
@@ -321,6 +323,8 @@ impl Scenario {
             "crash10" => Some(Self::Crash10),
             "crash20" => Some(Self::Crash20),
             "funding_drain" => Some(Self::FundingDrain),
+            "oracle_wick" => Some(Self::OracleWick),
+            "high_lev" => Some(Self::HighLev),
             _ => None,
         }
     }
@@ -330,8 +334,90 @@ impl Scenario {
             Self::Crash10 => "crash10",
             Self::Crash20 => "crash20",
             Self::FundingDrain => "funding_drain",
+            Self::OracleWick => "oracle_wick",
+            Self::HighLev => "high_lev",
         }
     }
+}
+
+/// Explicit invariant battery — v12-style granular checks. Returns a list of
+/// (label, ok) pairs so the caller can attribute the specific invariant that
+/// failed.
+fn invariant_battery(engine: &V13Engine) -> Vec<(&'static str, bool)> {
+    let g = &engine.group;
+    let mut results = vec![];
+
+    // I1: vault >= c_tot + insurance (solvency)
+    let senior = g.c_tot.saturating_add(g.insurance);
+    results.push(("V >= C + I", g.vault >= senior));
+
+    // I2: matured <= pnl_pos_tot
+    results.push(("matured <= pos_tot", g.pnl_matured_pos_tot <= g.pnl_pos_tot));
+
+    // I3-5: per-asset K, F, A bounds
+    let mut k_ok = true;
+    let mut f_ok = true;
+    let mut a_ok = true;
+    for i in 0..g.config.max_portfolio_assets as usize {
+        let asset = g.assets[i];
+        if asset.k_long.unsigned_abs() > (i128::MAX as u128) / 2 { k_ok = false; }
+        if asset.k_short.unsigned_abs() > (i128::MAX as u128) / 2 { k_ok = false; }
+        if asset.f_long_num.unsigned_abs() > (i128::MAX as u128) / 2 { f_ok = false; }
+        if asset.f_short_num.unsigned_abs() > (i128::MAX as u128) / 2 { f_ok = false; }
+        // A_side >= MIN_A_SIDE unless in DrainOnly/ResetPending
+        if asset.oi_eff_long_q > 0 && asset.mode_long == SideModeV13::Normal && asset.a_long < MIN_A_SIDE {
+            a_ok = false;
+        }
+        if asset.oi_eff_short_q > 0 && asset.mode_short == SideModeV13::Normal && asset.a_short < MIN_A_SIDE {
+            a_ok = false;
+        }
+    }
+    results.push(("K within i128/2", k_ok));
+    results.push(("F within i128/2", f_ok));
+    results.push(("A_side >= MIN_A_SIDE (Normal mode)", a_ok));
+
+    // I6: negative_pnl_account_count consistency
+    let neg_count = engine.accounts.iter().filter(|a| a.pnl < 0).count() as u64;
+    results.push(("neg_pnl_count consistent", neg_count == g.negative_pnl_account_count));
+
+    // I7: sum(capital) == c_tot
+    let sum_cap: u128 = engine.accounts.iter().map(|a| a.capital).sum();
+    results.push(("sum(capital) == c_tot", sum_cap == g.c_tot));
+
+    // I8: sum(reserved_pnl) <= sum(max(0, pnl))
+    let sum_reserved: u128 = engine.accounts.iter().map(|a| a.reserved_pnl).sum();
+    let sum_pos_pnl: u128 = engine.accounts.iter().map(|a| a.pnl.max(0) as u128).sum();
+    results.push(("sum(reserved) <= sum(pos pnl)", sum_reserved <= sum_pos_pnl));
+
+    // I9 (v13-specific): F7 invariant — DrainOnly implies opposing OI > 0 OR opp is in ResetPending
+    let mut f7_ok = true;
+    for i in 0..g.config.max_portfolio_assets as usize {
+        let asset = g.assets[i];
+        if asset.mode_long == SideModeV13::DrainOnly
+            && asset.oi_eff_short_q == 0
+            && asset.mode_short != SideModeV13::ResetPending
+        {
+            f7_ok = false;
+        }
+        if asset.mode_short == SideModeV13::DrainOnly
+            && asset.oi_eff_long_q == 0
+            && asset.mode_long != SideModeV13::ResetPending
+        {
+            f7_ok = false;
+        }
+    }
+    results.push(("F7 DrainOnly + opp OI consistent", f7_ok));
+
+    results
+}
+
+fn run_invariant_battery(engine: &V13Engine) -> u32 {
+    let results = invariant_battery(engine);
+    let mut failures = 0u32;
+    for (_, ok) in &results {
+        if !ok { failures += 1; }
+    }
+    failures
 }
 
 /// Wrapper-side oracle clamp matching v12 semantics: limit per-call move to
@@ -347,7 +433,7 @@ fn clamp_oracle(real: u64, last: u64, max_move_bps: u64, dt: u64) -> u64 {
 /// Compute the next oracle for the slot under the chosen scenario.
 fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_move: u64) -> u64 {
     match scen {
-        Scenario::Random => {
+        Scenario::Random | Scenario::HighLev => {
             let crash = rng.bool() && rng.bool() && rng.bool() && rng.bool();
             let pct = if crash {
                 rng.range_u64(1, max_move)
@@ -359,24 +445,26 @@ fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_mo
             if up { oracle.saturating_add(d) } else { oracle.saturating_sub(d).max(1) }
         }
         Scenario::Crash10 | Scenario::Crash20 => {
-            // Monotone downward walk, envelope-max each slot for 100 slots,
-            // then drift back up. With max_move=45 bps/slot for 100 slots,
-            // worst-case cumulative ≈ 36% (compounded). 10/20 distinguished
-            // by direction at the end (10 stays down, 20 keeps crashing).
             let crash_len: u64 = if matches!(scen, Scenario::Crash20) { 200 } else { 100 };
             if step < crash_len {
                 let d = (oracle as u128 * max_move as u128 / 10_000) as u64;
                 oracle.saturating_sub(d).max(1)
             } else {
-                // recovery: drift up gently
                 let d = (oracle as u128 * (max_move as u128 / 3) / 10_000) as u64;
                 oracle.saturating_add(d)
             }
         }
-        Scenario::FundingDrain => {
-            // No price moves; the fuzz applies a non-zero funding rate every
-            // step elsewhere. Oracle stays flat.
-            oracle
+        Scenario::FundingDrain => oracle,
+        Scenario::OracleWick => {
+            // Sharp V-shape: 50 slots down envelope-max, 50 slots back up
+            // envelope-max, repeat. Tests engine's response to fast reversals.
+            let cycle = step % 100;
+            let d = (oracle as u128 * max_move as u128 / 10_000) as u64;
+            if cycle < 50 {
+                oracle.saturating_sub(d).max(1)
+            } else {
+                oracle.saturating_add(d)
+            }
         }
     }
 }
@@ -421,12 +509,16 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
         Scenario::Crash10 => 200,
         Scenario::Crash20 => 400,
         Scenario::FundingDrain => 300,
+        Scenario::OracleWick => 400,
+        Scenario::HighLev => 200,
     };
 
-    // Open initial positions on each user (random direction, ~10x leverage)
+    // Open initial positions on each user. Default 8x leverage; HighLev
+    // pushes to 18x (close to IM cap so any adverse move forces liquidation).
+    let init_leverage = if matches!(scen, Scenario::HighLev) { 18 } else { 8 };
     for &u in &users {
         let going_long = rng.bool();
-        let notional = usdc(8_000); // 8x of $1k → safe IM at 20x limit
+        let notional = usdc(1_000 * init_leverage);
         let size_q = notional * POS_SCALE / oracle as u128;
         let (long, short) = if going_long { (u, lp) } else { (lp, u) };
         if engine.trade(long, short, SOL_ASSET, size_q, oracle, 1).is_ok() {
@@ -514,6 +606,7 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
         if engine.assert_invariants().is_err() {
             summary.invariant_failures += 1;
         }
+        summary.invariant_failures += run_invariant_battery(&engine);
         if engine.group.bankruptcy_hlock_active {
             summary.bankruptcy_lock_tripped = true;
         }
@@ -1091,9 +1184,20 @@ fn main() {
         run_fuzz(scen, n);
         return;
     }
-    if args.iter().any(|a| a == "--fuzz-all") {
-        for scen in [Scenario::Random, Scenario::Crash10, Scenario::Crash20, Scenario::FundingDrain] {
-            run_fuzz(scen, 200);
+    if args.iter().any(|a| a == "--fuzz-all" || a.starts_with("--fuzz-all=")) {
+        let n = args.iter()
+            .find(|a| a.starts_with("--fuzz-all="))
+            .and_then(|a| a.strip_prefix("--fuzz-all=").unwrap().parse().ok())
+            .unwrap_or(200);
+        for scen in [
+            Scenario::Random,
+            Scenario::Crash10,
+            Scenario::Crash20,
+            Scenario::FundingDrain,
+            Scenario::OracleWick,
+            Scenario::HighLev,
+        ] {
+            run_fuzz(scen, n);
             println!();
         }
         return;
