@@ -318,6 +318,8 @@ enum Scenario {
     FundingDrain,
     OracleWick,
     HighLev,
+    /// Combined: 20 users, 3 assets, mixed leverage, independent crashes
+    Mega,
 }
 
 impl Scenario {
@@ -329,6 +331,7 @@ impl Scenario {
             "funding_drain" => Some(Self::FundingDrain),
             "oracle_wick" => Some(Self::OracleWick),
             "high_lev" => Some(Self::HighLev),
+            "mega" => Some(Self::Mega),
             _ => None,
         }
     }
@@ -340,6 +343,7 @@ impl Scenario {
             Self::FundingDrain => "funding_drain",
             Self::OracleWick => "oracle_wick",
             Self::HighLev => "high_lev",
+            Self::Mega => "mega",
         }
     }
 }
@@ -470,6 +474,13 @@ fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_mo
                 oracle.saturating_add(d)
             }
         }
+        Scenario::Mega => {
+            // Independent random walk per asset, but bigger moves than Random
+            let dir = rng.bool();
+            let pct = rng.range_u64(0, max_move);
+            let d = (oracle as u128 * pct as u128 / 10_000) as u64;
+            if dir { oracle.saturating_add(d) } else { oracle.saturating_sub(d).max(1) }
+        }
     }
 }
 
@@ -477,23 +488,27 @@ fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_mo
 /// keeper that checks each user's certified_liq_deficit and liquidates the
 /// largest leg if positive.
 fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
-    let cfg = make_bounty_sol_20x_max_config();
+    let n_assets = if matches!(scen, Scenario::Mega) { 3 } else { 1 };
+    let cfg = make_bounty_config(n_assets);
     let mut engine = V13Engine::new(cfg).expect("init");
     let mut rng = Rng::new(seed);
 
     let lp = engine.add_account(1).unwrap();
-    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
 
-    const N_USERS: usize = 5;
-    let mut users = Vec::with_capacity(N_USERS);
-    for _ in 0..N_USERS {
+    let n_users = if matches!(scen, Scenario::Mega) { 20 } else { 5 };
+    let mut users = Vec::with_capacity(n_users);
+    for _ in 0..n_users {
         let u = engine.add_account(2).unwrap();
         engine.deposit(u, usdc(1_000)).unwrap();
         users.push(u);
     }
 
     let oracle0 = price_e6(200);
-    engine.accrue_asset(SOL_ASSET, 1, oracle0, 0).unwrap();
+    for ai in 0..n_assets as usize {
+        engine.accrue_asset(ai, 1, oracle0, 0).unwrap();
+    }
+    let _ = SOL_ASSET;
 
     let mut summary = RunSummary {
         seed,
@@ -506,7 +521,7 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
     };
 
     let mut slot = 2u64;
-    let mut oracle = oracle0;
+    let mut oracles = vec![oracle0; n_assets as usize];
     let max_move = cfg.max_price_move_bps_per_slot;
     let total_slots: u64 = match scen {
         Scenario::Random => 200,
@@ -515,17 +530,31 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
         Scenario::FundingDrain => 300,
         Scenario::OracleWick => 400,
         Scenario::HighLev => 200,
+        Scenario::Mega => 400,
     };
 
     // Open initial positions on each user. Default 8x leverage; HighLev
-    // pushes to 18x (close to IM cap so any adverse move forces liquidation).
-    let init_leverage = if matches!(scen, Scenario::HighLev) { 18 } else { 8 };
+    // pushes to 18x; Mega uses random 5-18x with random direction across
+    // a random asset.
+    let init_leverage_fn = |rng: &mut Rng| -> u128 {
+        match scen {
+            Scenario::HighLev => 18,
+            Scenario::Mega => rng.range_u64(5, 18) as u128,
+            _ => 8,
+        }
+    };
     for &u in &users {
         let going_long = rng.bool();
-        let notional = usdc(1_000 * init_leverage);
-        let size_q = notional * POS_SCALE / oracle as u128;
+        let asset = if matches!(scen, Scenario::Mega) {
+            (rng.next_u64() as usize) % (n_assets as usize)
+        } else {
+            SOL_ASSET
+        };
+        let lev = init_leverage_fn(&mut rng);
+        let notional = usdc(1_000 * lev);
+        let size_q = notional * POS_SCALE / oracles[asset] as u128;
         let (long, short) = if going_long { (u, lp) } else { (lp, u) };
-        if engine.trade(long, short, SOL_ASSET, size_q, oracle, 1).is_ok() {
+        if engine.trade(long, short, asset, size_q, oracles[asset], 1).is_ok() {
             summary.total_trades += 1;
         }
     }
@@ -533,13 +562,18 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
     let funding_rate = if matches!(scen, Scenario::FundingDrain) { 5_000i128 } else { 0 };
 
     for step in 0..total_slots {
-        let target = scenario_oracle(scen, &mut rng, oracle, step, max_move);
-        oracle = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
-
-        if engine.accrue_asset(SOL_ASSET, slot, oracle, funding_rate).is_err() {
-            slot += 1;
-            continue;
+        // For multi-asset Mega, each asset moves independently.
+        for ai in 0..n_assets as usize {
+            let target = scenario_oracle(scen, &mut rng, oracles[ai], step, max_move);
+            oracles[ai] = clamp_oracle(
+                target,
+                engine.group.assets[ai].effective_price,
+                max_move,
+                1,
+            );
+            let _ = engine.accrue_asset(ai, slot, oracles[ai], funding_rate);
         }
+        let oracle = oracles[0]; // primary oracle for legacy code below
 
         // Keeper: liquidate anyone with certified_liq_deficit > 0.
         // To learn each account's deficit we have to refresh it first.
@@ -589,23 +623,30 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
             }
         }
 
-        // Random new trades (only for Random/FundingDrain — crash scenarios
-        // observe pre-positioned users getting liquidated)
-        if matches!(scen, Scenario::Random | Scenario::FundingDrain) && step % 5 == 0 {
+        // Random new trades (Random/FundingDrain/Mega add liveness churn)
+        if matches!(scen, Scenario::Random | Scenario::FundingDrain | Scenario::Mega)
+            && step % 5 == 0
+        {
             let uidx = users[(rng.next_u64() as usize) % users.len()];
             let cap = engine.accounts[uidx].capital;
             if cap > usdc(50) {
                 let going_long = rng.bool();
+                let asset = if matches!(scen, Scenario::Mega) {
+                    (rng.next_u64() as usize) % (n_assets as usize)
+                } else {
+                    SOL_ASSET
+                };
                 let leverage = rng.range_u64(2, 15) as u128;
                 let notional = (cap * leverage).min(usdc(20_000));
-                let size_q = notional * POS_SCALE / oracle as u128;
+                let size_q = notional * POS_SCALE / oracles[asset] as u128;
                 let (long, short) = if going_long { (uidx, lp) } else { (lp, uidx) };
-                match engine.trade(long, short, SOL_ASSET, size_q, oracle, 1) {
+                match engine.trade(long, short, asset, size_q, oracles[asset], 1) {
                     Ok(_) => summary.total_trades += 1,
                     Err(_) => summary.rejected_trades += 1,
                 }
             }
         }
+        let _ = oracle;
 
         if engine.assert_invariants().is_err() {
             summary.invariant_failures += 1;
@@ -1374,6 +1415,7 @@ fn main() {
             Scenario::FundingDrain,
             Scenario::OracleWick,
             Scenario::HighLev,
+            Scenario::Mega,
         ] {
             run_fuzz(scen, n);
             println!();
