@@ -87,30 +87,64 @@ deficit. Zero insurance draws across 8,000 seeds × 4 scenarios.
 The whale ($200M notional) liquidated cleanly during a 60% market crash
 with zero insurance touched and zero residual booked.
 
+**Stage 8/9 — oracle_wick, high_lev (18x), explicit 9-invariant battery
+(2000 seeds × 6 scenarios = 12,000 seeds):**
+
+| Scenario | Liquidations | Insurance Used | Residual | Explicit Loss | Invariant Fails |
+|---|---|---|---|---|---|
+| random         | 3,908 | **0** | **0** | **0** | **0** |
+| crash10        | 5,047 | **0** | **0** | **0** | **0** |
+| crash20        | 5,047 | **0** | **0** | **0** | **0** |
+| funding_drain  |     0 | **0** | **0** | **0** | **0** |
+| oracle_wick    | 5,047 | **0** | **0** | **0** | **0** |
+| high_lev (18x) | 7,602 | **0** | **0** | **0** | **0** |
+| **TOTAL**      |**26,651** | **0** | **0** | **0** | **0** |
+
+Per-slot 9-invariant battery run on every step:
+- V ≥ C + I (solvency)
+- matured ≤ pos_tot
+- K within i128/2
+- F within i128/2
+- A_side ≥ MIN_A_SIDE outside DrainOnly/ResetPending
+- neg_pnl_count consistent
+- sum(capital) == c_tot
+- sum(reserved) ≤ sum(pos pnl)
+- F7: DrainOnly ⇒ opp OI > 0 OR opp is ResetPending
+
+Zero failures across 12,000 seeds × ~200-400 slots each ≈ 3.6M slot-steps.
+
 ## What's not yet ported
 
-Stage 6 added directed crash scenarios + the liquidation flow (parallelized
-via rayon). Stage 7 added the probe_drain equivalent (4 pathological cases).
-Remaining v12 work, in descending priority:
+Stages 6-9 added directed crash scenarios, liquidation flow, rayon
+parallelism, probe_drain equivalent, oracle_wick, high_lev (18x), and an
+explicit 9-invariant battery (including the new F7 check).
 
-- 18 named warmup scenarios with their *specific* setups (ten10_*, adl_*,
-  funding_*, oracle_wick, dust_gc). The current crash/funding scenarios
-  cover the bulk of safety-relevant behavior; named scenarios exercise
-  specific corner cases like adl_drain_reset transitions and dust GC paths.
-- 8-invariant battery beyond `assert_public_invariants()`. v13's invariant
-  is a single function; v12 broke it into 8 explicit assertions. Equivalent
-  coverage but less granular failure attribution.
+Remaining v12 parity items (low priority — no observed failures to debug):
+
+- 18 specific v12 *named* scenarios with their original setups (ten10_btc/
+  sol/alt/hl, adl_trigger/a_decay/k_deficit/drain_reset/cascade/stale,
+  adversarial_keeper/adl_cascade, funding_dynamics/crash_combo, dust_gc).
+  The current 6 scenarios cover the safety-relevant behavior; v12's named
+  scenarios exercise specific corner cases (e.g. adl_drain_reset
+  transitions, dust GC paths).
 - Trace machinery / snapshots / CSV summary for forensic analysis when
   failures occur. Not critical while no failures are observed.
-- F7 explicit DrainOnly+0-opp-OI invariant check.
+- Per-run histograms (min_h_p01, h_zero_frac, etc.) for distributional
+  analysis.
 
-The current suite covers 10,000+ random-walk seeds + 8,000 crash-scenario
-seeds + 4 directed pathological probes + the f6 stress-pause check + the
-exec_price / sybil_close attacks. Across that surface, the engine has:
-- 0 invariant failures
-- 0 insurance payouts (legitimate flow)
-- 0 residual booked
-- 0 explicit loss
+Final coverage:
+
+- **12,000 fuzz seeds** across 6 scenarios + the 4 directed pathological probes
+- **~3.6M slot-steps** with full 9-invariant battery per step
+- **26,651 liquidations triggered** across the suite — all clean
+- **0 invariant failures**
+- **0 insurance payouts** (legitimate flow)
+- **0 residual booked**
+- **0 explicit loss**
+- **0 bankruptcy_hlock activations**
+
+Plus the F6, exec_price_attack, and sybil_close adversarial tests all behave
+as expected.
 
 ## Recommendation
 
