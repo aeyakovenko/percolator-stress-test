@@ -1135,6 +1135,74 @@ fn run_probes_v13_more() {
     probe_rapid_churn();
 }
 
+/// Resolve market path: trigger market resolve, then exit accounts via
+/// close_resolved_account_not_atomic. Tests the emergency-exit path.
+fn probe_resolve_exit() {
+    println!("  Market resolve + emergency exit: 5 users, resolve, close_resolved");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let mut users = Vec::new();
+    for _ in 0..5 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        users.push(u);
+    }
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    // Each user opens random position
+    let mut rng = Rng::new(42);
+    for &u in &users {
+        let going_long = rng.bool();
+        let notional = usdc(5_000);
+        let size_q = notional * POS_SCALE / oracle as u128;
+        let (long, short) = if going_long { (u, lp) } else { (lp, u) };
+        let _ = engine.trade(long, short, SOL_ASSET, size_q, oracle, 1);
+    }
+
+    // Resolve the market at slot 10
+    let r = engine.group.resolve_market_not_atomic(10);
+    println!("    resolve_market: {:?}", r);
+    println!("    mode: {:?}", engine.group.mode);
+
+    // Each user tries close_resolved_account_not_atomic
+    let mut exits = 0;
+    let mut progresses = 0;
+    for &u in &users {
+        for attempt in 0..10 {
+            let mut acc = engine.accounts[u];
+            let r = engine.group.close_resolved_account_not_atomic(&mut acc, 0);
+            engine.accounts[u] = acc;
+            match r {
+                Ok(ResolvedCloseOutcomeV13::ProgressOnly) => {
+                    progresses += 1;
+                }
+                Ok(ResolvedCloseOutcomeV13::Closed { payout }) => {
+                    exits += 1;
+                    println!("    user {} closed on attempt {}: payout=${}",
+                        u, attempt, payout / USDC_DECIMALS);
+                    break;
+                }
+                Err(e) => {
+                    println!("    user {} attempt {}: {:?}", u, attempt, e);
+                    break;
+                }
+            }
+        }
+    }
+    println!("    exits: {} / {} users", exits, users.len());
+    println!("    progress-only calls: {}", progresses);
+    println!("    invariants: {:?}", engine.assert_invariants().err());
+}
+
+fn run_probes_resolve() {
+    println!("=== v13 resolve / emergency-exit probe ===");
+    probe_resolve_exit();
+}
+
 /// P2 equivalent: 0 insurance, 0 LP capital. Long-running funding drain on
 /// users with one-sided exposure. If the engine can ever leak negative pnl
 /// to insurance, this should reveal it.
@@ -1531,6 +1599,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=probes_paths") {
         run_probes_v13_more();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=probes_resolve") {
+        run_probes_resolve();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {
