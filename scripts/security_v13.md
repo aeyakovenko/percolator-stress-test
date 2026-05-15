@@ -170,14 +170,22 @@ In the trace: a 22% oracle drop with no keeper liquidation produced:
 
 **Implication for the bounty deployment:**
 
-A keeper that doesn't liquidate promptly **CAN** drain insurance. The engine
-correctly absorbs the deficit per spec, but the deficit only exists because
-the wrapper let it. This is the wrapper's responsibility, not an engine bug.
+This is the standard perp-engine operating assumption: keepers must run
+liquidations fast enough. Insurance exists to absorb the residual when
+volatility outruns the keeper *briefly* — that's the design intent of
+spec §5.6 step 2, and it's what the accumulated fee balance protects.
 
-Mitigations:
-- Run the keeper every slot (4 sec on Solana). The engine's max_accrual_dt_slots=10 (~4 sec) means at most 1 catchup window of slip is tolerable.
-- Set conservative leverage / margin (20x with 5% mm = $400 loss tolerance per slot before MM violation).
-- The 9-invariant battery passes throughout — no engine bug, just wrapper-required behavior.
+Deploy requirement (documented in `bounty_v13.md`):
+- Keeper runs every slot.
+- `max_accrual_dt_slots = 10` (~4 sec) is the catchup-window bound.
+- The 9-invariant battery and engine logic are correct; only operator
+  practice matters here.
+
+**Note on v12 parity:** v12 has the same waterfall (`enqueue_adl` calls
+`use_insurance_buffer` before applying ADL). My v12 audit didn't surface
+this because every v12 probe ran the keeper every slot; the slow-keeper
+scenario wasn't tested. Both engines impose the same keeper-liveness
+deploy assumption.
 
 **v12-style corner-case probes (`--test=corner_cases`):**
 

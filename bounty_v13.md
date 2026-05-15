@@ -89,19 +89,25 @@ V13Config {
      3. If `health_cert.certified_liq_deficit > 0`, call
         `liquidate_account_not_atomic` with the appropriate leg.
 
-   **Critical timing requirement:** a slow keeper CAN drain insurance.
-   If the keeper waits too long after a price move, a user's K-pair losses
-   first exhaust `capital` (absorbed via `settle_negative_pnl_from_principal`),
-   then accumulate as negative `account.pnl`. When liquidation finally fires
-   on a `pnl < 0` and `cap == 0` account, the engine consumes `insurance`
-   per spec §5.6 step 2.
+   **Keeper-liveness operating assumption:** like every perp engine, v13
+   assumes the keeper runs liquidations fast enough. The §1.4 envelope
+   reserves headroom for `max_accrual_dt_slots` of keeper lag (~4 seconds
+   on Solana); if the keeper is slower than that, the engine is operating
+   outside its design envelope.
 
-   Verified in `--test=pnl_trace`: a 22% drop with no liquidation produces
-   `cap=0, pnl=-$1198, liq_deficit=$1198, insurance_used=$2, residual=$1196`.
-   The $2 insurance dip is the keeper's fault, not the engine's.
+   Failure mode if the keeper is too slow: K-pair losses first exhaust
+   `capital` (absorbed via `settle_negative_pnl_from_principal`), then
+   accumulate as negative `account.pnl`. When liquidation finally fires on
+   `pnl < 0` and `cap == 0`, the engine consumes `insurance` per spec
+   §5.6 step 2 — the standard deficit-absorption waterfall, not a defect.
 
-   Run the keeper every slot. `max_accrual_dt_slots=10` (~4 seconds) is the
-   maximum tolerable lag before catchup must occur.
+   Reference (`--test=pnl_trace`): a 22%-drop, no-keeper trace produces
+   `cap=0, pnl=-$1198, liq_deficit=$1198, insurance_used=$2,
+   residual=$1196`. This is *what insurance is for* — accumulating fees
+   to cover keeper-lag risk during real volatility events.
+
+   Deploy requirement: run the keeper every slot. Catchup window
+   ≤ `max_accrual_dt_slots = 10` (~4 sec).
 
 4. **Emergency pause.** Operator can set
    `MarketGroupV13.threshold_stress_active = true` to pause favorable
