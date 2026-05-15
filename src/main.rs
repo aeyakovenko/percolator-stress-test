@@ -1290,6 +1290,287 @@ fn run_probes_boundary() {
     probe_rebalance();
 }
 
+/// ADL drain reset probe (v12 adl_drain_reset port).
+/// Force one side's ADL multiplier (a_long or a_short) to floor by repeatedly
+/// liquidating opposite-side bankrupt positions, triggering ADL haircuts.
+/// Verify the side cleanly transitions Normal → DrainOnly → (eventually)
+/// ResetPending.
+fn probe_adl_drain_reset() {
+    println!("  ADL drain-reset: force a_side to floor, observe DrainOnly → ResetPending");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    // Many small longs that will all crash
+    let mut longs = Vec::new();
+    for _ in 0..50 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(100)).unwrap();
+        longs.push(u);
+    }
+    // Hedge shorts that will benefit
+    let mut shorts = Vec::new();
+    for _ in 0..10 {
+        let u = engine.add_account(3).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        shorts.push(u);
+    }
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    // Longs open near-max-leverage
+    let long_notional = usdc(1_800); // 18x of $100
+    let long_size = long_notional * POS_SCALE / oracle as u128;
+    for &u in &longs {
+        let _ = engine.trade(u, lp, SOL_ASSET, long_size, oracle, 1);
+    }
+    // Shorts open similar exposure on opposite side
+    let short_notional = usdc(15_000);
+    let short_size = short_notional * POS_SCALE / oracle as u128;
+    for &u in &shorts {
+        let _ = engine.trade(lp, u, SOL_ASSET, short_size, oracle, 1);
+    }
+
+    println!("    initial: {} longs, {} shorts, asset OI long=${} short=${}",
+        longs.len(), shorts.len(),
+        engine.group.assets[0].oi_eff_long_q,
+        engine.group.assets[0].oi_eff_short_q);
+    println!("    a_long={}  a_short={}",
+        engine.group.assets[0].a_long, engine.group.assets[0].a_short);
+
+    // Crash to push longs into MM violation
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o = oracle;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    let mut drain_only_long_seen = false;
+    let mut drain_only_short_seen = false;
+    let mut reset_pending_seen = false;
+
+    for _ in 0..400 {
+        let d = (o as u128 * max_move as u128 / 10_000) as u64;
+        o = o.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(SOL_ASSET, slot, o, 0);
+
+        let prices = engine.effective_prices();
+        for &u in &longs {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                let leg = engine.accounts[u].legs[0];
+                if leg.active {
+                    let mut acc = engine.accounts[u];
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV13 {
+                            asset_index: 0,
+                            close_q: leg.basis_pos_q.unsigned_abs(),
+                            fee_bps: 5,
+                        },
+                        &prices,
+                    ) {
+                        total_liquidations += 1;
+                        total_insurance_used += out.insurance_used;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        // Observe side-mode transitions
+        match engine.group.assets[0].mode_long {
+            SideModeV13::DrainOnly => drain_only_long_seen = true,
+            SideModeV13::ResetPending => reset_pending_seen = true,
+            _ => {}
+        }
+        match engine.group.assets[0].mode_short {
+            SideModeV13::DrainOnly => drain_only_short_seen = true,
+            SideModeV13::ResetPending => reset_pending_seen = true,
+            _ => {}
+        }
+        slot += 1;
+    }
+    println!("    final oracle: ${}", o / 1_000_000);
+    println!("    a_long={}  a_short={}",
+        engine.group.assets[0].a_long, engine.group.assets[0].a_short);
+    println!("    mode: long={:?}  short={:?}",
+        engine.group.assets[0].mode_long, engine.group.assets[0].mode_short);
+    println!("    transitions seen: DrainOnly_long={}  DrainOnly_short={}  ResetPending={}",
+        drain_only_long_seen, drain_only_short_seen, reset_pending_seen);
+    println!("    total liquidations: {}", total_liquidations);
+    println!("    insurance used: {}", total_insurance_used);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Dust GC probe (v12 dust_gc port).
+/// Open many tiny positions to test phantom-dust tracking and cleanup.
+fn probe_dust_gc() {
+    println!("  Dust GC: open many tiny positions, observe phantom dust handling");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let mut users = Vec::new();
+    for _ in 0..30 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(50)).unwrap();
+        users.push(u);
+    }
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let mut opened = 0;
+    let mut rng = Rng::new(7);
+    for &u in &users {
+        let going_long = rng.bool();
+        let notional = usdc(300); // 6x of $50 — tiny positions
+        let size_q = notional * POS_SCALE / oracle as u128;
+        let (long, short) = if going_long { (u, lp) } else { (lp, u) };
+        if engine.trade(long, short, SOL_ASSET, size_q, oracle, 1).is_ok() {
+            opened += 1;
+        }
+    }
+    println!("    opened {} tiny positions", opened);
+
+    // Mild oracle walk + repeated close-reopen by random users
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o = oracle;
+    let mut slot = 2u64;
+    let mut churn_cycles = 0;
+    for step in 0..300 {
+        let dir = rng.bool();
+        let pct = rng.range_u64(0, max_move / 2);
+        let d = (o as u128 * pct as u128 / 10_000) as u64;
+        o = if dir { o + d } else { o.saturating_sub(d).max(1) };
+        let _ = engine.accrue_asset(SOL_ASSET, slot, o, 0);
+
+        // Every 10 slots, a random user closes and reopens
+        if step % 10 == 0 {
+            let u = users[(rng.next_u64() as usize) % users.len()];
+            let leg = engine.accounts[u].legs[0];
+            if leg.active {
+                let qty = leg.basis_pos_q.unsigned_abs();
+                let (long, short) = if leg.side == SideV13::Long { (lp, u) } else { (u, lp) };
+                if engine.trade(long, short, SOL_ASSET, qty, o, 1).is_ok() {
+                    churn_cycles += 1;
+                    // reopen on the opposite side
+                    let notional = usdc(200);
+                    let new_size = notional * POS_SCALE / o as u128;
+                    let going_long = rng.bool();
+                    let (long, short) = if going_long { (u, lp) } else { (lp, u) };
+                    let _ = engine.trade(long, short, SOL_ASSET, new_size, o, 1);
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    churn cycles: {}", churn_cycles);
+    println!("    final OI: long={}  short={}",
+        engine.group.assets[0].oi_eff_long_q,
+        engine.group.assets[0].oi_eff_short_q);
+    println!("    stored_pos_count: long={}  short={}",
+        engine.group.assets[0].stored_pos_count_long,
+        engine.group.assets[0].stored_pos_count_short);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Adversarial-keeper probe (v12 adversarial_keeper port).
+/// Keeper liquidates accounts in the WORST possible order — touches the
+/// most-profitable (most-unrealized-PnL) accounts first to maximize the
+/// system's exposure during the cascade.
+fn probe_adversarial_keeper() {
+    println!("  Adversarial keeper: liquidate richest accounts first under crash");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let mut longs = Vec::new();
+    for _ in 0..20 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        longs.push(u);
+    }
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    for &u in &longs {
+        let size_q = usdc(8_000) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, SOL_ASSET, size_q, oracle, 1);
+    }
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o = oracle;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+
+    for _ in 0..300 {
+        let d = (o as u128 * max_move as u128 / 10_000) as u64;
+        o = o.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(SOL_ASSET, slot, o, 0);
+
+        let prices = engine.effective_prices();
+        // ADVERSARIAL ORDER: refresh all, sort by HIGHEST equity, liquidate top first
+        let mut candidates: Vec<(usize, i128)> = vec![];
+        for &u in &longs {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                let equity = engine.accounts[u].capital as i128 + engine.accounts[u].pnl;
+                candidates.push((u, equity));
+            }
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1)); // descending — most equity first
+
+        for (u, _) in candidates {
+            let leg = engine.accounts[u].legs[0];
+            if leg.active {
+                let mut acc = engine.accounts[u];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV13 {
+                        asset_index: 0,
+                        close_q: leg.basis_pos_q.unsigned_abs(),
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                }
+                engine.accounts[u] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    final oracle: ${}", o / 1_000_000);
+    println!("    total liquidations: {}", total_liquidations);
+    println!("    insurance used: {}", total_insurance_used);
+    let mut total_user_cap = 0u128;
+    for &u in &longs {
+        total_user_cap += engine.accounts[u].capital;
+    }
+    println!("    sum user capital remaining: ${}", total_user_cap / USDC_DECIMALS);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_v12_corner_cases() {
+    println!("=== v13 corner-case probes ported from v12 ===");
+    probe_adl_drain_reset();
+    println!();
+    probe_dust_gc();
+    println!();
+    probe_adversarial_keeper();
+}
+
 /// Hedge probe: user opens long asset 0, short asset 1 at same notional.
 /// Crash asset 0. The short hedge on asset 1 shouldn't mask the long's
 /// deficit; liquidation should fire on asset 0 only.
@@ -2182,6 +2463,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=multileg") {
         run_probes_multileg();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=corner_cases") {
+        run_probes_v12_corner_cases();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {

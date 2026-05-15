@@ -144,6 +144,14 @@ Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
 | Boundary inputs | size_q=1 / exec_price=1 / exec_price=MAX accepted; size_q≥MAX_TRADE_SIZE_Q / exec_price=0 / fee>max_fee rejected with proper errors. |
 | Rebalance path | `rebalance_reduce_position_not_atomic` correctly reduces position (75M→37.5M atomic) without margin check (risk-reducing-only). |
 
+**v12-style corner-case probes (`--test=corner_cases`):**
+
+| Probe | Setup | Result |
+|---|---|---|
+| adl_drain_reset | 50 longs at 18x, $200→$32 crash (84%) | 50 liquidations, **0 insurance**; ADL multiplier never degraded — engine liquidated in time to keep a_long=a_short=ADL_ONE. Mode stayed Normal throughout. |
+| dust_gc | 30 tiny positions ($300 notional each) with churn | 30 churn cycles; stored_pos_count tracks correctly; 0 invariant fails |
+| adversarial_keeper | Keeper liquidates HIGHEST-equity account first during crash | 20 liquidations, **0 insurance used**, sum user cap $6,770 of $20k initial (loss = crash mark-to-market, not engine deficit). 0 invariant fails. |
+
 **v13 multi-leg per account (`--test=multileg`):**
 
 This is a v13-only attack surface — v12 was single-asset, so accounts could
