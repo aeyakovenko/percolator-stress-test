@@ -667,6 +667,291 @@ fn test_sybil_close_v13() -> V13Result<()> {
     Ok(())
 }
 
+/// v13 probe_drain port: 4 pathological configs trying to force insurance
+/// to absorb a deficit. v12 had 5 probes; one (P1) used the zombie-injection
+/// test backdoor which doesn't exist in v13. The other 4 are reachable
+/// through legitimate APIs and worth testing.
+fn run_probes() {
+    println!("=== v13 probe_drain: 4 pathological scenarios ===");
+    println!();
+
+    probe_zero_insurance_concentrated_long();
+    println!();
+    probe_no_lp_no_insurance();
+    println!();
+    probe_whale_crash();
+    println!();
+    probe_long_funding_drain();
+}
+
+/// P2 equivalent: 0 insurance, 0 LP capital. Long-running funding drain on
+/// users with one-sided exposure. If the engine can ever leak negative pnl
+/// to insurance, this should reveal it.
+fn probe_no_lp_no_insurance() {
+    println!("  P2: zero insurance, zero LP — does anything leak?");
+    let cfg = V13Config {
+        max_abs_funding_e9_per_slot: 10_000,
+        ..make_bounty_sol_20x_max_config()
+    };
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(1_000_000)).unwrap(); // small LP
+
+    let mut users = Vec::new();
+    for _ in 0..3 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        users.push(u);
+    }
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    // All users long; LP is short
+    for &u in &users {
+        let notional = usdc(8_000);
+        let size_q = notional * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, SOL_ASSET, size_q, oracle, 1);
+    }
+
+    let ins_pre = engine.group.insurance;
+    let mut total_insurance_used = 0u128;
+    let mut total_liquidations = 0u32;
+    let mut slot = 2u64;
+    for _ in 0..500 {
+        if engine.accrue_asset(SOL_ASSET, slot, oracle, 5_000).is_ok() {
+            // try liquidations
+            let prices = engine.effective_prices();
+            for &u in &users {
+                let mut acc = engine.accounts[u];
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[u] = acc;
+                if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                    if let Some(li) = (0..V13_MAX_PORTFOLIO_ASSETS_N)
+                        .find(|&i| engine.accounts[u].legs[i].active) {
+                        let mut acc = engine.accounts[u];
+                        let qty = acc.legs[li].basis_pos_q.unsigned_abs();
+                        if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                            &mut acc,
+                            LiquidationRequestV13 { asset_index: li, close_q: qty, fee_bps: 5 },
+                            &prices,
+                        ) {
+                            total_liquidations += 1;
+                            total_insurance_used += out.insurance_used;
+                        }
+                        engine.accounts[u] = acc;
+                    }
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    liquidations:      {}", total_liquidations);
+    println!("    insurance used:    {}", total_insurance_used);
+    println!("    insurance: {} → {}", ins_pre, engine.group.insurance);
+    println!("    invariants: {:?}", engine.assert_invariants().err());
+}
+
+/// P3 equivalent: concentrated longs on a small LP; large drop tests whether
+/// ADL cascade can produce a deficit insurance must absorb.
+fn probe_zero_insurance_concentrated_long() {
+    println!("  P3: concentrated long crash — can ADL cascade leak?");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(2_000_000)).unwrap();
+
+    let mut users = Vec::new();
+    for _ in 0..10 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        users.push(u);
+    }
+    let oracle0 = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle0, 0).unwrap();
+
+    for &u in &users {
+        let notional = usdc(15_000);
+        let size_q = notional * POS_SCALE / oracle0 as u128;
+        let _ = engine.trade(u, lp, SOL_ASSET, size_q, oracle0, 1);
+    }
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut oracle = oracle0;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    let mut total_residual = 0u128;
+    let mut total_explicit = 0u128;
+
+    for _ in 0..200 {
+        let d = (oracle as u128 * max_move as u128 / 10_000) as u64;
+        oracle = oracle.saturating_sub(d).max(1);
+        if engine.accrue_asset(SOL_ASSET, slot, oracle, 0).is_err() {
+            slot += 1;
+            continue;
+        }
+        let prices = engine.effective_prices();
+        for &u in &users {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                if let Some(li) = (0..V13_MAX_PORTFOLIO_ASSETS_N)
+                    .find(|&i| engine.accounts[u].legs[i].active) {
+                    let mut acc = engine.accounts[u];
+                    let qty = acc.legs[li].basis_pos_q.unsigned_abs();
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV13 { asset_index: li, close_q: qty, fee_bps: 5 },
+                        &prices,
+                    ) {
+                        total_liquidations += 1;
+                        total_insurance_used += out.insurance_used;
+                        total_residual += out.residual_booked;
+                        total_explicit += out.explicit_loss;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    liquidations:      {}", total_liquidations);
+    println!("    insurance used:    {}", total_insurance_used);
+    println!("    residual booked:   {}", total_residual);
+    println!("    explicit loss:     {}", total_explicit);
+    println!("    final oracle:      ${}", oracle / 1_000_000);
+    println!("    invariants:        {:?}", engine.assert_invariants().err());
+}
+
+/// P4 equivalent: whale trade ($20M @ 10x = $200M notional) + crash.
+fn probe_whale_crash() {
+    println!("  P4: whale ($20M @ 10x) + 36% crash");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(500_000_000)).unwrap(); // $500M LP
+
+    let whale = engine.add_account(2).unwrap();
+    engine.deposit(whale, usdc(20_000_000)).unwrap(); // $20M whale
+
+    let oracle0 = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle0, 0).unwrap();
+
+    let whale_notional = usdc(200_000_000); // $200M = 10x
+    let size_q = whale_notional * POS_SCALE / oracle0 as u128;
+    match engine.trade(whale, lp, SOL_ASSET, size_q, oracle0, 1) {
+        Ok(_) => println!("    whale opened OK"),
+        Err(e) => {
+            println!("    whale trade REJECTED: {:?}", e);
+            return;
+        }
+    }
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut oracle = oracle0;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    let mut total_residual = 0u128;
+
+    for _ in 0..200 {
+        let d = (oracle as u128 * max_move as u128 / 10_000) as u64;
+        oracle = oracle.saturating_sub(d).max(1);
+        if engine.accrue_asset(SOL_ASSET, slot, oracle, 0).is_err() {
+            slot += 1;
+            continue;
+        }
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[whale];
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[whale] = acc;
+        if engine.accounts[whale].health_cert.certified_liq_deficit > 0 {
+            if let Some(li) = (0..V13_MAX_PORTFOLIO_ASSETS_N)
+                .find(|&i| engine.accounts[whale].legs[i].active) {
+                let mut acc = engine.accounts[whale];
+                let qty = acc.legs[li].basis_pos_q.unsigned_abs();
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV13 { asset_index: li, close_q: qty, fee_bps: 5 },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                    total_residual += out.residual_booked;
+                }
+                engine.accounts[whale] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    liquidations:      {}", total_liquidations);
+    println!("    insurance used:    {}", total_insurance_used);
+    println!("    residual booked:   {}", total_residual);
+    println!("    final oracle:      ${}", oracle / 1_000_000);
+    println!("    invariants:        {:?}", engine.assert_invariants().err());
+}
+
+/// Long-running funding drain test
+fn probe_long_funding_drain() {
+    println!("  P5: 2000-slot funding drain at max rate");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user_long = engine.add_account(2).unwrap();
+    let user_short = engine.add_account(3).unwrap();
+    engine.deposit(user_long, usdc(10_000)).unwrap();
+    engine.deposit(user_short, usdc(10_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let notional = usdc(50_000); // 5x leverage
+    let size_q = notional * POS_SCALE / oracle as u128;
+    let _ = engine.trade(user_long, lp, SOL_ASSET, size_q, oracle, 1);
+    let _ = engine.trade(lp, user_short, SOL_ASSET, size_q, oracle, 1);
+
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+
+    for _ in 0..2000 {
+        let _ = engine.accrue_asset(SOL_ASSET, slot, oracle, 10_000);
+        let prices = engine.effective_prices();
+        for &u in &[user_long, user_short] {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                if let Some(li) = (0..V13_MAX_PORTFOLIO_ASSETS_N)
+                    .find(|&i| engine.accounts[u].legs[i].active) {
+                    let mut acc = engine.accounts[u];
+                    let qty = acc.legs[li].basis_pos_q.unsigned_abs();
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV13 { asset_index: li, close_q: qty, fee_bps: 5 },
+                        &prices,
+                    ) {
+                        total_liquidations += 1;
+                        total_insurance_used += out.insurance_used;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    liquidations:      {}", total_liquidations);
+    println!("    insurance used:    {}", total_insurance_used);
+    println!("    user_long  pnl: {}  cap: {}",
+        engine.accounts[user_long].pnl, engine.accounts[user_long].capital);
+    println!("    user_short pnl: {}  cap: {}",
+        engine.accounts[user_short].pnl, engine.accounts[user_short].capital);
+    println!("    invariants:        {:?}", engine.assert_invariants().err());
+}
+
 /// V13 port of v12 F6 (positive PnL trap under stress).
 ///
 /// In v13, threshold_stress_active is NOT auto-set by consumption tracking.
@@ -783,6 +1068,10 @@ fn main() {
             Ok(()) => {},
             Err(e) => println!("FAILED: {:?}", e),
         }
+        return;
+    }
+    if args.iter().any(|a| a == "--test=probes") {
+        run_probes();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {

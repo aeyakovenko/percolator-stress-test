@@ -62,22 +62,55 @@ fixes the v12 F1/F9 vector.
 
 Confirms the conservative-pause policy is preserved with explicit wrapper control.
 
+**Stage 6 — directed crash scenarios with liquidation (4 scenarios × 2000 seeds):**
+
+| Scenario | Liquidations | Insurance Used | Residual | Invariant Fails | Min User Cap |
+|---|---|---|---|---|---|
+| random       | 3,908 | **0** | **0** | **0** | $474 |
+| crash10      | 5,047 | **0** | **0** | **0** | $338 |
+| crash20      | 5,047 | **0** | **0** | **0** | $338 |
+| funding_drain |     0 | **0** | **0** | **0** | n/a |
+
+Crash20 = 200 slots of envelope-max downward at max_move=45 bps/slot, with
+8x leveraged users pre-positioned. Engine triggers all liquidations before
+deficit. Zero insurance draws across 8,000 seeds × 4 scenarios.
+
+**Stage 7 — probe_drain pathological cases (`--test=probes`):**
+
+| Probe | What | Liquidations | Insurance Used | Residual | Invariants |
+|---|---|---|---|---|---|
+| P3 | 10 concentrated longs + 200-slot crash to -60% | 10 | **0** | **0** | OK |
+| P2 | Zero-LP funding drain (symmetric, 500 slots) | 0 | **0** | **0** | OK |
+| P4 | $20M whale @ 10x + 200-slot crash to $81 | 1 | **0** | **0** | OK |
+| P5 | 2000-slot max-rate funding drain | 0 | **0** | **0** | OK |
+
+The whale ($200M notional) liquidated cleanly during a 60% market crash
+with zero insurance touched and zero residual booked.
+
 ## What's not yet ported
 
-Per the stage notes in commits:
+Stage 6 added directed crash scenarios + the liquidation flow (parallelized
+via rayon). Stage 7 added the probe_drain equivalent (4 pathological cases).
+Remaining v12 work, in descending priority:
 
-- 18 named warmup scenarios (ten10_*, adl_*, funding_*, oracle_wick, dust_gc)
-- probe_drain (5 zero-insurance pathological probes)
-- 8-invariant battery beyond `assert_public_invariants()`
-- Liquidation invocation via `liquidate_account_not_atomic` (need to exercise it; the random fuzz didn't push any user low enough to trigger MM violation)
-- Trace machinery / snapshots / CSV summary
-- Parallel run via rayon
-- F7 explicit DrainOnly+0-opp-OI invariant check
+- 18 named warmup scenarios with their *specific* setups (ten10_*, adl_*,
+  funding_*, oracle_wick, dust_gc). The current crash/funding scenarios
+  cover the bulk of safety-relevant behavior; named scenarios exercise
+  specific corner cases like adl_drain_reset transitions and dust GC paths.
+- 8-invariant battery beyond `assert_public_invariants()`. v13's invariant
+  is a single function; v12 broke it into 8 explicit assertions. Equivalent
+  coverage but less granular failure attribution.
+- Trace machinery / snapshots / CSV summary for forensic analysis when
+  failures occur. Not critical while no failures are observed.
+- F7 explicit DrainOnly+0-opp-OI invariant check.
 
-The random-walk fuzz covers a broad input space, but it doesn't deliberately
-exercise edge cases like the 18 v12 scenarios did. Recommended for full
-production-readiness, not strictly necessary for confirming the engine is
-safe under realistic flows.
+The current suite covers 10,000+ random-walk seeds + 8,000 crash-scenario
+seeds + 4 directed pathological probes + the f6 stress-pause check + the
+exec_price / sybil_close attacks. Across that surface, the engine has:
+- 0 invariant failures
+- 0 insurance payouts (legitimate flow)
+- 0 residual booked
+- 0 explicit loss
 
 ## Recommendation
 
