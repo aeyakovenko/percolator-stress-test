@@ -87,18 +87,25 @@ deficit. Zero insurance draws across 8,000 seeds × 4 scenarios.
 The whale ($200M notional) liquidated cleanly during a 60% market crash
 with zero insurance touched and zero residual booked.
 
-**Stage 8/9 — oracle_wick, high_lev (18x), explicit 9-invariant battery
-(2000 seeds × 6 scenarios = 12,000 seeds):**
+**Stage 8/9/10/14 — comprehensive sweep across all 7 scenarios
+(2000 seeds × 7 scenarios = 14,000 seeds):**
 
 | Scenario | Liquidations | Insurance Used | Residual | Explicit Loss | Invariant Fails |
 |---|---|---|---|---|---|
-| random         | 3,908 | **0** | **0** | **0** | **0** |
-| crash10        | 5,047 | **0** | **0** | **0** | **0** |
-| crash20        | 5,047 | **0** | **0** | **0** | **0** |
-| funding_drain  |     0 | **0** | **0** | **0** | **0** |
-| oracle_wick    | 5,047 | **0** | **0** | **0** | **0** |
-| high_lev (18x) | 7,602 | **0** | **0** | **0** | **0** |
-| **TOTAL**      |**26,651** | **0** | **0** | **0** | **0** |
+| random         | 3,908  | **0** | **0** | **0** | **0** |
+| crash10        | 5,047  | **0** | **0** | **0** | **0** |
+| crash20        | 5,047  | **0** | **0** | **0** | **0** |
+| funding_drain  |     0  | **0** | **0** | **0** | **0** |
+| oracle_wick    | 5,047  | **0** | **0** | **0** | **0** |
+| high_lev (18x) | 7,602  | **0** | **0** | **0** | **0** |
+| mega (20×3×mixed) | 12,215 | **0** | **0** | **0** | **0** |
+| **TOTAL**      |**38,866** | **0** | **0** | **0** | **0** |
+
+The **mega** scenario combines: 20 users (vs 5), 3 assets (multi-asset
+portfolios), random 5-18× initial leverage, random asset selection per
+trade, independent random walks per asset at envelope-max, 400 slots.
+This is the most adversarial scenario in the suite. 12,215 liquidations
+triggered across 2000 seeds; zero insurance touched.
 
 Per-slot 9-invariant battery run on every step:
 - V ≥ C + I (solvency)
@@ -111,7 +118,15 @@ Per-slot 9-invariant battery run on every step:
 - sum(reserved) ≤ sum(pos pnl)
 - F7: DrainOnly ⇒ opp OI > 0 OR opp is ResetPending
 
-Zero failures across 12,000 seeds × ~200-400 slots each ≈ 3.6M slot-steps.
+Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
+
+**v13-specific probes (`--test=probes_v13`):**
+
+| Probe | Setup | Result |
+|---|---|---|
+| Multi-asset crash | 2 assets, both long, one crashes 60% | 1 liq, **0** insurance |
+| Stale account exploit | Mark stale, try convert / withdraw | convert blocked (LockActive); withdraw runs with post-call IM check |
+| Withdraw undercollateralize | 15x position, escalating withdraws | small OK; large rejected (LockActive / InvalidConfig) |
 
 ## What's not yet ported
 
@@ -134,16 +149,17 @@ Remaining v12 parity items (low priority — no observed failures to debug):
 
 Final coverage:
 
-- **12,000 fuzz seeds** across 6 scenarios + the 4 directed pathological probes
-- **~3.6M slot-steps** with full 9-invariant battery per step
-- **26,651 liquidations triggered** across the suite — all clean
+- **14,000 fuzz seeds** across 7 scenarios + the 4 directed pathological probes + 3 v13-specific probes
+- **~4.2M slot-steps** with full 9-invariant battery per step
+- **38,866 liquidations triggered** across the suite — all clean
 - **0 invariant failures**
 - **0 insurance payouts** (legitimate flow)
 - **0 residual booked**
 - **0 explicit loss**
 - **0 bankruptcy_hlock activations**
 
-Plus the F6, exec_price_attack, and sybil_close adversarial tests all behave
+Plus the F6 (PnL trap), exec_price_attack, sybil_close, multi-asset, stale
+extraction, and withdraw-undercollateralize adversarial tests all behave
 as expected.
 
 ## Recommendation
