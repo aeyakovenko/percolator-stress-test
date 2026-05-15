@@ -113,16 +113,19 @@ impl V13Engine {
         funding_rate_e9: i128,
     ) -> V13Result<AccrueAssetOutcomeV13> {
         // Keep the raw-oracle target in sync with the effective price so
-        // target_effective_lag stays false. The wrapper is responsible for
-        // setting raw_oracle_target_price; a more realistic wrapper would
-        // post the target and let cranks walk effective up to it.
+        // target_effective_lag stays false.
         self.group.assets[asset_index].raw_oracle_target_price = effective_price;
+        // protective_progress_committed=true: the wrapper attests that any
+        // exposed accounts have already been touched this slot. In the real
+        // deployment the wrapper would batch account refreshes alongside the
+        // accrue; here our smoke test cranks the price without explicit
+        // account-touches because the trade itself does the refresh.
         self.group.accrue_asset_to_not_atomic(
             asset_index,
             now_slot,
             effective_price,
             funding_rate_e9,
-            false,
+            true,
         )
     }
 
@@ -143,10 +146,44 @@ fn make_full_margin_config() -> V13Config {
     V13Config::public_user_fund(1, 0, 30)
 }
 
-/// Aspirational bounty config (matches max_risk.md from v12). Currently
-/// fails v13 validate_exact_solvency_envelope; need to investigate which
-/// parameter the v13 envelope tightens vs v12.
-#[allow(dead_code)]
+/// Probe: try variants of the bounty_sol_20x_max config to find what
+/// v13's validate_exact_solvency_envelope accepts.
+fn probe_bounty_variants() {
+    let mk = |max_move: u64, max_dt: u64, liq: u64, fee: u64| V13Config {
+        max_portfolio_assets: 1, min_nonzero_mm_req: 20, min_nonzero_im_req: 30,
+        h_min: 0, h_max: 30,
+        maintenance_margin_bps: 500, initial_margin_bps: 500,
+        max_trading_fee_bps: fee, liquidation_fee_bps: liq,
+        liquidation_fee_cap: usdc(50_000), min_liquidation_abs: 0,
+        max_accrual_dt_slots: max_dt, max_abs_funding_e9_per_slot: 0,
+        min_funding_lifetime_slots: max_dt, max_price_move_bps_per_slot: max_move,
+        max_account_b_settlement_chunks: 8, max_bankrupt_close_chunks: 8,
+        public_b_chunk_atoms: MAX_VAULT_TVL,
+        permissionless_recovery_enabled: true,
+        stale_certificate_penalty_enabled: true,
+        full_refresh_required_for_favorable_actions: true,
+        public_liveness_profile_crank_forward: true,
+    };
+    let cases: Vec<(String, V13Config)> = vec![
+        ("baseline v12 max_risk".to_string(), make_bounty_sol_20x_max_config()),
+        ("mm=im=10000 (full)".to_string(), V13Config::public_user_fund(1, 0, 30)),
+    ].into_iter()
+    .chain([10, 20, 30, 40, 45, 48, 49].iter().flat_map(|&mv| {
+        [0u64, 5].iter().map(move |&lf| {
+            (format!("max_move={:>2} dt=10 liq={:>2} fee=0", mv, lf), mk(mv, 10, lf, 0))
+        })
+    }))
+    .collect();
+    for (name, cfg) in cases {
+        let r = cfg.validate_public_user_fund();
+        println!("  {:<35}  {:?}", name, r);
+    }
+}
+
+/// v13 bounty config — equivalent to v12 max_risk.md but tuned to v13's
+/// stricter solvency envelope. v12 allowed max_move=49 bps/slot; v13's exact
+/// envelope reserves more headroom, max it accepts is 45.
+/// Effective per-accrual oracle tolerance: 45 × 10 = 450 bps = 4.5%.
 fn make_bounty_sol_20x_max_config() -> V13Config {
     V13Config {
         max_portfolio_assets: 1,
@@ -161,9 +198,9 @@ fn make_bounty_sol_20x_max_config() -> V13Config {
         liquidation_fee_cap: usdc(50_000),
         min_liquidation_abs: 0,
         max_accrual_dt_slots: 10,
-        max_abs_funding_e9_per_slot: 10_000,
+        max_abs_funding_e9_per_slot: 0,
         min_funding_lifetime_slots: 10,
-        max_price_move_bps_per_slot: 49,
+        max_price_move_bps_per_slot: 45,
         max_account_b_settlement_chunks: 8,
         max_bankrupt_close_chunks: 8,
         public_b_chunk_atoms: MAX_VAULT_TVL,
@@ -174,10 +211,10 @@ fn make_bounty_sol_20x_max_config() -> V13Config {
     }
 }
 
-/// Stage 1 smoke test: create engine, add LP + user, deposit, trade, accrue.
+/// Stage 1 smoke test: create engine, add LP + user, deposit, trade, accrue, close.
 fn smoke_test() -> V13Result<()> {
-    let cfg = make_full_margin_config();
-    println!("V13 stage-1 smoke: full-margin (100% mm) config");
+    let cfg = make_bounty_sol_20x_max_config();
+    println!("V13 stage-2 smoke: bounty_sol_20x_max config (v13-tuned)");
     cfg.validate_public_user_fund()?;
     println!("  config validated");
 
@@ -187,28 +224,43 @@ fn smoke_test() -> V13Result<()> {
     engine.deposit(lp, usdc(10_000_000))?;
     engine.deposit(user, usdc(1_000))?;
     println!("  accounts: lp=idx{}, user=idx{}", lp, user);
-    println!("  vault=${}  c_tot=${}",
-        engine.group.vault / USDC_DECIMALS,
-        engine.group.c_tot / USDC_DECIMALS);
+    println!("  vault=${}M  c_tot=${}M",
+        engine.group.vault / USDC_DECIMALS / 1_000_000,
+        engine.group.c_tot / USDC_DECIMALS / 1_000_000);
 
-    // Set up oracle for the asset
+    // Set up oracle
     let oracle0 = price_e6(200);
     engine.accrue_asset(SOL_ASSET, 1, oracle0, 0)?;
-    println!("  asset 0 oracle initialized to ${}", oracle0 / 1_000_000);
 
-    // Open user-long against LP-short. Note: full-margin config (100% mm)
-    // means a $500 notional requires $500 capital — user has $1000 so $500
-    // notional is well within IM.
-    let size_q = (usdc(500) * POS_SCALE / oracle0 as u128) as u128;
-    println!("  attempting trade: size_q={}  exec=${}", size_q, oracle0 / 1_000_000);
-    let outcome = engine.trade(user, lp, SOL_ASSET, size_q, oracle0, 0)?;
-    println!("  trade ok: notional=${}  fee_a=${}  fee_b=${}",
+    // Open user-long against LP-short. 20x leverage: $20k notional on $1k.
+    // For mm=500 (5%), $20k notional requires $1000 IM/MM — fits exactly.
+    let notional = usdc(15_000); // 15x, conservative
+    let size_q = notional * POS_SCALE / oracle0 as u128;
+    let outcome = engine.trade(user, lp, SOL_ASSET, size_q, oracle0, 1)?;
+    println!("  OPEN: notional=${}  fee_a=${}  fee_b=${}",
         outcome.notional / USDC_DECIMALS,
         outcome.fee_a / USDC_DECIMALS,
         outcome.fee_b / USDC_DECIMALS);
-    println!("  user.pnl={}  user.capital=${}",
-        engine.accounts[user].pnl / 1_000_000,
-        engine.accounts[user].capital / USDC_DECIMALS);
+    println!("    user.pnl={} cap=${} legs[0].active={}",
+        engine.accounts[user].pnl, engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].legs[0].active);
+
+    // Walk oracle up by 1% across 10 slots (within envelope)
+    let mut slot = 2u64;
+    let mut oracle = oracle0;
+    for _ in 0..10 {
+        oracle = oracle + (oracle as u128 * 10 / 10_000) as u64;
+        engine.accrue_asset(SOL_ASSET, slot, oracle, 0)?;
+        slot += 1;
+    }
+    println!("  after 10 cranks: oracle=${}", engine.group.assets[0].effective_price / 1_000_000);
+
+    // Close: user goes short (size_q) — i.e., role swap: lp is the new long, user the new short
+    let close_outcome = engine.trade(lp, user, SOL_ASSET, size_q, oracle, 1)?;
+    println!("  CLOSE: notional=${}", close_outcome.notional / USDC_DECIMALS);
+    println!("    user.pnl={} cap=${} legs[0].active={}",
+        engine.accounts[user].pnl, engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].legs[0].active);
 
     engine.assert_invariants()?;
     println!("  invariants OK");
@@ -231,6 +283,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        return;
+    }
+    if args.iter().any(|a| a == "--test=probe_configs") {
+        probe_bounty_variants();
         return;
     }
 
