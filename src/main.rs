@@ -11,6 +11,7 @@
 //!   stage 5: trace machinery + summary aggregation
 
 use percolator::*;
+use rayon::prelude::*;
 use std::env;
 
 const USDC_DECIMALS: u128 = 1_000_000;
@@ -298,8 +299,39 @@ struct RunSummary {
     liquidations: u32,
     invariant_failures: u32,
     insurance_payouts: u128,
+    residual_booked: u128,
+    explicit_loss: u128,
     min_user_capital: u128,
     max_user_pnl_abs: u128,
+    bankruptcy_lock_tripped: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Scenario {
+    Random,
+    Crash10,
+    Crash20,
+    FundingDrain,
+}
+
+impl Scenario {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "random" => Some(Self::Random),
+            "crash10" => Some(Self::Crash10),
+            "crash20" => Some(Self::Crash20),
+            "funding_drain" => Some(Self::FundingDrain),
+            _ => None,
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Crash10 => "crash10",
+            Self::Crash20 => "crash20",
+            Self::FundingDrain => "funding_drain",
+        }
+    }
 }
 
 /// Wrapper-side oracle clamp matching v12 semantics: limit per-call move to
@@ -312,8 +344,47 @@ fn clamp_oracle(real: u64, last: u64, max_move_bps: u64, dt: u64) -> u64 {
     real.clamp(lo, hi)
 }
 
-/// Single fuzz run: open random positions, walk oracle, check invariants.
-fn run_one_bounty(seed: u64) -> RunSummary {
+/// Compute the next oracle for the slot under the chosen scenario.
+fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_move: u64) -> u64 {
+    match scen {
+        Scenario::Random => {
+            let crash = rng.bool() && rng.bool() && rng.bool() && rng.bool();
+            let pct = if crash {
+                rng.range_u64(1, max_move)
+            } else {
+                rng.range_u64(0, max_move / 2)
+            };
+            let up = rng.bool();
+            let d = (oracle as u128 * pct as u128 / 10_000) as u64;
+            if up { oracle.saturating_add(d) } else { oracle.saturating_sub(d).max(1) }
+        }
+        Scenario::Crash10 | Scenario::Crash20 => {
+            // Monotone downward walk, envelope-max each slot for 100 slots,
+            // then drift back up. With max_move=45 bps/slot for 100 slots,
+            // worst-case cumulative ≈ 36% (compounded). 10/20 distinguished
+            // by direction at the end (10 stays down, 20 keeps crashing).
+            let crash_len: u64 = if matches!(scen, Scenario::Crash20) { 200 } else { 100 };
+            if step < crash_len {
+                let d = (oracle as u128 * max_move as u128 / 10_000) as u64;
+                oracle.saturating_sub(d).max(1)
+            } else {
+                // recovery: drift up gently
+                let d = (oracle as u128 * (max_move as u128 / 3) / 10_000) as u64;
+                oracle.saturating_add(d)
+            }
+        }
+        Scenario::FundingDrain => {
+            // No price moves; the fuzz applies a non-zero funding rate every
+            // step elsewhere. Oracle stays flat.
+            oracle
+        }
+    }
+}
+
+/// Single run for the given scenario. Includes liquidation by a synthetic
+/// keeper that checks each user's certified_liq_deficit and liquidates the
+/// largest leg if positive.
+fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
     let cfg = make_bounty_sol_20x_max_config();
     let mut engine = V13Engine::new(cfg).expect("init");
     let mut rng = Rng::new(seed);
@@ -321,7 +392,6 @@ fn run_one_bounty(seed: u64) -> RunSummary {
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
-    // 5 users with $1k each
     const N_USERS: usize = 5;
     let mut users = Vec::with_capacity(N_USERS);
     for _ in 0..N_USERS {
@@ -338,54 +408,115 @@ fn run_one_bounty(seed: u64) -> RunSummary {
         final_vault: 0, final_insurance: 0, final_c_tot: 0,
         total_trades: 0, rejected_trades: 0, liquidations: 0,
         invariant_failures: 0, insurance_payouts: 0,
+        residual_booked: 0, explicit_loss: 0,
         min_user_capital: u128::MAX, max_user_pnl_abs: 0,
+        bankruptcy_lock_tripped: false,
     };
 
     let mut slot = 2u64;
     let mut oracle = oracle0;
     let max_move = cfg.max_price_move_bps_per_slot;
-    let total_slots = 200;
+    let total_slots: u64 = match scen {
+        Scenario::Random => 200,
+        Scenario::Crash10 => 200,
+        Scenario::Crash20 => 400,
+        Scenario::FundingDrain => 300,
+    };
+
+    // Open initial positions on each user (random direction, ~10x leverage)
+    for &u in &users {
+        let going_long = rng.bool();
+        let notional = usdc(8_000); // 8x of $1k → safe IM at 20x limit
+        let size_q = notional * POS_SCALE / oracle as u128;
+        let (long, short) = if going_long { (u, lp) } else { (lp, u) };
+        if engine.trade(long, short, SOL_ASSET, size_q, oracle, 1).is_ok() {
+            summary.total_trades += 1;
+        }
+    }
+
+    let funding_rate = if matches!(scen, Scenario::FundingDrain) { 5_000i128 } else { 0 };
 
     for step in 0..total_slots {
-        // Random oracle walk within envelope (10% chance of "crash slot" with bigger move)
-        let crash = rng.bool() && rng.bool() && rng.bool() && rng.bool(); // ~6%
-        let move_pct = if crash { rng.range_u64(1, max_move) } else { rng.range_u64(0, max_move / 2) };
-        let direction_up = rng.bool();
-        let move_abs = (oracle as u128 * move_pct as u128 / 10_000) as u64;
-        let target = if direction_up { oracle.saturating_add(move_abs) } else { oracle.saturating_sub(move_abs).max(1) };
+        let target = scenario_oracle(scen, &mut rng, oracle, step, max_move);
         oracle = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
 
-        if engine.accrue_asset(SOL_ASSET, slot, oracle, 0).is_err() {
-            // skip this slot if accrue rejected (e.g., NonProgress)
+        if engine.accrue_asset(SOL_ASSET, slot, oracle, funding_rate).is_err() {
             slot += 1;
             continue;
         }
 
-        // Occasional trade: pick a random user, open or close
-        if step % 5 == 0 {
-            let user_idx = users[(rng.next_u64() as usize) % users.len()];
-            let user = engine.accounts[user_idx];
-            let cap = user.capital;
+        // Keeper: liquidate anyone with certified_liq_deficit > 0.
+        // To learn each account's deficit we have to refresh it first.
+        let prices = engine.effective_prices();
+        for &u in &users {
+            let mut acc = engine.accounts[u];
+            if engine.group.full_account_refresh(&mut acc, &prices).is_err() {
+                engine.accounts[u] = acc;
+                continue;
+            }
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                // Find the largest active leg and close it fully
+                let mut largest_leg_idx = None;
+                let mut largest_abs = 0u128;
+                for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+                    let leg = engine.accounts[u].legs[li];
+                    if leg.active {
+                        let a = leg.basis_pos_q.unsigned_abs();
+                        if a > largest_abs {
+                            largest_abs = a;
+                            largest_leg_idx = Some(li);
+                        }
+                    }
+                }
+                if let Some(li) = largest_leg_idx {
+                    let ins_pre = engine.group.insurance;
+                    let mut acc = engine.accounts[u];
+                    let r = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV13 {
+                            asset_index: li,
+                            close_q: largest_abs,
+                            fee_bps: 5,
+                        },
+                        &prices,
+                    );
+                    engine.accounts[u] = acc;
+                    if let Ok(out) = r {
+                        summary.liquidations += 1;
+                        summary.insurance_payouts += out.insurance_used;
+                        summary.residual_booked += out.residual_booked;
+                        summary.explicit_loss += out.explicit_loss;
+                        let _ = ins_pre;
+                    }
+                }
+            }
+        }
+
+        // Random new trades (only for Random/FundingDrain — crash scenarios
+        // observe pre-positioned users getting liquidated)
+        if matches!(scen, Scenario::Random | Scenario::FundingDrain) && step % 5 == 0 {
+            let uidx = users[(rng.next_u64() as usize) % users.len()];
+            let cap = engine.accounts[uidx].capital;
             if cap > usdc(50) {
                 let going_long = rng.bool();
                 let leverage = rng.range_u64(2, 15) as u128;
                 let notional = (cap * leverage).min(usdc(20_000));
-                let exec = oracle;
-                let size_q = notional * POS_SCALE / exec as u128;
-                let (long, short) = if going_long { (user_idx, lp) } else { (lp, user_idx) };
-                match engine.trade(long, short, SOL_ASSET, size_q, exec, 1) {
+                let size_q = notional * POS_SCALE / oracle as u128;
+                let (long, short) = if going_long { (uidx, lp) } else { (lp, uidx) };
+                match engine.trade(long, short, SOL_ASSET, size_q, oracle, 1) {
                     Ok(_) => summary.total_trades += 1,
                     Err(_) => summary.rejected_trades += 1,
                 }
             }
         }
 
-        // Check invariants
         if engine.assert_invariants().is_err() {
             summary.invariant_failures += 1;
         }
-
-        // Track minima
+        if engine.group.bankruptcy_hlock_active {
+            summary.bankruptcy_lock_tripped = true;
+        }
         for &u in &users {
             let acc = &engine.accounts[u];
             summary.min_user_capital = summary.min_user_capital.min(acc.capital);
@@ -401,43 +532,52 @@ fn run_one_bounty(seed: u64) -> RunSummary {
     summary
 }
 
-fn run_fuzz(n_seeds: usize) {
-    println!("v13 bounty_sol_20x_max fuzz: {} seeds", n_seeds);
-    let mut total_invariant_failures = 0u32;
-    let mut total_trades = 0u32;
-    let mut total_rejected = 0u32;
-    let mut total_liquidations = 0u32;
-    let mut total_insurance_payouts = 0u128;
-    let mut min_vault = u128::MAX;
-    let mut max_vault = 0u128;
-    let mut min_insurance = u128::MAX;
-    let mut min_user_capital = u128::MAX;
-    let mut max_pnl = 0u128;
+fn run_one_bounty(seed: u64) -> RunSummary {
+    run_one_scenario(Scenario::Random, seed)
+}
 
-    for seed in 0..n_seeds as u64 {
-        let s = run_one_bounty(seed);
-        total_invariant_failures += s.invariant_failures;
-        total_trades += s.total_trades;
-        total_rejected += s.rejected_trades;
-        total_liquidations += s.liquidations;
-        total_insurance_payouts += s.insurance_payouts;
-        min_vault = min_vault.min(s.final_vault);
-        max_vault = max_vault.max(s.final_vault);
-        min_insurance = min_insurance.min(s.final_insurance);
-        min_user_capital = min_user_capital.min(s.min_user_capital);
-        max_pnl = max_pnl.max(s.max_user_pnl_abs);
-    }
+fn aggregate(scen: Scenario, results: Vec<RunSummary>) {
+    let n = results.len();
+    let total_invariant_failures: u32 = results.iter().map(|r| r.invariant_failures).sum();
+    let total_trades: u32 = results.iter().map(|r| r.total_trades).sum();
+    let total_rejected: u32 = results.iter().map(|r| r.rejected_trades).sum();
+    let total_liquidations: u32 = results.iter().map(|r| r.liquidations).sum();
+    let total_insurance_payouts: u128 = results.iter().map(|r| r.insurance_payouts).sum();
+    let total_residual: u128 = results.iter().map(|r| r.residual_booked).sum();
+    let total_explicit: u128 = results.iter().map(|r| r.explicit_loss).sum();
+    let bankruptcy_runs = results.iter().filter(|r| r.bankruptcy_lock_tripped).count();
+    let min_vault = results.iter().map(|r| r.final_vault).min().unwrap_or(0);
+    let max_vault = results.iter().map(|r| r.final_vault).max().unwrap_or(0);
+    let min_insurance = results.iter().map(|r| r.final_insurance).min().unwrap_or(0);
+    let max_pnl = results.iter().map(|r| r.max_user_pnl_abs).max().unwrap_or(0);
+    let min_user_capital = results
+        .iter()
+        .map(|r| r.min_user_capital)
+        .min()
+        .unwrap_or(u128::MAX);
 
-    println!("  total trades:           {}", total_trades);
-    println!("  rejected trades:        {}", total_rejected);
-    println!("  liquidations:           {}", total_liquidations);
-    println!("  invariant failures:     {}  (must be 0)", total_invariant_failures);
-    println!("  insurance_payouts (sum): {}  (atomic; must be 0 for legitimate flow)", total_insurance_payouts);
-    println!("  vault range:            ${}M – ${}M",
-        min_vault / USDC_DECIMALS / 1_000_000, max_vault / USDC_DECIMALS / 1_000_000);
-    println!("  insurance final min:    ${}", min_insurance / USDC_DECIMALS);
-    println!("  user min capital:       ${}", min_user_capital / USDC_DECIMALS);
-    println!("  max |user pnl|:         ${}", max_pnl / 1_000_000);
+    println!("=== {} ({} seeds) ===", scen.name(), n);
+    println!("  trades total:          {}  (rejected: {})", total_trades, total_rejected);
+    println!("  liquidations:          {}", total_liquidations);
+    println!("  bankruptcy lock runs:  {}/{}", bankruptcy_runs, n);
+    println!("  invariant failures:    {}  (must be 0)", total_invariant_failures);
+    println!("  insurance used (atomic): {}", total_insurance_payouts);
+    println!("  residual booked (atomic): {}", total_residual);
+    println!("  explicit loss (atomic):   {}", total_explicit);
+    println!("  vault final:           min ${}M  max ${}M",
+        min_vault / USDC_DECIMALS / 1_000_000,
+        max_vault / USDC_DECIMALS / 1_000_000);
+    println!("  insurance final:       min ${}", min_insurance / USDC_DECIMALS);
+    println!("  user min capital:      ${}", min_user_capital / USDC_DECIMALS);
+    println!("  max |user pnl|:        ${}", max_pnl / 1_000_000);
+}
+
+fn run_fuzz(scen: Scenario, n_seeds: usize) {
+    let results: Vec<RunSummary> = (0..n_seeds as u64)
+        .into_par_iter()
+        .map(|seed| run_one_scenario(scen, seed))
+        .collect();
+    aggregate(scen, results);
 }
 
 /// V13 port of v12 exec_price_attack test. Engine v13 also doesn't bound
@@ -652,10 +792,22 @@ fn main() {
         }
         return;
     }
+    let scen = args
+        .iter()
+        .find(|a| a.starts_with("--scenario="))
+        .and_then(|a| Scenario::from_str(a.strip_prefix("--scenario=").unwrap()))
+        .unwrap_or(Scenario::Random);
     if let Some(arg) = args.iter().find(|a| a.starts_with("--fuzz=")) {
         let n: usize = arg.strip_prefix("--fuzz=").unwrap().parse().unwrap_or(100);
-        run_fuzz(n);
+        run_fuzz(scen, n);
         return;
     }
-    println!("v13 port in progress. Try: --test=smoke, --fuzz=200");
+    if args.iter().any(|a| a == "--fuzz-all") {
+        for scen in [Scenario::Random, Scenario::Crash10, Scenario::Crash20, Scenario::FundingDrain] {
+            run_fuzz(scen, 200);
+            println!();
+        }
+        return;
+    }
+    println!("v13 port in progress. Try: --test=smoke, --fuzz=200, --fuzz=2000 --scenario=crash20, --fuzz-all");
 }
