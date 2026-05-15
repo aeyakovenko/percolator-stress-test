@@ -1290,6 +1290,424 @@ fn run_probes_boundary() {
     probe_rebalance();
 }
 
+/// Hedge probe: user opens long asset 0, short asset 1 at same notional.
+/// Crash asset 0. The short hedge on asset 1 shouldn't mask the long's
+/// deficit; liquidation should fire on asset 0 only.
+fn probe_hedge_no_mask() {
+    println!("  Hedge probe: long A + short B, crash A — does hedge mask deficit?");
+    let cfg = make_bounty_config(2);
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(2_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // User: long $8k asset 0, short $8k asset 1 (hedged)
+    let notional = usdc(8_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
+    engine.trade(lp, user, 1, size_q, oracle, 1).unwrap();
+    println!("    opened hedged: long $8k on asset 0, short $8k on asset 1");
+    println!("    legs[0].active={} side={:?}",
+        engine.accounts[user].legs[0].active,
+        engine.accounts[user].legs[0].side);
+    println!("    legs[1].active={} side={:?}",
+        engine.accounts[user].legs[1].active,
+        engine.accounts[user].legs[1].side);
+
+    // Crash asset 0 only — asset 1 stays flat
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let o1 = oracle;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut leg_0_liqs = 0u32;
+    let mut leg_1_liqs = 0u32;
+    let mut total_insurance_used = 0u128;
+
+    for _ in 0..200 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+            // Pick largest leg
+            let mut best = (0usize, 0u128);
+            for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+                let leg = engine.accounts[user].legs[li];
+                if leg.active {
+                    let a = leg.basis_pos_q.unsigned_abs();
+                    if a > best.1 { best = (li, a); }
+                }
+            }
+            if best.1 > 0 {
+                let mut acc = engine.accounts[user];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV13 {
+                        asset_index: best.0,
+                        close_q: best.1,
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                    if best.0 == 0 { leg_0_liqs += 1; } else { leg_1_liqs += 1; }
+                }
+                engine.accounts[user] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    final oracle: A=${}  B=${}", o0 / 1_000_000, o1 / 1_000_000);
+    println!("    total liquidations: {}", total_liquidations);
+    println!("    asset 0 (crashed) liquidations: {}", leg_0_liqs);
+    println!("    asset 1 (flat) liquidations:    {}", leg_1_liqs);
+    println!("    insurance used: {}", total_insurance_used);
+    println!("    user cap=${} pnl={}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// 16-leg saturation probe: open positions on every available asset.
+fn probe_max_legs() {
+    let n_assets = 8u8.min(V13_MAX_PORTFOLIO_ASSETS_N as u8); // 8 assets — stay below V13_MAX
+    println!("  Max-legs probe: open {} positions simultaneously on one account", n_assets);
+    let cfg = make_bounty_config(n_assets);
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(5_000)).unwrap();
+    let oracle = price_e6(200);
+    for ai in 0..n_assets as usize {
+        engine.accrue_asset(ai, 1, oracle, 0).unwrap();
+    }
+    // Open $1k notional on each — total 8*$1k=$8k = 1.6x leverage (very safe)
+    let per_leg = usdc(1_000);
+    let size_q = per_leg * POS_SCALE / oracle as u128;
+    let mut opened = 0;
+    for ai in 0..n_assets as usize {
+        // alternate long/short across legs
+        let (long, short) = if ai % 2 == 0 { (user, lp) } else { (lp, user) };
+        match engine.trade(long, short, ai, size_q, oracle, 1) {
+            Ok(_) => opened += 1,
+            Err(e) => {
+                println!("    asset {}: trade failed ({:?})", ai, e);
+                break;
+            }
+        }
+    }
+    println!("    opened {} legs", opened);
+    println!("    active_bitmap: 0b{:b}", engine.accounts[user].active_bitmap);
+    println!("    legs.count_ones(): {}", engine.accounts[user].active_bitmap.count_ones());
+
+    // Crash all assets in parallel
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut oracles = vec![oracle; n_assets as usize];
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    for _ in 0..200 {
+        for ai in 0..n_assets as usize {
+            let d = (oracles[ai] as u128 * max_move as u128 / 10_000) as u64;
+            oracles[ai] = oracles[ai].saturating_sub(d).max(1);
+            let _ = engine.accrue_asset(ai, slot, oracles[ai], 0);
+        }
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+            let mut best = (0usize, 0u128);
+            for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+                let leg = engine.accounts[user].legs[li];
+                if leg.active {
+                    let a = leg.basis_pos_q.unsigned_abs();
+                    if a > best.1 { best = (li, a); }
+                }
+            }
+            if best.1 > 0 {
+                let mut acc = engine.accounts[user];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV13 {
+                        asset_index: best.0,
+                        close_q: best.1,
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                }
+                engine.accounts[user] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    total liquidations: {}", total_liquidations);
+    println!("    insurance used: {}", total_insurance_used);
+    println!("    final legs active: {}", engine.accounts[user].active_bitmap.count_ones());
+    println!("    final cap=${} pnl={}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Multi-leg fuzz: many users with multiple legs each, random walks per asset,
+/// 2000 seeds. The Mega scenario only puts one leg per user.
+fn probe_multileg_fuzz(n_seeds: usize) {
+    println!("  Multi-leg fuzz: {} seeds, 5 users × 4 legs each", n_seeds);
+    let results: Vec<RunSummary> = (0..n_seeds as u64)
+        .into_par_iter()
+        .map(|seed| run_one_multileg(seed))
+        .collect();
+    let n = results.len();
+    let total_invariant_failures: u32 = results.iter().map(|r| r.invariant_failures).sum();
+    let total_trades: u32 = results.iter().map(|r| r.total_trades).sum();
+    let total_rejected: u32 = results.iter().map(|r| r.rejected_trades).sum();
+    let total_liquidations: u32 = results.iter().map(|r| r.liquidations).sum();
+    let total_insurance: u128 = results.iter().map(|r| r.insurance_payouts).sum();
+    let total_residual: u128 = results.iter().map(|r| r.residual_booked).sum();
+    let bankruptcy_runs = results.iter().filter(|r| r.bankruptcy_lock_tripped).count();
+    println!("    runs: {} | trades: {} (rej: {})", n, total_trades, total_rejected);
+    println!("    liquidations: {}", total_liquidations);
+    println!("    bankruptcy lock runs: {}/{}", bankruptcy_runs, n);
+    println!("    invariant failures: {}", total_invariant_failures);
+    println!("    insurance used: {}", total_insurance);
+    println!("    residual booked: {}", total_residual);
+}
+
+fn run_one_multileg(seed: u64) -> RunSummary {
+    let n_assets = 4u8;
+    let cfg = make_bounty_config(n_assets);
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let mut rng = Rng::new(seed);
+
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+
+    const N_USERS: usize = 5;
+    let mut users = Vec::with_capacity(N_USERS);
+    for _ in 0..N_USERS {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(2_000)).unwrap();
+        users.push(u);
+    }
+
+    let oracle = price_e6(200);
+    let mut oracles = vec![oracle; n_assets as usize];
+    for ai in 0..n_assets as usize {
+        engine.accrue_asset(ai, 1, oracles[ai], 0).unwrap();
+    }
+
+    let mut summary = RunSummary {
+        seed,
+        final_vault: 0, final_insurance: 0, final_c_tot: 0,
+        total_trades: 0, rejected_trades: 0, liquidations: 0,
+        invariant_failures: 0, insurance_payouts: 0,
+        residual_booked: 0, explicit_loss: 0,
+        min_user_capital: u128::MAX, max_user_pnl_abs: 0,
+        bankruptcy_lock_tripped: false,
+    };
+
+    // Each user opens positions on EACH asset (4 legs each)
+    for &u in &users {
+        for ai in 0..n_assets as usize {
+            let going_long = rng.bool();
+            let notional = usdc(2_000); // $2k each = $8k total per user = 4x leverage
+            let size_q = notional * POS_SCALE / oracles[ai] as u128;
+            let (long, short) = if going_long { (u, lp) } else { (lp, u) };
+            if engine.trade(long, short, ai, size_q, oracles[ai], 1).is_ok() {
+                summary.total_trades += 1;
+            }
+        }
+    }
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 2u64;
+    for _ in 0..200 {
+        // Each asset gets an independent random walk
+        for ai in 0..n_assets as usize {
+            let up = rng.bool();
+            let pct = rng.range_u64(0, max_move);
+            let d = (oracles[ai] as u128 * pct as u128 / 10_000) as u64;
+            oracles[ai] = if up { oracles[ai].saturating_add(d) } else { oracles[ai].saturating_sub(d).max(1) };
+            let _ = engine.accrue_asset(ai, slot, oracles[ai], 0);
+        }
+
+        let prices = engine.effective_prices();
+        for &u in &users {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                let mut best = (0usize, 0u128);
+                for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+                    let leg = engine.accounts[u].legs[li];
+                    if leg.active {
+                        let a = leg.basis_pos_q.unsigned_abs();
+                        if a > best.1 { best = (li, a); }
+                    }
+                }
+                if best.1 > 0 {
+                    let mut acc = engine.accounts[u];
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV13 {
+                            asset_index: best.0,
+                            close_q: best.1,
+                            fee_bps: 5,
+                        },
+                        &prices,
+                    ) {
+                        summary.liquidations += 1;
+                        summary.insurance_payouts += out.insurance_used;
+                        summary.residual_booked += out.residual_booked;
+                        summary.explicit_loss += out.explicit_loss;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        if engine.assert_invariants().is_err() {
+            summary.invariant_failures += 1;
+        }
+        summary.invariant_failures += run_invariant_battery(&engine);
+        if engine.group.bankruptcy_hlock_active {
+            summary.bankruptcy_lock_tripped = true;
+        }
+        for &u in &users {
+            let acc = &engine.accounts[u];
+            summary.min_user_capital = summary.min_user_capital.min(acc.capital);
+            summary.max_user_pnl_abs = summary.max_user_pnl_abs.max(acc.pnl.unsigned_abs());
+        }
+        slot += 1;
+    }
+    summary.final_vault = engine.group.vault;
+    summary.final_insurance = engine.group.insurance;
+    summary.final_c_tot = engine.group.c_tot;
+    summary
+}
+
+fn run_probes_multileg() {
+    println!("=== v13 multi-leg per account ===");
+    probe_hedge_no_mask();
+    println!();
+    probe_max_legs();
+    println!();
+    probe_multileg_fuzz(2000);
+    println!();
+    probe_multileg_high_lev_crash();
+}
+
+/// Stress test: user holds 4 LONGS across 4 assets at high leverage.
+/// Total notional ~$30k on $2k capital (15x effective). Then ALL 4 assets
+/// crash. Cascading liquidations expected. Insurance must not be touched.
+fn probe_multileg_high_lev_crash() {
+    println!("  High-lev multi-leg: 4 longs across 4 assets, total 15x, all crash");
+    let cfg = make_bounty_config(4);
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(2_000)).unwrap();
+
+    let oracle = price_e6(200);
+    let mut oracles = vec![oracle; 4];
+    for ai in 0..4 {
+        engine.accrue_asset(ai, 1, oracles[ai], 0).unwrap();
+    }
+
+    // 4 longs of $7.5k each = $30k total notional = 15x on $2k cap
+    let per_leg = usdc(7_500);
+    let size_q = per_leg * POS_SCALE / oracle as u128;
+    let mut opened = 0;
+    for ai in 0..4 {
+        if engine.trade(user, lp, ai, size_q, oracle, 1).is_ok() {
+            opened += 1;
+        }
+    }
+    println!("    opened {} long legs at $7.5k each (15x total leverage)", opened);
+
+    // Crash ALL 4 assets in parallel
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    let mut total_residual = 0u128;
+    let mut total_explicit = 0u128;
+
+    for _ in 0..200 {
+        for ai in 0..4 {
+            let d = (oracles[ai] as u128 * max_move as u128 / 10_000) as u64;
+            oracles[ai] = oracles[ai].saturating_sub(d).max(1);
+            let _ = engine.accrue_asset(ai, slot, oracles[ai], 0);
+        }
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+            // close the LARGEST leg, then repeat next slot for smaller legs
+            let mut best = (0usize, 0u128);
+            for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+                let leg = engine.accounts[user].legs[li];
+                if leg.active {
+                    let a = leg.basis_pos_q.unsigned_abs();
+                    if a > best.1 { best = (li, a); }
+                }
+            }
+            if best.1 > 0 {
+                let mut acc = engine.accounts[user];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV13 {
+                        asset_index: best.0,
+                        close_q: best.1,
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                    total_residual += out.residual_booked;
+                    total_explicit += out.explicit_loss;
+                }
+                engine.accounts[user] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    final oracles: A=${} B=${} C=${} D=${}",
+        oracles[0]/1_000_000, oracles[1]/1_000_000, oracles[2]/1_000_000, oracles[3]/1_000_000);
+    println!("    total liquidations: {}", total_liquidations);
+    println!("    insurance used: {}", total_insurance_used);
+    println!("    residual booked: {}", total_residual);
+    println!("    explicit loss: {}", total_explicit);
+    println!("    user final: cap=${} pnl={} legs_active={}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl,
+        engine.accounts[user].active_bitmap.count_ones());
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
 /// Sweep leverage levels: find what v13's envelope accepts at each mm.
 /// For mm=mm_bps (=1/leverage*10000), find max max_price_move_bps_per_slot
 /// that passes validate_exact_solvency_envelope.
@@ -1760,6 +2178,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=config_sweep") {
         probe_config_sweep();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=multileg") {
+        run_probes_multileg();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {

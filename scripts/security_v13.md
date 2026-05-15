@@ -144,6 +144,22 @@ Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
 | Boundary inputs | size_q=1 / exec_price=1 / exec_price=MAX accepted; size_q≥MAX_TRADE_SIZE_Q / exec_price=0 / fee>max_fee rejected with proper errors. |
 | Rebalance path | `rebalance_reduce_position_not_atomic` correctly reduces position (75M→37.5M atomic) without margin check (risk-reducing-only). |
 
+**v13 multi-leg per account (`--test=multileg`):**
+
+This is a v13-only attack surface — v12 was single-asset, so accounts could
+only ever hold one leg.
+
+| Probe | Setup | Result |
+|---|---|---|
+| Hedge mask test | Long $8k asset A + short $8k asset B (perfect hedge), crash A by 60% | 1 liquidation on A only; hedge does NOT mask deficit; 0 insurance used; user retains $704 of $2k |
+| 8-leg saturation | Open 8 alternating long/short legs, crash all 8 in parallel | All 8 legs stay active (alternating long-short self-hedges); 0 liquidations; user keeps $4999 of $5000 with -$594 unrealized PnL |
+| Multi-leg fuzz (2000 seeds) | 5 users × 4 legs each on 4 assets, random walks, 200 slots/seed | 40,000 initial trades; 0 invariant failures; 0 insurance used; 0 residual |
+| High-lev 4-long crash | 4 longs × $7.5k each (15x effective) on 4 assets, all crash 60% | 1 liquidation triggered; 3 legs remained covered post-liquidation; 0 insurance used; user retains $1439 of $2k |
+
+The engine correctly identifies and liquidates the deficit-causing leg
+without touching insurance, and without ADL-cascading the loss onto
+unrelated legs of the same account.
+
 **v13 config space sweep — max envelope per leverage level:**
 
 | Leverage | mm_bps | im_bps | Max max_move (bps/slot) | Per-accrual tolerance |
