@@ -80,9 +80,17 @@ V13Config {
    - Compute the envelope-bounded `effective_price`.
    - Call `accrue_asset_to_not_atomic` with `protective_progress_committed=true`
      once accounts have been touched.
-   - Refresh each at-risk account via `full_account_refresh`.
-   - For any account with `health_cert.certified_liq_deficit > 0`, call
-     `liquidate_account_not_atomic` with the most appropriate leg.
+   - **For each at-risk account, the wrapper MUST**:
+     1. Call `settle_account_side_effects_not_atomic` to materialize the
+        latest K-pair / B-flow PnL into `account.pnl`.
+     2. Call `full_account_refresh` to recompute and re-cert health.
+     3. If `health_cert.certified_liq_deficit > 0`, call
+        `liquidate_account_not_atomic` with the appropriate leg.
+   - **DO NOT** rely on `full_account_refresh` alone to surface MM violations
+     — v13 uses lazy settlement and the engine's recorded `account.pnl`
+     stays at the last-settled value unless the wrapper explicitly settles.
+     Verified empirically: a 97% crash with no `settle_*` call shows
+     `certified_liq_deficit=0` for actually-underwater accounts.
 
 4. **Emergency pause.** Operator can set
    `MarketGroupV13.threshold_stress_active = true` to pause favorable

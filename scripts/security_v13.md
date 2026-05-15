@@ -144,6 +144,13 @@ Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
 | Boundary inputs | size_q=1 / exec_price=1 / exec_price=MAX accepted; size_q≥MAX_TRADE_SIZE_Q / exec_price=0 / fee>max_fee rejected with proper errors. |
 | Rebalance path | `rebalance_reduce_position_not_atomic` correctly reduces position (75M→37.5M atomic) without margin check (risk-reducing-only). |
 
+**v13 advanced state probes (`--test=advanced`):**
+
+| Probe | Setup | Finding |
+|---|---|---|
+| Slow keeper | 50 longs at 9x leverage, 97% crash over 400 slots, but keeper limited to 2 liqs per slot | 0 deficit observations despite catastrophic crash. **Reveals v13's lazy-settlement design**: `full_account_refresh` does not materialize K-pair PnL into `account.pnl` on its own. To trigger deficit/ADL flows the wrapper must additionally drive `settle_account_side_effects_not_atomic` and possibly `accrue_asset` with active touch. Documented in `bounty_v13.md` wrapper responsibilities. |
+| Recovery declaration | `declare_permissionless_recovery` with 3 distinct reasons | All accepted, `recovery_reason` field updates; mode stays `Live` (recovery is a flag, not a mode change) |
+
 **v12-style corner-case probes (`--test=corner_cases`):**
 
 | Probe | Setup | Result |
