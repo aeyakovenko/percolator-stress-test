@@ -128,6 +128,38 @@ Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
 | Stale account exploit | Mark stale, try convert / withdraw | convert blocked (LockActive); withdraw runs with post-call IM check |
 | Withdraw undercollateralize | 15x position, escalating withdraws | small OK; large rejected (LockActive / InvalidConfig) |
 
+**v13 path probes (`--test=probes_paths`):**
+
+| Probe | Setup | Result |
+|---|---|---|
+| Account close path | full deposit → trade → close → withdraw → close_account | clean exit, materialized_portfolio_count decrements |
+| Long-dt gap | skip cranks for max_dt+5 slots, then accrue | engine segments at max_dt — graceful catchup over 2 calls |
+| Rapid churn | 100 open-close cycles | fee accounting exact: $100 each side → $200 to insurance |
+
+**v13 resolve / boundary / config probes:**
+
+| Probe | Finding |
+|---|---|
+| Resolve emergency exit | `close_resolved_account_not_atomic` does B-effect settlement only; positions need `apply_quantity_adl_after_residual_not_atomic` separately. Wrapper-flow doc item. |
+| Boundary inputs | size_q=1 / exec_price=1 / exec_price=MAX accepted; size_q≥MAX_TRADE_SIZE_Q / exec_price=0 / fee>max_fee rejected with proper errors. |
+| Rebalance path | `rebalance_reduce_position_not_atomic` correctly reduces position (75M→37.5M atomic) without margin check (risk-reducing-only). |
+
+**v13 config space sweep — max envelope per leverage level:**
+
+| Leverage | mm_bps | im_bps | Max max_move (bps/slot) | Per-accrual tolerance |
+|---|---|---|---|---|
+| 10x  | 1000 | 2000 | 90 | 9.0% per 10-slot (4s) window |
+| 15x  | 666  | 1332 | 60 | 6.0% |
+| **20x**  | **500**  | **1000** | **45** | **4.5%** (our bounty config) |
+| 25x  | 400  | 800  | 36 | 3.6% |
+| 33x  | 303  | 606  | 27 | 2.7% |
+| 50x  | 200  | 400  | 18 | 1.8% |
+| 67x  | 149  | 298  | 13 | 1.3% |
+| 100x | 100  | 200  | 8  | 0.8% |
+
+Linear approximation: `max_move × max_dt ≈ mm − ~100 bps` (the ~100 bps
+reservation covers worst-case linear loss + liquidation fee).
+
 ## What's not yet ported
 
 Stages 6-9 added directed crash scenarios, liquidation flow, rayon

@@ -1203,6 +1203,155 @@ fn run_probes_resolve() {
     probe_resolve_exit();
 }
 
+/// Boundary-value probe: test engine at the extreme inputs it accepts.
+fn probe_boundary_values() {
+    println!("  Boundary values: extreme size_q, exec_price, notional");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(5_000_000_000)).unwrap(); // $5B LP (well under MAX_VAULT_TVL=$10B)
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(100_000_000)).unwrap(); // $100M user
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    // (a) size_q = 1 (smallest non-zero)
+    let r = engine.trade(user, lp, SOL_ASSET, 1, oracle, 1);
+    println!("    size_q=1:                    {:?}", r.err());
+
+    // (b) size_q at MAX_TRADE_SIZE_Q (should reject — exceeds)
+    let r = engine.trade(user, lp, SOL_ASSET, MAX_TRADE_SIZE_Q, oracle, 1);
+    println!("    size_q=MAX_TRADE_SIZE_Q:    {:?}", r.err());
+
+    // (c) size_q at MAX_TRADE_SIZE_Q - 1 (should also reject — notional too large)
+    let r = engine.trade(user, lp, SOL_ASSET, MAX_TRADE_SIZE_Q.saturating_sub(1), oracle, 1);
+    println!("    size_q=MAX-1:               {:?}", r.err());
+
+    // (d) exec_price = 1 (smallest valid)
+    let r = engine.trade(user, lp, SOL_ASSET, 1, 1, 1);
+    println!("    exec_price=1, size=1:        {:?}", r.err());
+
+    // (e) exec_price = MAX_ORACLE_PRICE (largest valid)
+    let r = engine.trade(user, lp, SOL_ASSET, 1, MAX_ORACLE_PRICE, 1);
+    println!("    exec_price=MAX:              {:?}", r.err());
+
+    // (f) exec_price = 0 (invalid)
+    let r = engine.trade(user, lp, SOL_ASSET, 100, 0, 1);
+    println!("    exec_price=0:                {:?}", r.err());
+
+    // (g) fee_bps > max_trading_fee_bps
+    let r = engine.trade(user, lp, SOL_ASSET, 100, oracle, 100);
+    println!("    fee_bps=100 (cfg max=1):     {:?}", r.err());
+
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Rebalance path: reduce position without margin check (risk-reducing only)
+fn probe_rebalance() {
+    println!("  Rebalance path: open large, reduce via rebalance_reduce_position");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let notional = usdc(15_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+    println!("    opened 15x position: pos_q={}", engine.accounts[user].legs[0].basis_pos_q);
+
+    // Reduce by half
+    let reduce_q = size_q / 2;
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[user];
+    let r = engine.group.rebalance_reduce_position_not_atomic(
+        &mut acc,
+        RebalanceRequestV13 {
+            asset_index: SOL_ASSET,
+            reduce_q,
+        },
+        &prices,
+    );
+    engine.accounts[user] = acc;
+    println!("    rebalance reduce by half:    {:?}", r);
+    println!("    after rebalance: pos_q={}", engine.accounts[user].legs[0].basis_pos_q);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_boundary() {
+    println!("=== v13 boundary + rebalance probes ===");
+    probe_boundary_values();
+    println!();
+    probe_rebalance();
+}
+
+/// Sweep leverage levels: find what v13's envelope accepts at each mm.
+/// For mm=mm_bps (=1/leverage*10000), find max max_price_move_bps_per_slot
+/// that passes validate_exact_solvency_envelope.
+fn probe_config_sweep() {
+    println!("=== v13 config-space sweep: max envelope per leverage ===");
+    println!();
+    println!("  Leverage | mm | im | Max max_move | Per-accrual tolerance");
+    println!("  ---------|----|----|--------------|----------------------");
+    let leverages = [10u64, 15, 20, 25, 33, 50, 67, 100];
+    let max_dt = 10u64;
+    for lev in leverages {
+        let mm = 10000 / lev;
+        let im = (mm * 2).max(mm + 1);
+        // Binary search for max max_price_move that validates
+        let mut lo = 1u64;
+        let mut hi = mm; // can't be more than mm
+        let mut max_ok = 0u64;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let cfg = V13Config {
+                max_portfolio_assets: 1,
+                min_nonzero_mm_req: 20,
+                min_nonzero_im_req: 30,
+                h_min: 0,
+                h_max: 30,
+                maintenance_margin_bps: mm,
+                initial_margin_bps: im,
+                max_trading_fee_bps: 1,
+                liquidation_fee_bps: 5,
+                liquidation_fee_cap: usdc(50_000),
+                min_liquidation_abs: 0,
+                max_accrual_dt_slots: max_dt,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: max_dt,
+                max_price_move_bps_per_slot: mid,
+                max_account_b_settlement_chunks: 8,
+                max_bankrupt_close_chunks: 8,
+                public_b_chunk_atoms: MAX_VAULT_TVL,
+                permissionless_recovery_enabled: true,
+                stale_certificate_penalty_enabled: true,
+                full_refresh_required_for_favorable_actions: true,
+                public_liveness_profile_crank_forward: true,
+            };
+            if cfg.validate_public_user_fund().is_ok() {
+                max_ok = mid;
+                lo = mid + 1;
+            } else {
+                if mid == 0 { break; }
+                hi = mid - 1;
+            }
+        }
+        let tolerance_bps = max_ok * max_dt;
+        let tolerance_pct = tolerance_bps as f64 / 100.0;
+        println!("  {:>4}x   | {:>3} | {:>3} | {:>10} | {:.2}% per {}-slot window",
+            lev, mm, im, max_ok, tolerance_pct, max_dt);
+    }
+    println!();
+    println!("  Interpretation: at higher leverage, the envelope budget shrinks");
+    println!("  with mm. For a $1k bounty at 20x (mm=500), v13 allows max_move=45");
+    println!("  bps/slot = 4.5% per 10-slot window = ~1.1% per second.");
+}
+
 /// P2 equivalent: 0 insurance, 0 LP capital. Long-running funding drain on
 /// users with one-sided exposure. If the engine can ever leak negative pnl
 /// to insurance, this should reveal it.
@@ -1603,6 +1752,14 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=probes_resolve") {
         run_probes_resolve();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=probes_boundary") {
+        run_probes_boundary();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=config_sweep") {
+        probe_config_sweep();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {
