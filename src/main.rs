@@ -992,6 +992,149 @@ fn run_probes_v13_extra() {
     probe_withdraw_undercollateralize();
 }
 
+/// Account close path: deposit, open, close position, withdraw all, close
+/// account. Verifies the full happy-path exit is clean.
+fn probe_account_close() {
+    println!("  Account close path: full deposit → trade → close cycle");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    // Open + close position via reverse trade
+    let notional = usdc(5_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+    engine.trade(lp, user, SOL_ASSET, size_q, oracle, 1).unwrap();
+    println!("    after close trade: cap=${} pnl={} legs[0].active={}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl,
+        engine.accounts[user].legs[0].active);
+
+    // Withdraw remaining capital
+    let prices = engine.effective_prices();
+    let cap_left = engine.accounts[user].capital;
+    let mut acc = engine.accounts[user];
+    let r = engine.group.withdraw_not_atomic(&mut acc, cap_left, &prices);
+    engine.accounts[user] = acc;
+    println!("    withdraw ${}: {:?}", cap_left / USDC_DECIMALS, r);
+
+    // Close account
+    let acc = engine.accounts[user];
+    let r = engine.group.close_portfolio_account(&acc);
+    println!("    close_portfolio_account: {:?}", r);
+    println!("    materialized_portfolio_count: {}", engine.group.materialized_portfolio_count);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Long-dt gap test: skip cranks for max_accrual_dt_slots+1 slots and see
+/// what happens. Engine should reject excessive jumps.
+fn probe_long_dt_gap() {
+    println!("  Long-dt gap: skip cranks for max_dt+5 slots, attempt accrue");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let notional = usdc(5_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+
+    // Skip many slots and try to accrue
+    let dt_skip = cfg.max_accrual_dt_slots + 5;
+    let new_oracle = oracle + (oracle as u128 * 50 / 10_000) as u64; // 0.5% move
+    let r = engine.accrue_asset(SOL_ASSET, 2 + dt_skip, new_oracle, 0);
+    println!("    accrue after {}-slot gap with price move: {:?}", dt_skip, r);
+
+    // Try with no price move
+    let r2 = engine.accrue_asset(SOL_ASSET, 2 + dt_skip, oracle, 0);
+    println!("    accrue after gap, same price: {:?}", r2);
+
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Rapid open-close churn: open and close 100 times in a row at slightly
+/// different prices. Tests fee accounting and account state hygiene.
+fn probe_rapid_churn() {
+    println!("  Rapid churn: 100 open-close cycles");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(10_000)).unwrap();
+    let mut oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let initial_cap = engine.accounts[user].capital;
+    let initial_lp_cap = engine.accounts[lp].capital;
+    let initial_insurance = engine.group.insurance;
+    let mut slot = 2u64;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut cycle_failures = 0;
+
+    for cycle in 0..100 {
+        // Move oracle slightly
+        let dir = cycle % 2 == 0;
+        let d = (oracle as u128 * (max_move as u128 / 5) / 10_000) as u64;
+        oracle = if dir { oracle + d } else { oracle.saturating_sub(d).max(1) };
+        if engine.accrue_asset(SOL_ASSET, slot, oracle, 0).is_err() {
+            cycle_failures += 1;
+            slot += 1;
+            continue;
+        }
+        slot += 1;
+
+        // Open
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        if engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).is_err() {
+            cycle_failures += 1;
+            continue;
+        }
+        // Close
+        if engine.trade(lp, user, SOL_ASSET, size_q, oracle, 1).is_err() {
+            cycle_failures += 1;
+            continue;
+        }
+    }
+    let final_cap = engine.accounts[user].capital;
+    let final_lp_cap = engine.accounts[lp].capital;
+    let final_insurance = engine.group.insurance;
+    println!("    cycles attempted:    100");
+    println!("    cycle failures:      {}", cycle_failures);
+    println!("    user cap: ${} → ${} (Δ={})",
+        initial_cap / USDC_DECIMALS, final_cap / USDC_DECIMALS,
+        (final_cap as i128 - initial_cap as i128) / 1_000_000);
+    println!("    LP cap:   ${} → ${} (Δ={})",
+        initial_lp_cap / USDC_DECIMALS, final_lp_cap / USDC_DECIMALS,
+        (final_lp_cap as i128 - initial_lp_cap as i128) / 1_000_000);
+    println!("    insurance: ${} → ${} (Δ={})",
+        initial_insurance / USDC_DECIMALS, final_insurance / USDC_DECIMALS,
+        (final_insurance as i128 - initial_insurance as i128) / 1_000_000);
+    println!("    user.legs[0].active: {}", engine.accounts[user].legs[0].active);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_v13_more() {
+    println!("=== v13 paths probes (close, dt gap, churn) ===");
+    probe_account_close();
+    println!();
+    probe_long_dt_gap();
+    println!();
+    probe_rapid_churn();
+}
+
 /// P2 equivalent: 0 insurance, 0 LP capital. Long-running funding drain on
 /// users with one-sided exposure. If the engine can ever leak negative pnl
 /// to insurance, this should reveal it.
@@ -1384,6 +1527,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=probes_v13") {
         run_probes_v13_extra();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=probes_paths") {
+        run_probes_v13_more();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {
