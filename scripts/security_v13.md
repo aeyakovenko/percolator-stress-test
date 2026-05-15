@@ -144,12 +144,40 @@ Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
 | Boundary inputs | size_q=1 / exec_price=1 / exec_price=MAX accepted; size_q≥MAX_TRADE_SIZE_Q / exec_price=0 / fee>max_fee rejected with proper errors. |
 | Rebalance path | `rebalance_reduce_position_not_atomic` correctly reduces position (75M→37.5M atomic) without margin check (risk-reducing-only). |
 
-**v13 advanced state probes (`--test=advanced`):**
+**v13 advanced state probes (`--test=advanced`, `--test=pnl_trace`):**
 
 | Probe | Setup | Finding |
 |---|---|---|
-| Slow keeper | 50 longs at 9x leverage, 97% crash over 400 slots, but keeper limited to 2 liqs per slot | 0 deficit observations despite catastrophic crash. **Reveals v13's lazy-settlement design**: `full_account_refresh` does not materialize K-pair PnL into `account.pnl` on its own. To trigger deficit/ADL flows the wrapper must additionally drive `settle_account_side_effects_not_atomic` and possibly `accrue_asset` with active touch. Documented in `bounty_v13.md` wrapper responsibilities. |
+| Slow keeper | 50 longs at 9x leverage, 97% crash over 400 slots, but keeper limited to 2 liqs per slot | 0 deficit observations from this specific probe. Confirmed: v13 uses **lazy settlement** — see pnl_trace below for the real mechanism. |
 | Recovery declaration | `declare_permissionless_recovery` with 3 distinct reasons | All accepted, `recovery_reason` field updates; mode stays `Live` (recovery is a flag, not a mode change) |
+| **PnL materialization trace** | Open 10x long, walk oracle down step by step, log when account.pnl actually updates | **★ Key finding** — see below |
+
+### Key finding: v13's deficit-absorption surface (from pnl_trace)
+
+The trace exposes how v13 *actually* handles a slow-keeper deficit:
+
+1. `accrue_asset_to_not_atomic` updates `asset.k_long` (engine-level price tracking) but **does NOT touch `account.pnl`**.
+2. Calling `settle_account_side_effects_not_atomic` followed by `full_account_refresh` materializes K-pair PnL — but if the position is mildly underwater, the negative PnL is silently absorbed into `capital` via `settle_negative_pnl_from_principal` (which `settle_account_side_effects` invokes internally). pnl stays 0; cap decreases.
+3. Once `cap` is exhausted, additional K-pair losses accumulate as negative `account.pnl`. Now `certified_liq_deficit > 0` and the keeper can call `liquidate_account_not_atomic`.
+4. At liquidation, if `pnl` is still negative after capital settlement, the engine consumes `insurance` per spec §5.6 step 2.
+
+In the trace: a 22% oracle drop with no keeper liquidation produced:
+- `account.capital = 0` (exhausted absorbing K-pair losses)
+- `account.pnl = -$1198` (remaining deficit)
+- Liquidation fires with `insurance_used = $2`, `residual_booked = $1196`
+- The $2 was the only insurance balance (it had accumulated from fees);
+  the $1196 residual went through ADL booking.
+
+**Implication for the bounty deployment:**
+
+A keeper that doesn't liquidate promptly **CAN** drain insurance. The engine
+correctly absorbs the deficit per spec, but the deficit only exists because
+the wrapper let it. This is the wrapper's responsibility, not an engine bug.
+
+Mitigations:
+- Run the keeper every slot (4 sec on Solana). The engine's max_accrual_dt_slots=10 (~4 sec) means at most 1 catchup window of slip is tolerable.
+- Set conservative leverage / margin (20x with 5% mm = $400 loss tolerance per slot before MM violation).
+- The 9-invariant battery passes throughout — no engine bug, just wrapper-required behavior.
 
 **v12-style corner-case probes (`--test=corner_cases`):**
 

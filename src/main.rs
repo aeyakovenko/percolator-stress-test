@@ -1738,6 +1738,113 @@ fn run_probes_advanced() {
     probe_recovery_declaration();
 }
 
+/// PnL materialization trace: open one position, walk oracle in small
+/// envelope-bounded steps, log when account.pnl actually updates and what
+/// engine call sequence achieves it.
+fn probe_pnl_materialization() {
+    println!("  PnL materialization: trace which calls move K-pair into account.pnl");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    let notional = usdc(10_000); // 10x long
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+    println!("    after open: pnl={} cap=${} legs[0].k_snap={}",
+        engine.accounts[user].pnl,
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].legs[0].k_snap);
+    println!("    asset.k_long={}", engine.group.assets[0].k_long);
+
+    // Move oracle down 1% (20 bps × 5 steps within envelope)
+    let mut o = oracle;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 2u64;
+    for step in 0..5 {
+        let d = (o as u128 * max_move as u128 / 10_000) as u64;
+        o = o.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(SOL_ASSET, slot, o, 0);
+        slot += 1;
+        println!("    step {}: oracle=${} | account.pnl={} | asset.k_long={}",
+            step, o / 1_000_000,
+            engine.accounts[user].pnl,
+            engine.group.assets[0].k_long);
+    }
+    println!("    PNL unchanged by accrue (engine-state only) — expected lazy");
+
+    // Call settle_account_side_effects on the user — does this move pnl?
+    let mut acc = engine.accounts[user];
+    let r = engine.group.settle_account_side_effects_not_atomic(
+        &mut acc, cfg.public_b_chunk_atoms);
+    engine.accounts[user] = acc;
+    println!("    after settle_account_side_effects: r={:?} pnl={} k_snap={}",
+        r, engine.accounts[user].pnl, engine.accounts[user].legs[0].k_snap);
+
+    // Call full_account_refresh
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[user];
+    let r = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[user] = acc;
+    println!("    after full_account_refresh: r={:?}", r.is_ok());
+    println!("      pnl={} cap=${} k_snap={}",
+        engine.accounts[user].pnl,
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].legs[0].k_snap);
+    println!("      cert.equity={} cert.mm_req={} cert.liq_deficit={}",
+        engine.accounts[user].health_cert.certified_equity,
+        engine.accounts[user].health_cert.certified_maintenance_req,
+        engine.accounts[user].health_cert.certified_liq_deficit);
+
+    // Bigger drop — should trigger liquidation deficit
+    println!();
+    println!("  Phase 2: bigger drop to actually trigger deficit");
+    for _ in 0..50 {
+        let d = (o as u128 * max_move as u128 / 10_000) as u64;
+        o = o.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(SOL_ASSET, slot, o, 0);
+        slot += 1;
+    }
+    println!("    after 50 more slots: oracle=${}", o / 1_000_000);
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[user];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let r = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[user] = acc;
+    println!("    refresh: {:?}", r.is_ok());
+    println!("    pnl={} cap=${} k_snap={}",
+        engine.accounts[user].pnl,
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].legs[0].k_snap);
+    println!("    cert.equity={} cert.mm_req={} cert.liq_deficit={}",
+        engine.accounts[user].health_cert.certified_equity,
+        engine.accounts[user].health_cert.certified_maintenance_req,
+        engine.accounts[user].health_cert.certified_liq_deficit);
+
+    // Can liquidation proceed now?
+    let leg = engine.accounts[user].legs[0];
+    if leg.active && engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+        let mut acc = engine.accounts[user];
+        let lr = engine.group.liquidate_account_not_atomic(
+            &mut acc,
+            LiquidationRequestV13 {
+                asset_index: 0,
+                close_q: leg.basis_pos_q.unsigned_abs(),
+                fee_bps: 5,
+            },
+            &prices,
+        );
+        engine.accounts[user] = acc;
+        println!("    liquidation: {:?}", lr);
+    } else {
+        println!("    NO LIQUIDATION possible (deficit=0 or leg inactive)");
+    }
+}
+
 /// Hedge probe: user opens long asset 0, short asset 1 at same notional.
 /// Crash asset 0. The short hedge on asset 1 shouldn't mask the long's
 /// deficit; liquidation should fire on asset 0 only.
@@ -2638,6 +2745,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=advanced") {
         run_probes_advanced();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=pnl_trace") {
+        probe_pnl_materialization();
         return;
     }
     if args.iter().any(|a| a == "--test=f6") {

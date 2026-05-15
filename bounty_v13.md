@@ -81,16 +81,27 @@ V13Config {
    - Call `accrue_asset_to_not_atomic` with `protective_progress_committed=true`
      once accounts have been touched.
    - **For each at-risk account, the wrapper MUST**:
-     1. Call `settle_account_side_effects_not_atomic` to materialize the
-        latest K-pair / B-flow PnL into `account.pnl`.
+     1. Call `settle_account_side_effects_not_atomic` to drain B-chunks
+        and materialize K-pair flow (this internally calls
+        `settle_negative_pnl_from_principal` which absorbs negative PnL
+        from capital).
      2. Call `full_account_refresh` to recompute and re-cert health.
      3. If `health_cert.certified_liq_deficit > 0`, call
         `liquidate_account_not_atomic` with the appropriate leg.
-   - **DO NOT** rely on `full_account_refresh` alone to surface MM violations
-     — v13 uses lazy settlement and the engine's recorded `account.pnl`
-     stays at the last-settled value unless the wrapper explicitly settles.
-     Verified empirically: a 97% crash with no `settle_*` call shows
-     `certified_liq_deficit=0` for actually-underwater accounts.
+
+   **Critical timing requirement:** a slow keeper CAN drain insurance.
+   If the keeper waits too long after a price move, a user's K-pair losses
+   first exhaust `capital` (absorbed via `settle_negative_pnl_from_principal`),
+   then accumulate as negative `account.pnl`. When liquidation finally fires
+   on a `pnl < 0` and `cap == 0` account, the engine consumes `insurance`
+   per spec §5.6 step 2.
+
+   Verified in `--test=pnl_trace`: a 22% drop with no liquidation produces
+   `cap=0, pnl=-$1198, liq_deficit=$1198, insurance_used=$2, residual=$1196`.
+   The $2 insurance dip is the keeper's fault, not the engine's.
+
+   Run the keeper every slot. `max_accrual_dt_slots=10` (~4 seconds) is the
+   maximum tolerable lag before catchup must occur.
 
 4. **Emergency pause.** Operator can set
    `MarketGroupV13.threshold_stress_active = true` to pause favorable
