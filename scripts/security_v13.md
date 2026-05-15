@@ -140,7 +140,7 @@ Zero failures across 14,000 seeds × ~200-400 slots each ≈ 4.2M slot-steps.
 
 | Probe | Finding |
 |---|---|
-| Resolve emergency exit | `close_resolved_account_not_atomic` does B-effect settlement only; positions need `apply_quantity_adl_after_residual_not_atomic` separately. Wrapper-flow doc item. |
+| Resolve emergency exit | Initial probe: `close_resolved_account_not_atomic` does B-effect settlement only; positions stay open. Full flow probe: **resolve_market → apply_quantity_adl_after_residual (drains OI on both sides, modes → ResetPending) → clear_leg per account → close_resolved → all 3 users exit cleanly with full payout.** End-to-end verified in `probe_resolve_full_exit`. |
 | Boundary inputs | size_q=1 / exec_price=1 / exec_price=MAX accepted; size_q≥MAX_TRADE_SIZE_Q / exec_price=0 / fee>max_fee rejected with proper errors. |
 | Rebalance path | `rebalance_reduce_position_not_atomic` correctly reduces position (75M→37.5M atomic) without margin check (risk-reducing-only). |
 

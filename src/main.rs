@@ -1710,6 +1710,103 @@ fn probe_slow_keeper() {
         engine.assert_invariants().err(), run_invariant_battery(&engine));
 }
 
+/// Full resolve emergency-exit flow: resolve → apply_quantity_adl to drain
+/// OI → close_resolved on each account → final state.
+fn probe_resolve_full_exit() {
+    println!("  Resolve + apply_quantity_adl full flow: drive emergency exit end-to-end");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V13Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let mut users = Vec::new();
+    for _ in 0..3 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        users.push(u);
+    }
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+    // user[0] long, user[1] short, user[2] long
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(users[0], lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+    engine.trade(lp, users[1], SOL_ASSET, size_q, oracle, 1).unwrap();
+    engine.trade(users[2], lp, SOL_ASSET, size_q, oracle, 1).unwrap();
+    println!("    opened 2 longs, 1 short");
+    println!("    asset: oi_long={} oi_short={} stored_long={} stored_short={}",
+        engine.group.assets[0].oi_eff_long_q,
+        engine.group.assets[0].oi_eff_short_q,
+        engine.group.assets[0].stored_pos_count_long,
+        engine.group.assets[0].stored_pos_count_short);
+
+    // Resolve at slot 10
+    engine.group.resolve_market_not_atomic(10).unwrap();
+    println!("    resolved at slot 10");
+    println!("    mode: {:?}  resolved_slot: {}", engine.group.mode, engine.group.resolved_slot);
+
+    // Drain both sides via apply_quantity_adl
+    let drain_amount = engine.group.assets[0].oi_eff_long_q
+        .min(engine.group.assets[0].oi_eff_short_q);
+    let r = engine.group.apply_quantity_adl_after_residual_not_atomic(
+        SOL_ASSET, SideV13::Long, drain_amount);
+    println!("    apply_quantity_adl(Long, {}): {:?}", drain_amount, r);
+    println!("    asset after drain: oi_long={} oi_short={} mode_long={:?} mode_short={:?}",
+        engine.group.assets[0].oi_eff_long_q,
+        engine.group.assets[0].oi_eff_short_q,
+        engine.group.assets[0].mode_long,
+        engine.group.assets[0].mode_short);
+
+    // Wrapper step: clear each leg on each account (asset is in ResetPending,
+    // so clear_leg recognizes the prior_reset_epoch case).
+    let mut legs_cleared = 0;
+    let mut clear_errors = 0;
+    for &u in &users {
+        let mut acc = engine.accounts[u];
+        for li in 0..V13_MAX_PORTFOLIO_ASSETS_N {
+            if acc.legs[li].active {
+                match engine.group.clear_leg(&mut acc, li) {
+                    Ok(()) => legs_cleared += 1,
+                    Err(_) => clear_errors += 1,
+                }
+            }
+        }
+        engine.accounts[u] = acc;
+    }
+    println!("    legs_cleared: {}  clear_errors: {}", legs_cleared, clear_errors);
+
+    // Try close_resolved on each account
+    let mut closed = 0;
+    let mut progresses = 0;
+    let mut errors = vec![];
+    for &u in &users {
+        let mut acc = engine.accounts[u];
+        for _ in 0..20 {
+            let r = engine.group.close_resolved_account_not_atomic(&mut acc, 0);
+            match r {
+                Ok(ResolvedCloseOutcomeV13::ProgressOnly) => { progresses += 1; }
+                Ok(ResolvedCloseOutcomeV13::Closed { payout }) => {
+                    closed += 1;
+                    println!("    user {}: Closed payout=${}", u, payout / USDC_DECIMALS);
+                    break;
+                }
+                Err(e) => { errors.push((u, e)); break; }
+            }
+        }
+        engine.accounts[u] = acc;
+    }
+    println!("    closed: {}  progress-onlys: {}  errors: {}",
+        closed, progresses, errors.len());
+    if !errors.is_empty() {
+        for (u, e) in errors.iter().take(3) {
+            println!("      user {}: {:?}", u, e);
+        }
+    }
+    println!("    final mode: {:?}", engine.group.mode);
+    println!("    final vault=${}  insurance=${}",
+        engine.group.vault / USDC_DECIMALS, engine.group.insurance / USDC_DECIMALS);
+    println!("    invariants: {:?}", engine.assert_invariants().err());
+}
+
 /// Probe recovery declaration path.
 fn probe_recovery_declaration() {
     println!("  Recovery declaration: declare_permissionless_recovery transition");
@@ -1736,6 +1833,8 @@ fn run_probes_advanced() {
     probe_slow_keeper();
     println!();
     probe_recovery_declaration();
+    println!();
+    probe_resolve_full_exit();
 }
 
 /// PnL materialization trace: open one position, walk oracle in small

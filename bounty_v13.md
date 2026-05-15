@@ -115,12 +115,31 @@ V13Config {
    open positions are preserved; only outflows are paused. Clear the flag
    to resume normal operation.
 
-5. **Resolve path.** If the market needs to be wound down,
-   `resolve_market_not_atomic(slot)` moves to `Resolved` mode. From there,
-   each account exits via a loop:
-   - `settle_account_side_effects_not_atomic` until no chunk remains
-   - `apply_quantity_adl_after_residual_not_atomic` to flatten positions
-   - `close_resolved_account_not_atomic(account, fee_rate_per_slot)` to finalize payout
+5. **Resolve path.** If the market needs to be wound down, the full
+   emergency-exit flow is (verified working in `--test=advanced`):
+
+   a. `resolve_market_not_atomic(slot)` — mode goes `Live` → `Resolved`.
+
+   b. For each asset, drive `apply_quantity_adl_after_residual_not_atomic(
+      asset_idx, bankrupt_side, drain_q)` with
+      `drain_q = min(oi_long, oi_short)`. This zeros OI on both sides and
+      both side-modes transition to `ResetPending`.
+
+   c. **For each account, call `clear_leg(account, asset_idx)` on each
+      active leg** — this is the critical step missing from a naive
+      "just resolve and close" approach. clear_leg recognizes the
+      `prior_reset_epoch` case (asset is ResetPending and account's
+      leg epoch_snap+1 matches asset epoch) and clears the leg without
+      double-subtracting from OI.
+
+   d. For each account, call `close_resolved_account_not_atomic(account, 0)`.
+      With active_bitmap now 0, it transitions through to the `Closed`
+      outcome and returns the payout. Vault is debited.
+
+   Verified in `probe_resolve_full_exit`: 3 users with mixed long/short
+   positions resolved → quantity_adl → clear_leg → close_resolved all
+   exit cleanly with $999 each (their deposit minus $1 trade fee).
+   Invariants and the 9-invariant battery pass throughout.
 
 ## Operating envelope (for context)
 
