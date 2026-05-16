@@ -1562,6 +1562,247 @@ fn probe_adversarial_keeper() {
         engine.assert_invariants().err(), run_invariant_battery(&engine));
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v14 cross-margin probes — NEW SURFACE vs v13
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Cross-margin offset: profitable leg supports losing leg's MM.
+/// Open long $5k asset A + short $5k asset B. Move asset A up 10%
+/// (long profits $500). Then move asset B up 10% (short loses $500).
+/// Net PnL ~ 0; aggregate equity preserved; no liquidation.
+fn probe_xmargin_offset() {
+    println!("  Cross-margin offset: profitable leg supports losing leg");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    let notional = usdc(5_000);
+    let size_q = notional * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, 0, size_q, oracle, 1).unwrap(); // long asset 0
+    engine.trade(lp, user, 1, size_q, oracle, 1).unwrap(); // short asset 1
+    println!("    opened: long $5k asset 0, short $5k asset 1");
+
+    let mut o0 = oracle;
+    let mut o1 = oracle;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 2u64;
+    // Move asset 0 up 10% over many slots (long profitable)
+    let target0 = oracle + oracle / 10;
+    while o0 < target0 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = (o0.saturating_add(d)).min(target0);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        slot += 1;
+    }
+    // Now move asset 1 up 10% (short losing)
+    let target1 = oracle + oracle / 10;
+    while o1 < target1 {
+        let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+        o1 = (o1.saturating_add(d)).min(target1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        slot += 1;
+    }
+    println!("    after moves: oracle A=${} B=${}", o0/1_000_000, o1/1_000_000);
+
+    // Refresh account: pnl should be near 0 (offsetting moves)
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[user];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[user] = acc;
+
+    let cert = engine.accounts[user].health_cert;
+    println!("    cap=${}  pnl={}  cert.equity={}  cert.mm_req={}  liq_deficit={}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl,
+        cert.certified_equity,
+        cert.certified_maintenance_req,
+        cert.certified_liq_deficit);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Cross-margin asymmetric: long BTC + long SOL, only BTC crashes.
+/// SOL leg's neutral value supports BTC's losses via shared capital.
+/// BTC should be liquidatable BEFORE SOL is affected, but the SHARED
+/// capital pool means SOL leg also degrades.
+fn probe_xmargin_asymmetric() {
+    println!("  Cross-margin asymmetric: long-A + long-B, only A crashes");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(2_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    let size_q = usdc(8_000) * POS_SCALE / oracle as u128; // 4x on each = 8x portfolio
+    engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
+    engine.trade(user, lp, 1, size_q, oracle, 1).unwrap();
+    println!("    opened: long $8k asset 0 + long $8k asset 1 (portfolio 8x on $2k)");
+
+    let mut o0 = oracle;
+    let o1 = oracle;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 2u64;
+    let mut total_liquidations = 0u32;
+    let mut total_insurance_used = 0u128;
+    let mut leg0_liqs = 0u32;
+    let mut leg1_liqs = 0u32;
+
+    // Crash asset 0 only
+    for _ in 0..200 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+
+        if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+            // Liquidate the largest active leg
+            let mut best = (0usize, 0u128);
+            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                let leg = engine.accounts[user].legs[li];
+                if leg.active {
+                    let a = leg.basis_pos_q.unsigned_abs();
+                    if a > best.1 { best = (li, a); }
+                }
+            }
+            if best.1 > 0 {
+                let mut acc = engine.accounts[user];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV14 {
+                        asset_index: best.0,
+                        close_q: best.1,
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liquidations += 1;
+                    total_insurance_used += out.insurance_used;
+                    if best.0 == 0 { leg0_liqs += 1; } else { leg1_liqs += 1; }
+                }
+                engine.accounts[user] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    final oracle: A=${}  B=${}", o0 / 1_000_000, o1 / 1_000_000);
+    println!("    leg 0 (crashed) liquidations: {}", leg0_liqs);
+    println!("    leg 1 (flat) liquidations:    {}", leg1_liqs);
+    println!("    total insurance used: {}", total_insurance_used);
+    println!("    user final: cap=${} pnl={} legs_active={}",
+        engine.accounts[user].capital / USDC_DECIMALS,
+        engine.accounts[user].pnl,
+        engine.accounts[user].active_bitmap.count_ones());
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Cross-margin haircut: many users with positive PnL claims, system
+/// junior_claim_bound exceeds residual. Positive PnL should be haircut
+/// when used as support, preventing leg-local paper profit from becoming
+/// senior unbacked claims.
+fn probe_xmargin_haircut() {
+    println!("  Cross-margin haircut: stress positive-PnL support haircut");
+    let cfg = make_bounty_sol_20x_max_config();
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(1_000_000)).unwrap(); // smaller LP — limits residual
+
+    let mut winners = Vec::new();
+    for _ in 0..10 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(100)).unwrap();
+        winners.push(u);
+    }
+    let oracle = price_e6(200);
+    engine.accrue_asset(SOL_ASSET, 1, oracle, 0).unwrap();
+
+    // All open longs
+    for &u in &winners {
+        let size_q = usdc(500) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, SOL_ASSET, size_q, oracle, 1);
+    }
+    println!("    opened 10 longs at 5x leverage, smaller LP");
+    println!("    initial vault=${} c_tot=${} insurance=${} residual={}",
+        engine.group.vault / USDC_DECIMALS,
+        engine.group.c_tot / USDC_DECIMALS,
+        engine.group.insurance / USDC_DECIMALS,
+        engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance) / USDC_DECIMALS);
+
+    // Move oracle up 10% so all longs profit
+    let mut o = oracle;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let target = oracle + oracle / 10;
+    let mut slot = 2u64;
+    while o < target {
+        let d = (o as u128 * max_move as u128 / 10_000) as u64;
+        o = (o.saturating_add(d)).min(target);
+        let _ = engine.accrue_asset(SOL_ASSET, slot, o, 0);
+        slot += 1;
+    }
+    println!("    after 10% rise: oracle=${}", o / 1_000_000);
+
+    let prices = engine.effective_prices();
+    let mut sum_pnl = 0i128;
+    for &u in &winners {
+        let mut acc = engine.accounts[u];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[u] = acc;
+        sum_pnl += engine.accounts[u].pnl;
+    }
+    println!("    sum of user pnls: {}", sum_pnl);
+    println!("    pnl_pos_tot in engine: {}", engine.group.pnl_pos_tot);
+    println!("    residual = vault({}) - c_tot({}) - insurance({}) = {}",
+        engine.group.vault, engine.group.c_tot, engine.group.insurance,
+        engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance));
+
+    // Each user has a cert.equity that reflects haircut_effective_support.
+    // If junior_claim_bound > residual, positive support is haircut.
+    let mut total_certified_equity = 0i128;
+    let mut total_face_pnl = 0u128;
+    for &u in &winners {
+        let cert = engine.accounts[u].health_cert;
+        total_certified_equity += cert.certified_equity;
+        if engine.accounts[u].pnl > 0 {
+            total_face_pnl += engine.accounts[u].pnl as u128;
+        }
+    }
+    println!("    sum certified_equity: {}", total_certified_equity);
+    println!("    sum face positive pnl: {}", total_face_pnl);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_xmargin() {
+    println!("=== v14 cross-margin probes (new attack surface) ===");
+    probe_xmargin_offset();
+    println!();
+    probe_xmargin_asymmetric();
+    println!();
+    probe_xmargin_haircut();
+}
+
 fn run_probes_v12_corner_cases() {
     println!("=== v14 corner-case probes ported from v12 ===");
     probe_adl_drain_reset();
@@ -2839,6 +3080,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=corner_cases") {
         run_probes_v12_corner_cases();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=xmargin") {
+        run_probes_xmargin();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
