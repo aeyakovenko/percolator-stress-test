@@ -164,6 +164,7 @@ fn probe_bounty_variants() {
         stale_certificate_penalty_enabled: true,
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
+        recovery_fallback_price_enabled: true,
     };
     let cases: Vec<(String, V14Config)> = vec![
         ("baseline v12 max_risk".to_string(), make_bounty_sol_20x_max_config()),
@@ -213,6 +214,7 @@ fn make_bounty_config(n_assets: u8) -> V14Config {
         stale_certificate_penalty_enabled: true,
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
+        recovery_fallback_price_enabled: true,
     }
 }
 
@@ -2183,6 +2185,7 @@ fn probe_ten10_single_asset() {
         stale_certificate_penalty_enabled:  true,
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
+        recovery_fallback_price_enabled: true,
     };
     if cfg.validate_public_user_fund().is_err() {
         println!("    cfg validation failed");
@@ -2337,6 +2340,7 @@ fn probe_ten10_cross_margin() {
         stale_certificate_penalty_enabled:  true,
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
+        recovery_fallback_price_enabled: true,
     };
     let mut engine = V14Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
@@ -3145,6 +3149,7 @@ fn probe_slow_keeper() {
         stale_certificate_penalty_enabled:  true,
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
+        recovery_fallback_price_enabled: true,
     };
     let mut engine = V14Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
@@ -3949,6 +3954,7 @@ fn probe_config_sweep() {
                 stale_certificate_penalty_enabled: true,
                 full_refresh_required_for_favorable_actions: true,
                 public_liveness_profile_crank_forward: true,
+        recovery_fallback_price_enabled: true,
             };
             if cfg.validate_public_user_fund().is_ok() {
                 max_ok = mid;
