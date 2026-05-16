@@ -296,6 +296,79 @@ For the bounty deployment, this means:
   determine the LP's exposure to oracle manipulation. That's a configuration
   / oracle-quality problem, outside the engine.
 
+## Per-domain bankruptcy attribution — empirically verified (`--test=domain_attr`)
+
+Spec §0 non-negotiable requirement 2: *"bankruptcy residual MUST be charged
+only to the asset-side loss domain whose exposure generated the residual."*
+Two probes force a **real residual** via a slow-keeper bankruptcy and
+verify the per-(asset, side) accounting.
+
+### probe_per_domain_attribution
+
+| Setup | Value |
+|---|---|
+| Assets | 2 (asset 0 = "SOL", asset 1 = "BTC") |
+| BTC bystanders | 5 users × $1k cap, hold longs on asset 1 |
+| SOL victim | 1 user × $500 cap, 16x long on asset 0 |
+| Insurance domain budgets | all set to $1M (no caps) |
+| Pre-attack insurance balance | $6 (from accumulated fees) |
+
+Slow-keeper SOL crash to -16%; then liquidate.
+
+| Metric | Result |
+|---|---|
+| `liq outcome.insurance_used` | $6.60 |
+| `liq outcome.residual_booked` | $814.75 |
+| **`insurance_domain_spent[1]` (asset 0, opp=Short)** | **$6.60 — exactly the SOL opposing-side domain** ★ |
+| **`insurance_domain_spent[2]` (asset 1, opp=Long)** | **0 ★** |
+| **`insurance_domain_spent[3]` (asset 1, opp=Short)** | **0 ★** |
+| BTC users' total cap | $4,997 of $5,000 (fee loss only — no contagion) |
+| Invariant battery | 0 failures |
+
+### probe_per_domain_budget_cap
+
+Same setup but `insurance_domain_budget[1] = $0` (the SOL opp domain is
+budget-capped at zero).
+
+| Metric | Result |
+|---|---|
+| `liq outcome.insurance_used` | 0 (cap honored) |
+| `liq outcome.residual_booked` | $821.35 (full deficit) |
+| **`insurance_domain_spent[1]`** | **0 ★** — budget respected |
+| Insurance balance | $6 → $6 (no spend) |
+| Other domains | still 0 |
+| Invariant battery | 0 failures |
+
+### What this empirically confirms
+
+1. ★ **Bankruptcy residual is per-(asset, opposing-side) attributed.** A SOL
+   long bankruptcy charged ONLY `insurance_domain_spent[asset=0, side=Short]`.
+   BTC's domains were not touched.
+
+2. ★ **Per-domain budget caps are enforced.** Setting the SOL opp domain
+   budget to $0 caused zero insurance consumption; the full deficit
+   became `residual_booked` (eligible for further ADL or recovery handling).
+
+3. ★ **No cross-asset contagion via the insurance path.** The BTC
+   bystanders' positions were unaffected by the SOL bankruptcy. Their
+   $5,000 of capital remained intact modulo the fees they paid on their
+   own trades.
+
+4. **Real residual booking works.** The probes produced $814.75 and
+   $821.35 of `residual_booked` respectively — the engine's
+   `book_bankruptcy_residual_chunk_for_account` path is exercised and
+   leaves the account/asset state invariant-consistent.
+
+### Implications
+
+The claim *"a manipulated or failed market cannot drain unrelated
+markets merely by inflating unrealized profit"* is now empirically
+verified at the lowest level: even when a real bankruptcy DOES occur,
+the deficit absorption is strictly contained within the bankrupt
+asset's `(asset, opposing_side)` insurance domain. Other assets'
+domains are not touched. Per-domain budgeting provides an additional
+operator-configurable cap on per-domain exposure.
+
 ## Empirical conclusion
 
 v14's safety surface is at least as strong as v13's across all tested

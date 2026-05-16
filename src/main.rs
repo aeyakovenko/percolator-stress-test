@@ -165,6 +165,7 @@ fn probe_bounty_variants() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
+        max_bankrupt_close_lifetime_slots: 1000,
     };
     let cases: Vec<(String, V14Config)> = vec![
         ("baseline v12 max_risk".to_string(), make_bounty_sol_20x_max_config()),
@@ -215,6 +216,7 @@ fn make_bounty_config(n_assets: u8) -> V14Config {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
+        max_bankrupt_close_lifetime_slots: 1000,
     }
 }
 
@@ -2186,6 +2188,7 @@ fn probe_ten10_single_asset() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
+        max_bankrupt_close_lifetime_slots: 1000,
     };
     if cfg.validate_public_user_fund().is_err() {
         println!("    cfg validation failed");
@@ -2341,6 +2344,7 @@ fn probe_ten10_cross_margin() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
+        max_bankrupt_close_lifetime_slots: 1000,
     };
     let mut engine = V14Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
@@ -2822,6 +2826,215 @@ fn run_probes_hard_extended() {
     fuzz_drift_attack(2000);
 }
 
+/// Empirically verify v14 bankruptcy residual is attributed STRICTLY to the
+/// losing market's opposing-side domain. Other assets' insurance domains
+/// must be untouched by a single-market bankruptcy.
+fn probe_per_domain_attribution() {
+    println!("  Per-domain bankruptcy attribution: SOL crash should NOT touch BTC domains");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let mut btc_users = Vec::new();
+    for _ in 0..5 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        btc_users.push(u);
+    }
+    let sol_loser = engine.add_account(3).unwrap();
+    engine.deposit(sol_loser, usdc(500)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Set generous domain budgets so spending isn't capped — we only want
+    // to verify ATTRIBUTION, not capping.
+    for d in 0..V14_MAX_PORTFOLIO_ASSETS_N * 2 {
+        engine.group.insurance_domain_budget[d] = usdc(1_000_000);
+    }
+
+    // Generate insurance via fees on BTC (asset 1) — these should NOT be
+    // spent for SOL bankruptcies.
+    for &u in &btc_users {
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, 1, size_q, oracle, 1);
+    }
+    // SOL victim: high-lev long on asset 0
+    let sol_size = usdc(8_000) * POS_SCALE / oracle as u128;
+    engine.trade(sol_loser, lp, 0, sol_size, oracle, 1).unwrap();
+
+    println!("    setup: {} BTC longs + 1 SOL victim (16x lev)", btc_users.len());
+    let ins_initial = engine.group.insurance;
+    println!("    insurance: ${}", ins_initial / USDC_DECIMALS);
+
+    // Domain layout: insurance_domain_index(asset, side) = asset*2 + encode_side(side).
+    // encode_side: Long=0, Short=1.
+    // For bankrupt LONG on asset 0, opposing side = Short → domain = 0*2 + 1 = 1.
+    let dom_sol_long_opp = 1;
+    let dom_btc_long_opp = 3;
+    let dom_btc_short_opp = 2;
+
+    // Slow-keeper SOL crash
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let o1 = oracle;
+    let mut slot = 2u64;
+    for _ in 0..40 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        slot += 1;
+    }
+    println!("    SOL crashed to ${} (-{}%)", o0/1_000_000, (oracle-o0)*100/oracle);
+
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[sol_loser];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[sol_loser] = acc;
+    println!("    sol_loser: cap=${} pnl={} liq_deficit={}",
+        engine.accounts[sol_loser].capital / USDC_DECIMALS,
+        engine.accounts[sol_loser].pnl,
+        engine.accounts[sol_loser].health_cert.certified_liq_deficit);
+
+    let mut liq_out: Option<LiquidationOutcomeV14> = None;
+    if engine.accounts[sol_loser].health_cert.certified_liq_deficit > 0 {
+        let leg = engine.accounts[sol_loser].legs[0];
+        let mut acc = engine.accounts[sol_loser];
+        if let Ok(out) = engine.group.liquidate_account_not_atomic(
+            &mut acc,
+            LiquidationRequestV14 {
+                asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
+            }, &prices,
+        ) {
+            liq_out = Some(out);
+        }
+        engine.accounts[sol_loser] = acc;
+    }
+    if let Some(out) = liq_out {
+        println!("    liq outcome: closed_q={} insurance_used={} residual_booked={} explicit_loss={}",
+            out.closed_q, out.insurance_used, out.residual_booked, out.explicit_loss);
+    } else {
+        println!("    no liquidation triggered");
+    }
+
+    let ins_final = engine.group.insurance;
+    println!("    insurance: ${} → ${} (Δ=${})",
+        ins_initial / USDC_DECIMALS, ins_final / USDC_DECIMALS,
+        (ins_final as i128 - ins_initial as i128) / 1_000_000);
+    let sol_long_opp_spent = engine.group.insurance_domain_spent[dom_sol_long_opp];
+    let btc_long_opp_spent = engine.group.insurance_domain_spent[dom_btc_long_opp];
+    let btc_short_opp_spent = engine.group.insurance_domain_spent[dom_btc_short_opp];
+    println!();
+    println!("    DOMAIN ATTRIBUTION:");
+    println!("      domain[1] SOL long-side opp (where SOL-long bankruptcy charges): spent={}",
+        sol_long_opp_spent);
+    println!("      domain[2] BTC short-side opp:                                    spent={}",
+        btc_short_opp_spent);
+    println!("      domain[3] BTC long-side opp:                                     spent={}",
+        btc_long_opp_spent);
+    println!("    ★ BTC domains untouched: {}",
+        btc_long_opp_spent == 0 && btc_short_opp_spent == 0);
+    println!("    ★ SOL long-opp domain charged: {}", sol_long_opp_spent > 0);
+
+    let sum_btc_cap: u128 = btc_users.iter().map(|&u| engine.accounts[u].capital).sum();
+    println!("    BTC users total cap: ${} (initial $5000, fee loss only)",
+        sum_btc_cap / USDC_DECIMALS);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Test the budget-cap path: set SOL_long_opp domain budget=0, force deficit,
+/// verify insurance_used == 0 (capped) and residual goes elsewhere.
+fn probe_per_domain_budget_cap() {
+    println!("  Per-domain budget cap: SOL_long_opp budget=$0, force deficit");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let mut btc_users = Vec::new();
+    for _ in 0..5 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        btc_users.push(u);
+    }
+    let sol_loser = engine.add_account(3).unwrap();
+    engine.deposit(sol_loser, usdc(500)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Generous budgets EXCEPT for SOL long-opp domain
+    for d in 0..V14_MAX_PORTFOLIO_ASSETS_N * 2 {
+        engine.group.insurance_domain_budget[d] = usdc(1_000_000);
+    }
+    engine.group.insurance_domain_budget[1] = 0; // SOL long-opp (asset 0 short-side dom)
+
+    for &u in &btc_users {
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, 1, size_q, oracle, 1);
+    }
+    let sol_size = usdc(8_000) * POS_SCALE / oracle as u128;
+    engine.trade(sol_loser, lp, 0, sol_size, oracle, 1).unwrap();
+    let ins_initial = engine.group.insurance;
+    println!("    insurance balance: ${} | SOL long-opp budget = $0",
+        ins_initial / USDC_DECIMALS);
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let mut slot = 2u64;
+    for _ in 0..40 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        slot += 1;
+    }
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[sol_loser];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[sol_loser] = acc;
+
+    if engine.accounts[sol_loser].health_cert.certified_liq_deficit > 0 {
+        let leg = engine.accounts[sol_loser].legs[0];
+        let mut acc = engine.accounts[sol_loser];
+        match engine.group.liquidate_account_not_atomic(
+            &mut acc,
+            LiquidationRequestV14 {
+                asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
+            }, &prices,
+        ) {
+            Ok(out) => println!("    liq outcome: closed_q={} insurance_used={} residual_booked={} explicit_loss={}",
+                out.closed_q, out.insurance_used, out.residual_booked, out.explicit_loss),
+            Err(e) => println!("    liq failed: {:?}", e),
+        }
+        engine.accounts[sol_loser] = acc;
+    }
+
+    let sol_long_opp_spent = engine.group.insurance_domain_spent[1];
+    println!("    ★ SOL long-opp domain spent (budget=$0): {} (must be 0)", sol_long_opp_spent);
+    println!("    ★ Budget respected: {}", sol_long_opp_spent == 0);
+    println!("    other BTC domains:  spent[2]={} spent[3]={}",
+        engine.group.insurance_domain_spent[2],
+        engine.group.insurance_domain_spent[3]);
+    println!("    insurance balance: ${} → ${}",
+        ins_initial / USDC_DECIMALS, engine.group.insurance / USDC_DECIMALS);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_domain_attribution() {
+    println!("=== v14 per-domain bankruptcy attribution (empirical verification) ===");
+    probe_per_domain_attribution();
+    println!();
+    probe_per_domain_budget_cap();
+}
+
 /// Probe D: concentrated one-sided OI asset.
 /// An asset where all the OI is on ONE side (no real shorts to ADL against).
 /// Crash the unbalanced side and see if the engine handles it.
@@ -3150,6 +3363,7 @@ fn probe_slow_keeper() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
+        max_bankrupt_close_lifetime_slots: 1000,
     };
     let mut engine = V14Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
@@ -3955,6 +4169,7 @@ fn probe_config_sweep() {
                 full_refresh_required_for_favorable_actions: true,
                 public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
+        max_bankrupt_close_lifetime_slots: 1000,
             };
             if cfg.validate_public_user_fund().is_ok() {
                 max_ok = mid;
@@ -4407,6 +4622,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=hard_ext") {
         run_probes_hard_extended();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=domain_attr") {
+        run_probes_domain_attribution();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
