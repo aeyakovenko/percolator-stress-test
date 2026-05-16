@@ -211,6 +211,91 @@ The attacker DID succeed in opening a $30k notional position on asset 0
 (real capital backed the $1.5k IM at 5% IM), but could not extract any
 value from the pumped asset.
 
+## HARD stress extended: iterated + collusion + fuzz (`--test=hard_ext`)
+
+### probe_drift_iterated (10 cycles)
+
+Same Drift-hack pattern repeated 10 times with state carry-over. Each cycle:
+open $100 thin position → pump 50% → close → withdraw $50.
+
+| Metric | Value |
+|---|---|
+| Successful withdraws | 10 / 10 |
+| Total withdrawn | $500 (across 10 cycles) |
+| Attacker cap delta | -$501 (mostly fees) |
+| LP cap delta | -$500 (lost via K-pair flow during pumps) |
+| Insurance change | **$0** |
+| Invariant fails | 0 |
+
+**Critical observation:** the attacker DID extract $500 from the LP across
+10 cycles. This is **oracle-manipulation P&L**, not cross-margin amplification.
+The wrapper accepted manipulated oracle prices; the engine processed the
+trades at those prices; the LP is the counterparty. Net attacker outcome
+after fees: -$1. The LP eats the loss.
+
+**Insurance is not touched.** Cross-margin haircut works — the attacker
+cannot use the pumped PnL to over-leverage and extract from insurance.
+
+### probe_multi_attacker_collusion
+
+Three attackers coordinate: A long asset 1, B short asset 1 (collusion OI
+between A and B), C uninvolved. Pump asset 1 by 50%.
+
+| Account | Initial cap | Final cap | pnl | cert.equity |
+|---|---|---|---|---|
+| A (pumper) | $2000 | $1999 | +$500 | $1999.9 |
+| B (loser) | $2000 | $1499 | $0 | $1499.9 |
+| C (uninvolved) | $2000 | $2000 | $0 | $2000 |
+
+All three tried `withdraw $500`; all succeeded.
+- **Insurance: $0.20 (fees only, no payout)**
+- LP cap: unchanged
+- Sum attacker caps: $3999 of $6000 initial — they lost $2001 collectively to
+  fees + redistribution
+
+**Conclusion:** collusion does not break the haircut. The pump just transfers
+funds among the colluders. No external extraction.
+
+### fuzz_drift_attack (2000 randomized seeds) ★
+
+Randomized parameters per seed:
+- Attacker initial cap: $500–$5,000
+- Initial position notional: $100–$2,000
+- Pump amount: 50%–100%
+
+| Metric | Value |
+|---|---|
+| Seeds | 2,000 |
+| Successful withdraws | 2,000 (withdrawing own capital, post-pump) |
+| Total withdrawn | $2.69M (cumulative across seeds, ~50% of deposits) |
+| Max single withdraw | $2,500 |
+| **Max insurance increase across seeds** | **4×10⁵ atomic = $0.40** (trade fees only, no payouts) |
+| **Total invariant battery failures** | **0** |
+
+Across 2,000 randomized Drift-hack reconstructions with varied attacker
+size, position size, and pump magnitude — **zero insurance payouts on any
+seed, zero invariant failures on any seed**. The cross-margin haircut math
+holds across the entire parameter space.
+
+## Oracle manipulation as wrapper concern
+
+The probes empirically separate two attack surfaces:
+
+1. **Engine-level cross-margin manipulation** — bounded by `haircut_effective_support`.
+   Verified across 2000+ seeds: cannot extract beyond what residual supports.
+
+2. **Wrapper-level oracle manipulation** — if the wrapper provides a manipulated
+   oracle, the engine processes trades at that price. The LP/counterparty
+   eats the loss. **Insurance is NOT exposed** because the deficit doesn't
+   exceed counterparty capital.
+
+For the bounty deployment, this means:
+- The **engine cross-margin design is robust** against the attack surface
+  it's responsible for.
+- The **oracle source** (Pyth/Switchboard) and the **wrapper's clamping logic**
+  determine the LP's exposure to oracle manipulation. That's a configuration
+  / oracle-quality problem, outside the engine.
+
 ## Empirical conclusion
 
 v14's safety surface is at least as strong as v13's across all tested

@@ -2548,6 +2548,276 @@ fn run_probes_hard_stress() {
     probe_drift_hack_aggressive();
 }
 
+/// Iterated Drift-hack: try the same attack 10 times in a row with state
+/// carry-over. Each cycle: pump → close → try to withdraw → reopen.
+/// Cumulative measure: total extracted vs total cost.
+fn probe_drift_iterated(cycles: u32) {
+    println!("  Drift-hack ITERATED ({} cycles): cumulative extraction test", cycles);
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let attacker = engine.add_account(2).unwrap();
+    let initial_deposit = usdc(2_000);
+    engine.deposit(attacker, initial_deposit).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 2u64;
+    let mut o1 = oracle;
+    let o0 = oracle;
+    let mut total_extracted = 0u128;
+    let mut successful_extracts = 0u32;
+    let mut total_fees = 0u128;
+
+    let initial_lp_cap = engine.accounts[lp].capital;
+    let initial_insurance = engine.group.insurance;
+
+    for cycle in 0..cycles {
+        // Open tiny long on thin asset 1
+        let size_q = usdc(100) * POS_SCALE / o1 as u128;
+        if engine.trade(attacker, lp, 1, size_q, o1, 1).is_err() {
+            continue;
+        }
+        // Pump asset 1 by 50%
+        let target = o1 * 3 / 2;
+        let mut pump_slots = 0;
+        while o1 < target && pump_slots < 200 {
+            let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+            o1 = (o1.saturating_add(d)).min(target);
+            let _ = engine.accrue_asset(0, slot, o0, 0);
+            let _ = engine.accrue_asset(1, slot, o1, 0);
+            slot += 1;
+            pump_slots += 1;
+        }
+        // Close the pumped leg to realize PnL
+        let leg = engine.accounts[attacker].legs[1];
+        if leg.active {
+            let _ = engine.trade(lp, attacker, 1, leg.basis_pos_q.unsigned_abs(), o1, 1);
+        }
+        // Try to withdraw the gain
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[attacker];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[attacker] = acc;
+        let pre_cap = engine.accounts[attacker].capital;
+        let withdraw_amount = usdc(50);
+        let mut acc = engine.accounts[attacker];
+        let r = engine.group.withdraw_not_atomic(&mut acc, withdraw_amount, &prices);
+        engine.accounts[attacker] = acc;
+        if r.is_ok() {
+            successful_extracts += 1;
+            let extracted = pre_cap.saturating_sub(engine.accounts[attacker].capital);
+            total_extracted += extracted;
+        }
+        // Reset oracle (oracle "snaps back" between cycles via slow accrue)
+        // Bring asset 1 back down to oracle level
+        let target_down = oracle;
+        while o1 > target_down {
+            let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+            o1 = o1.saturating_sub(d).max(target_down);
+            let _ = engine.accrue_asset(0, slot, o0, 0);
+            let _ = engine.accrue_asset(1, slot, o1, 0);
+            slot += 1;
+        }
+        if cycle == 0 || cycle == cycles - 1 {
+            println!("    cycle {}: attacker cap=${} pnl={}", cycle,
+                engine.accounts[attacker].capital / USDC_DECIMALS,
+                engine.accounts[attacker].pnl);
+        }
+    }
+    let final_cap = engine.accounts[attacker].capital;
+    let net_loss = initial_deposit as i128 - final_cap as i128;
+    total_fees = if net_loss > 0 { net_loss as u128 } else { 0 };
+    println!("    cycles attempted: {}", cycles);
+    println!("    successful withdraws: {} / {}", successful_extracts, cycles);
+    println!("    total extracted via withdraw: ${}", total_extracted / USDC_DECIMALS);
+    println!("    attacker initial: ${}  final: ${}  delta: {}",
+        initial_deposit / USDC_DECIMALS, final_cap / USDC_DECIMALS,
+        (final_cap as i128 - initial_deposit as i128) / 1_000_000);
+    println!("    LP cap change: {}",
+        (engine.accounts[lp].capital as i128 - initial_lp_cap as i128) / 1_000_000);
+    println!("    insurance change: {}",
+        (engine.group.insurance as i128 - initial_insurance as i128) / 1_000_000);
+    println!("    total fees paid: ${}", total_fees / USDC_DECIMALS);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Multi-attacker collusion: 3 attackers coordinating on the cross-margin
+/// surface. One pumps, one shorts, one tries to extract. Test if joint
+/// activity can break the per-account haircut bound.
+fn probe_multi_attacker_collusion() {
+    println!("  Multi-attacker collusion: 3 attackers coordinating on cross-margin");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let attacker_a = engine.add_account(2).unwrap(); // pumper of asset 1
+    let attacker_b = engine.add_account(3).unwrap(); // counterparty on asset 1
+    let attacker_c = engine.add_account(4).unwrap(); // extractor on asset 0
+    for &u in &[attacker_a, attacker_b, attacker_c] {
+        engine.deposit(u, usdc(2_000)).unwrap();
+    }
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Step 1: attacker_a and attacker_b open opposite positions on asset 1
+    // (so OI is between them, not against LP)
+    let size_q = usdc(1_000) * POS_SCALE / oracle as u128;
+    let r1 = engine.trade(attacker_a, attacker_b, 1, size_q, oracle, 1);
+    if r1.is_err() {
+        println!("    setup failed: {:?}", r1.err());
+        return;
+    }
+    println!("    step 1: A long $1k asset 1, B short $1k asset 1 (collusion OI)");
+
+    // Step 2: pump asset 1 oracle to inflate A's PnL
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o1 = oracle;
+    let target = oracle * 3 / 2;
+    let mut slot = 2u64;
+    let o0 = oracle;
+    while o1 < target {
+        let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+        o1 = (o1.saturating_add(d)).min(target);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        slot += 1;
+    }
+    println!("    step 2: pumped asset 1 from ${} → ${}", oracle / 1_000_000, o1 / 1_000_000);
+
+    // Step 3: A tries to withdraw via cross-margin haircut bypass
+    let prices = engine.effective_prices();
+    for &u in &[attacker_a, attacker_b, attacker_c] {
+        let mut acc = engine.accounts[u];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[u] = acc;
+    }
+
+    println!("    after pump:");
+    for &u in &[attacker_a, attacker_b, attacker_c] {
+        let acc = &engine.accounts[u];
+        println!("      acc {}: cap=${} pnl={} cert.equity={}",
+            u, acc.capital / USDC_DECIMALS, acc.pnl, acc.health_cert.certified_equity);
+    }
+    println!("    engine: residual={} pnl_pos_tot={}",
+        engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance),
+        engine.group.pnl_pos_tot);
+
+    // Step 4: each attacker tries withdrawal
+    for &u in &[attacker_a, attacker_b, attacker_c] {
+        let mut acc = engine.accounts[u];
+        let r = engine.group.withdraw_not_atomic(&mut acc, usdc(500), &prices);
+        engine.accounts[u] = acc;
+        println!("    acc {} withdraw $500: {:?}", u, r.err());
+    }
+
+    // Final accounting
+    let final_total: u128 = [attacker_a, attacker_b, attacker_c]
+        .iter()
+        .map(|&u| engine.accounts[u].capital)
+        .sum();
+    println!("    final attacker cap sum: ${} (initial $6000)", final_total / USDC_DECIMALS);
+    println!("    LP cap: ${} (initial $10M)", engine.accounts[lp].capital / USDC_DECIMALS);
+    println!("    insurance: {}", engine.group.insurance);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Fuzz Drift-hack across 1000 randomized seeds:
+/// - Random pump amount (50% to 100%)
+/// - Random initial position size ($100 to $2000)
+/// - Random attacker capital ($500 to $5000)
+/// Verify zero insurance use and zero invariant failures.
+fn fuzz_drift_attack(n_seeds: u64) {
+    println!("  Drift-attack fuzz: {} randomized seeds", n_seeds);
+    let cfg = make_bounty_config(2);
+    let results: Vec<(u64, u128, i128, u128, u32)> = (0..n_seeds)
+        .into_par_iter()
+        .map(|seed| {
+            let mut rng = Rng::new(seed);
+            let mut engine = V14Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(10_000_000)).unwrap();
+            let attacker_cap = usdc(rng.range_u64(500, 5_000) as u128);
+            let attacker = engine.add_account(2).unwrap();
+            engine.deposit(attacker, attacker_cap).unwrap();
+            let oracle = price_e6(200);
+            let _ = engine.accrue_asset(0, 1, oracle, 0);
+            let _ = engine.accrue_asset(1, 1, oracle, 0);
+
+            // Random initial position on thin asset 1
+            let init_notional = usdc(rng.range_u64(100, 2_000) as u128);
+            let init_size = init_notional * POS_SCALE / oracle as u128;
+            if engine.trade(attacker, lp, 1, init_size, oracle, 1).is_err() {
+                return (seed, 0u128, 0i128, 0u128, 1u32);
+            }
+            // Pump by random pct
+            let pump_pct = rng.range_u64(50, 100);
+            let max_move = cfg.max_price_move_bps_per_slot;
+            let target = oracle.saturating_add((oracle as u128 * pump_pct as u128 / 100) as u64);
+            let mut o1 = oracle;
+            let mut slot = 2u64;
+            let mut pump_steps = 0;
+            while o1 < target && pump_steps < 500 {
+                let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+                o1 = (o1.saturating_add(d)).min(target);
+                let _ = engine.accrue_asset(0, slot, oracle, 0);
+                let _ = engine.accrue_asset(1, slot, o1, 0);
+                slot += 1;
+                pump_steps += 1;
+            }
+            // Try to withdraw
+            let prices = engine.effective_prices();
+            let mut acc = engine.accounts[attacker];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[attacker] = acc;
+            let pre_cap = engine.accounts[attacker].capital;
+            let mut acc = engine.accounts[attacker];
+            let _ = engine.group.withdraw_not_atomic(&mut acc, attacker_cap / 2, &prices);
+            engine.accounts[attacker] = acc;
+            let final_cap = engine.accounts[attacker].capital;
+            let withdrawn = pre_cap.saturating_sub(final_cap);
+            let ins_change = engine.group.insurance as i128 - 0i128;
+            let invariant_fails = run_invariant_battery(&engine);
+            (seed, withdrawn, ins_change, attacker_cap, invariant_fails)
+        })
+        .collect();
+
+    let total_withdrawn: u128 = results.iter().map(|r| r.1).sum();
+    let any_insurance_change: i128 = results.iter().map(|r| r.2).max().unwrap_or(0);
+    let total_invariant_fails: u32 = results.iter().map(|r| r.4).sum();
+    let max_single_extract = results.iter().map(|r| r.1).max().unwrap_or(0);
+    let extracts = results.iter().filter(|r| r.1 > 0).count();
+    let max_initial_cap = results.iter().map(|r| r.3).max().unwrap_or(0);
+    println!("    seeds: {}", results.len());
+    println!("    extractions attempted (withdraw succeeded): {}", extracts);
+    println!("    total withdrawn (sum): ${}", total_withdrawn / USDC_DECIMALS);
+    println!("    max single withdraw: ${}", max_single_extract / USDC_DECIMALS);
+    println!("    max attacker initial cap: ${}", max_initial_cap / USDC_DECIMALS);
+    println!("    max insurance increase across seeds: {}", any_insurance_change);
+    println!("    total invariant battery fails: {}", total_invariant_fails);
+}
+
+fn run_probes_hard_extended() {
+    println!("=== v14 HARD stress extended: iterated drift + collusion + fuzz ===");
+    probe_drift_iterated(10);
+    println!();
+    probe_multi_attacker_collusion();
+    println!();
+    fuzz_drift_attack(2000);
+}
+
 /// Probe D: concentrated one-sided OI asset.
 /// An asset where all the OI is on ONE side (no real shorts to ADL against).
 /// Crash the unbalanced side and see if the engine handles it.
@@ -4127,6 +4397,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=hard") {
         run_probes_hard_stress();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=hard_ext") {
+        run_probes_hard_extended();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
