@@ -442,6 +442,34 @@ i.e., by the protocol's *over-collateralization* relative to all positive-PnL cl
    gain leg settles second → can only partially offset via haircut. Users with
    the most-profitable legs in low-index positions get earlier capital absorption.
 
+### Settlement order is symmetric (verified)
+
+`probe_settle_order_sensitivity` runs the same hedge with the loss either
+on `legs[0]` or `legs[1]`. Both produce **identical** outcomes:
+`cap=$0, pnl=-$501, liq_deficit=$501`. The settle iteration order doesn't
+disadvantage any specific leg ordering — the cap-drain happens regardless.
+
+### Capital scaling: the hedge provides ZERO offset
+
+`probe_xmargin_with_residual` varies user cap from $1k to $100k while
+keeping the position at $5k+$5k (long SOL + long BTC, hedged moves):
+
+| User cap | Portfolio leverage | Outcome | Net value lost |
+|---|---|---|---|
+| $1,000 | 10x | **LIQUIDATABLE** | $1,501 |
+| $5,000 | 2x | HEALTHY | $1,501 |
+| $25,000 | 0.4x | HEALTHY | $1,501 |
+| $100,000 | 0.1x | HEALTHY | $1,501 |
+
+★ **The user always loses $1,501 regardless of capital level.** That's
+exactly the size of the un-offset SOL loss; the BTC gain provides
+essentially zero credit because residual ≈ 0 and the haircut math
+nullifies it.
+
+Users with more capital survive only because they have enough buffer
+to absorb the un-offset loss. **The "hedge" provides no protection
+beyond holding extra capital that would absorb the loss anyway.**
+
 ### Verified vs. claim restatement
 
 So the correct restatement of v14's cross-margin property is:

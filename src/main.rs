@@ -3035,6 +3035,142 @@ fn run_probes_domain_attribution() {
     probe_per_domain_budget_cap();
 }
 
+/// Empirically test the residual-dependent cross-margin offset.
+/// First produce residual by liquidating a few "loser" users, then run the
+/// hedge probe with that residual buffer. Compare results across residual levels.
+fn probe_xmargin_with_residual() {
+    println!("  Cross-margin with residual: hedge behavior at different residual levels");
+    println!();
+
+    for user_cap_usd in [1_000u128, 5_000, 25_000, 100_000] {
+        println!("  --- user cap = ${} ---", user_cap_usd);
+        let cfg = make_bounty_config(2);
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+        let oracle = price_e6(200);
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+        let mut slot = 2u64;
+        let max_move = cfg.max_price_move_bps_per_slot;
+
+        // Main test user with varying capital
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(user_cap_usd)).unwrap();
+        // Position size stays $5k each (so leverage = $10k / cap varies)
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
+        engine.trade(user, lp, 1, size_q, oracle, 1).unwrap();
+        println!("    setup: $10k total notional on ${} cap = {:.1}x portfolio leverage",
+            user_cap_usd, 10_000.0 / user_cap_usd as f64);
+        let initial_residual = engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance);
+        println!("    initial residual: ${}", initial_residual / USDC_DECIMALS);
+
+        // SOL -30%, BTC +30%
+        let mut o_sol = oracle;
+        let mut o_btc = oracle;
+        let t_sol = oracle * 70 / 100;
+        let t_btc = oracle * 130 / 100;
+        while o_sol > t_sol || o_btc < t_btc {
+            if o_sol > t_sol {
+                let d = (o_sol as u128 * max_move as u128 / 10_000) as u64;
+                o_sol = o_sol.saturating_sub(d).max(t_sol);
+            }
+            if o_btc < t_btc {
+                let d = (o_btc as u128 * max_move as u128 / 10_000) as u64;
+                o_btc = (o_btc.saturating_add(d)).min(t_btc);
+            }
+            let _ = engine.accrue_asset(0, slot, o_sol, 0);
+            let _ = engine.accrue_asset(1, slot, o_btc, 0);
+            slot += 1;
+        }
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        let cert = engine.accounts[user].health_cert;
+        let initial_cap = usdc(user_cap_usd);
+        let total_value_lost = (initial_cap as i128) - (engine.accounts[user].capital as i128 + engine.accounts[user].pnl);
+        println!("    after hedged moves: cap=${} pnl={} cert.equity={} liq_deficit={}",
+            engine.accounts[user].capital / USDC_DECIMALS,
+            engine.accounts[user].pnl,
+            cert.certified_equity, cert.certified_liq_deficit);
+        println!("    net value lost: ${} of initial ${}",
+            total_value_lost / 1_000_000, user_cap_usd);
+        let healthy = cert.certified_liq_deficit == 0;
+        println!("    ⇒ {}", if healthy { "HEALTHY ★ (hedge worked)" } else { "LIQUIDATABLE (hedge failed)" });
+        println!();
+    }
+}
+
+/// Settlement order sensitivity: does which leg is at index 0 vs 1 matter?
+fn probe_settle_order_sensitivity() {
+    println!("  Settlement order sensitivity: does leg index assignment matter?");
+    for swap in [false, true] {
+        let cfg = make_bounty_config(2);
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(10_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let oracle = price_e6(200);
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        let (asset_for_losing_long, asset_for_winning_long) = if swap {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        engine.trade(user, lp, asset_for_losing_long, size_q, oracle, 1).unwrap();
+        engine.trade(user, lp, asset_for_winning_long, size_q, oracle, 1).unwrap();
+
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let mut o_losing = oracle;
+        let mut o_winning = oracle;
+        let t_loss = oracle * 70 / 100;
+        let t_win = oracle * 130 / 100;
+        let mut slot = 2u64;
+        while o_losing > t_loss || o_winning < t_win {
+            if o_losing > t_loss {
+                let d = (o_losing as u128 * max_move as u128 / 10_000) as u64;
+                o_losing = o_losing.saturating_sub(d).max(t_loss);
+            }
+            if o_winning < t_win {
+                let d = (o_winning as u128 * max_move as u128 / 10_000) as u64;
+                o_winning = (o_winning.saturating_add(d)).min(t_win);
+            }
+            let _ = engine.accrue_asset(asset_for_losing_long, slot, o_losing, 0);
+            let _ = engine.accrue_asset(asset_for_winning_long, slot, o_winning, 0);
+            slot += 1;
+        }
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        let cert = engine.accounts[user].health_cert;
+        let label = if swap { "loss-on-index-1" } else { "loss-on-index-0" };
+        println!("    {}: cap=${} pnl={} liq_deficit={}",
+            label,
+            engine.accounts[user].capital / USDC_DECIMALS,
+            engine.accounts[user].pnl,
+            cert.certified_liq_deficit);
+    }
+}
+
+fn run_probes_xmargin_deep() {
+    println!("=== v14 cross-margin deep dive: residual + order sensitivity ===");
+    probe_xmargin_with_residual();
+    println!();
+    probe_settle_order_sensitivity();
+}
+
 /// Direct empirical demonstration: a SINGLE user's profitable SOL leg
 /// supports their losing BTC leg's MM. The two probes are:
 ///   (a) baseline: user holds ONLY the losing leg → liquidated
@@ -3229,6 +3365,10 @@ fn probe_xmargin_offset_within_account() {
         engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
         engine.trade(user, lp, 1, size_q, oracle, 1).unwrap();
         println!("    opened: long $5k SOL + long $5k BTC ($1k cap, 10x portfolio)");
+
+        println!("    pre-crash state: vault={} c_tot={} insurance={} residual={}",
+            engine.group.vault, engine.group.c_tot, engine.group.insurance,
+            engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance));
 
         let max_move = cfg.max_price_move_bps_per_slot;
         // SOL crashes 30%, BTC rises 30% — net hedge from the user's perspective
@@ -4870,6 +5010,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=xmargin_within") {
         probe_xmargin_offset_within_account();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=xmargin_deep") {
+        run_probes_xmargin_deep();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
