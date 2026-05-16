@@ -1803,6 +1803,642 @@ fn run_probes_xmargin() {
     probe_xmargin_haircut();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// "Drift-style" attacks: bad assets in the cross-margin portfolio.
+// The Drift Protocol exploit (2021) extracted real value via oracle/asset
+// misconfiguration. Test v14's defenses against similar patterns.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Make a config with N assets where asset 0 is "good" and asset N-1 is
+/// "loose" (low MM, fast moves allowed). Tests whether v14 keeps the bad
+/// asset's bankruptcy contained per-leg.
+fn make_mixed_quality_config(n_assets: u8) -> V14Config {
+    // Use the most conservative (good) config — engine applies same params
+    // across all assets. The "badness" comes from oracle behavior, OI
+    // concentration, or wrapper misconfiguration, not config heterogeneity
+    // (v14 doesn't support per-asset margin params).
+    make_bounty_config(n_assets)
+}
+
+/// Probe A: thin-market asset oracle manipulation.
+/// Asset 0 = legit (LP and many users), asset 1 = thin (only attacker).
+/// Attacker opens position on asset 1; tries to manipulate its oracle to
+/// inflate PnL; checks whether that PnL can support a real loss on asset 0.
+fn probe_thin_market_xmargin() {
+    println!("  Drift-style A: thin asset (1 user, manipulated oracle) supports loss on real asset");
+    let cfg = make_mixed_quality_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    // Set up: asset 0 has many users (legit OI), asset 1 has just the attacker
+    let mut legit_users = Vec::new();
+    for _ in 0..5 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(1_000)).unwrap();
+        legit_users.push(u);
+    }
+    let attacker = engine.add_account(3).unwrap();
+    engine.deposit(attacker, usdc(1_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Legit OI on asset 0 (both sides)
+    for &u in &legit_users {
+        let size_q = usdc(3_000) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, 0, size_q, oracle, 1);
+    }
+
+    // Attacker opens HEDGED position on asset 0 (1x long for real loss exposure)
+    // AND on asset 1 (which they alone hold)
+    let attacker_real_size = usdc(15_000) * POS_SCALE / oracle as u128; // 15x on $1k
+    if engine.trade(attacker, lp, 0, attacker_real_size, oracle, 1).is_err() {
+        println!("    attacker real open FAILED — IM too tight"); return;
+    }
+    // Attacker's thin-market position on asset 1
+    let attacker_thin_size = usdc(5_000) * POS_SCALE / oracle as u128;
+    if engine.trade(attacker, lp, 1, attacker_thin_size, oracle, 1).is_err() {
+        println!("    attacker thin open FAILED"); return;
+    }
+    println!("    attacker: long $15k asset 0 (real OI) + long $5k asset 1 (thin, just them + LP)");
+    println!("    asset 1 OI: long={} short={} (LP is the only short)",
+        engine.group.assets[1].oi_eff_long_q,
+        engine.group.assets[1].oi_eff_short_q);
+
+    // Attacker tries to manipulate asset 1 oracle: push price up gradually.
+    // Each crank, asset 1 goes up envelope-max; asset 0 stays flat.
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let mut o1 = oracle;
+    let mut slot = 2u64;
+    for _ in 0..200 {
+        let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+        o1 = o1.saturating_add(d);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        slot += 1;
+    }
+    println!("    after 200 slots: o0=${} (unchanged), o1=${} (+{}%)",
+        o0 / 1_000_000, o1 / 1_000_000, (o1 - oracle) * 100 / oracle);
+
+    // Refresh attacker's account
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[attacker];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[attacker] = acc;
+
+    println!("    attacker post-manipulation:");
+    println!("      face pnl: {}", engine.accounts[attacker].pnl);
+    println!("      cert.equity (haircut): {}", engine.accounts[attacker].health_cert.certified_equity);
+    println!("      cert.mm_req: {}", engine.accounts[attacker].health_cert.certified_maintenance_req);
+    println!("      cert.liq_deficit: {}", engine.accounts[attacker].health_cert.certified_liq_deficit);
+    println!("      residual: {}", engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance));
+    println!("      pnl_pos_tot: {}", engine.group.pnl_pos_tot);
+
+    // Now crash asset 0 (where attacker has real long exposure)
+    o0 = oracle;
+    let mut total_liq = 0u32;
+    let mut total_ins = 0u128;
+    for _ in 0..200 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+
+        // Liquidate any account with deficit
+        let prices = engine.effective_prices();
+        for &u in std::iter::once(&attacker).chain(legit_users.iter()) {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                let mut best = (0usize, 0u128);
+                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                    let leg = engine.accounts[u].legs[li];
+                    if leg.active {
+                        let a = leg.basis_pos_q.unsigned_abs();
+                        if a > best.1 { best = (li, a); }
+                    }
+                }
+                if best.1 > 0 {
+                    let mut acc = engine.accounts[u];
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV14 {
+                            asset_index: best.0,
+                            close_q: best.1,
+                            fee_bps: 5,
+                        },
+                        &prices,
+                    ) {
+                        total_liq += 1;
+                        total_ins += out.insurance_used;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    after crash: o0=${} (-{}%)", o0 / 1_000_000, (oracle - o0) * 100 / oracle);
+    println!("    total liquidations: {}", total_liq);
+    println!("    total insurance used: {}", total_ins);
+    println!("    attacker final cap=${} pnl={} legs={}",
+        engine.accounts[attacker].capital / USDC_DECIMALS,
+        engine.accounts[attacker].pnl,
+        engine.accounts[attacker].active_bitmap.count_ones());
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Probe B: phantom-PnL extraction attempt.
+/// Attacker opens 2 legs. Tries to use the profitable leg's PnL to support
+/// the losing leg, while extracting capital before the losing leg gets
+/// liquidated. v14 haircut should bound the extraction.
+fn probe_phantom_pnl_extract() {
+    println!("  Drift-style B: profitable leg supports losing leg, attempt extraction");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let attacker = engine.add_account(2).unwrap();
+    engine.deposit(attacker, usdc(2_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Long asset 0 ($8k) + Short asset 1 ($8k) — hedged at portfolio level
+    let size_q = usdc(8_000) * POS_SCALE / oracle as u128;
+    engine.trade(attacker, lp, 0, size_q, oracle, 1).unwrap();
+    engine.trade(lp, attacker, 1, size_q, oracle, 1).unwrap();
+    println!("    opened: long $8k asset 0 + short $8k asset 1");
+
+    // Asset 0 crashes (long loses), asset 1 ALSO crashes (short profits!)
+    // Net effect on attacker: hedge holds up, MM stays satisfied
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o = oracle;
+    let mut slot = 2u64;
+    for _ in 0..100 {
+        let d = (o as u128 * max_move as u128 / 10_000) as u64;
+        o = o.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o, 0);
+        let _ = engine.accrue_asset(1, slot, o, 0); // both crash together
+        slot += 1;
+    }
+    println!("    after 100 slots: both oracles=${}", o / 1_000_000);
+
+    // Refresh
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[attacker];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[attacker] = acc;
+
+    println!("    after hedged crash:");
+    println!("      cap=${}  pnl={}  cert.equity={}",
+        engine.accounts[attacker].capital / USDC_DECIMALS,
+        engine.accounts[attacker].pnl,
+        engine.accounts[attacker].health_cert.certified_equity);
+    println!("      legs[0]={} legs[1]={}",
+        engine.accounts[attacker].legs[0].active,
+        engine.accounts[attacker].legs[1].active);
+
+    // Try to withdraw the "profit" from short leg
+    let mut acc = engine.accounts[attacker];
+    let r = engine.group.withdraw_not_atomic(&mut acc, usdc(500), &prices);
+    engine.accounts[attacker] = acc;
+    println!("    withdraw $500 attempt: {:?}", r);
+    if r.is_ok() {
+        println!("      post-withdraw cap=${}", engine.accounts[attacker].capital / USDC_DECIMALS);
+    }
+
+    // Now ONLY asset 0 keeps crashing (no more hedge)
+    let mut o0 = o;
+    let o1_stable = o;
+    let mut total_liq = 0u32;
+    let mut total_ins = 0u128;
+    for _ in 0..200 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1_stable, 0);
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[attacker];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[attacker] = acc;
+        if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
+            let mut best = (0usize, 0u128);
+            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                let leg = engine.accounts[attacker].legs[li];
+                if leg.active {
+                    let a = leg.basis_pos_q.unsigned_abs();
+                    if a > best.1 { best = (li, a); }
+                }
+            }
+            if best.1 > 0 {
+                let mut acc = engine.accounts[attacker];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV14 {
+                        asset_index: best.0,
+                        close_q: best.1,
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liq += 1;
+                    total_ins += out.insurance_used;
+                }
+                engine.accounts[attacker] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    after asset-0 sole crash to ${}: liqs={} ins_used={}",
+        o0 / 1_000_000, total_liq, total_ins);
+    println!("    attacker final cap=${} pnl={}",
+        engine.accounts[attacker].capital / USDC_DECIMALS,
+        engine.accounts[attacker].pnl);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Probe C: oracle-divergence attack.
+/// Attacker exploits a slow oracle update on asset 1 while asset 0 is
+/// crashing. Asset 1 oracle stays stale (artificially high), inflating
+/// the perceived value of the short hedge.
+fn probe_oracle_divergence() {
+    println!("  Drift-style C: stale oracle on one asset inflates hedge value");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let attacker = engine.add_account(2).unwrap();
+    engine.deposit(attacker, usdc(2_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    let size_q = usdc(8_000) * POS_SCALE / oracle as u128;
+    engine.trade(attacker, lp, 0, size_q, oracle, 1).unwrap();
+    engine.trade(lp, attacker, 1, size_q, oracle, 1).unwrap();
+
+    // Crash asset 0, but only accrue asset 1 OCCASIONALLY (keeper laziness on asset 1)
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let mut o1 = oracle;
+    let mut slot = 2u64;
+    let mut acc_failures = 0u32;
+    for step in 0..200 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        // Asset 1 oracle "stays stale" — wrapper only accrues every 20 slots
+        if step % 20 == 0 {
+            // when we DO accrue, asset 1 has actually moved (correlated with 0)
+            o1 = o0; // perfectly correlated in reality, but engine doesn't know
+            let r = engine.accrue_asset(1, slot, o1, 0);
+            if r.is_err() { acc_failures += 1; }
+        }
+        slot += 1;
+    }
+    println!("    after 200 slots: asset 0 oracle=${}, asset 1 engine-effective=${}",
+        engine.group.assets[0].effective_price / 1_000_000,
+        engine.group.assets[1].effective_price / 1_000_000);
+    println!("    asset 1 raw_oracle_target=${}", engine.group.assets[1].raw_oracle_target_price / 1_000_000);
+    println!("    accrue failures on asset 1: {}", acc_failures);
+
+    // Try to refresh/exit attacker — should be blocked by target_effective_lag
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[attacker];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let r_refresh = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[attacker] = acc;
+    println!("    refresh after divergence: {:?}", r_refresh.is_ok());
+
+    // Try withdrawal — should be blocked if cross-asset lag is detected
+    let mut acc = engine.accounts[attacker];
+    let r_withdraw = engine.group.withdraw_not_atomic(&mut acc, usdc(500), &prices);
+    engine.accounts[attacker] = acc;
+    println!("    withdraw $500: {:?}", r_withdraw);
+
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+fn run_probes_drift() {
+    println!("=== v14 Drift-style bad-asset cross-margin attacks ===");
+    probe_thin_market_xmargin();
+    println!();
+    probe_phantom_pnl_extract();
+    println!();
+    probe_oracle_divergence();
+    println!();
+    probe_concentrated_one_sided_oi();
+    println!();
+    probe_pump_and_withdraw();
+    println!();
+    probe_cross_asset_contagion();
+}
+
+/// Probe D: concentrated one-sided OI asset.
+/// An asset where all the OI is on ONE side (no real shorts to ADL against).
+/// Crash the unbalanced side and see if the engine handles it.
+fn probe_concentrated_one_sided_oi() {
+    println!("  Drift-style D: one-sided OI (all longs, no shorts to ADL against)");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    // 10 longs on asset 1, all using cross-margin support from asset 0 LP-short
+    let mut longs = Vec::new();
+    for _ in 0..10 {
+        let u = engine.add_account(2).unwrap();
+        engine.deposit(u, usdc(500)).unwrap();
+        longs.push(u);
+    }
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Every user goes LONG asset 1 (no shorts on this side — LP eats all the short)
+    for &u in &longs {
+        let size_q = usdc(2_500) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(u, lp, 1, size_q, oracle, 1);
+    }
+    println!("    opened 10 longs on asset 1, total notional=$25k, all against LP");
+    println!("    asset 1 OI: long={} short={}",
+        engine.group.assets[1].oi_eff_long_q,
+        engine.group.assets[1].oi_eff_short_q);
+
+    // Crash asset 1 (the one-sided side)
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o1 = oracle;
+    let o0 = oracle;
+    let mut slot = 2u64;
+    let mut total_liq = 0u32;
+    let mut total_ins = 0u128;
+    let mut total_res = 0u128;
+    for _ in 0..400 {
+        let d = (o1 as u128 * max_move as u128 / 10_000) as u64;
+        o1 = o1.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+
+        let prices = engine.effective_prices();
+        for &u in &longs {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                let leg = engine.accounts[u].legs[1];
+                if leg.active {
+                    let mut acc = engine.accounts[u];
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV14 {
+                            asset_index: 1,
+                            close_q: leg.basis_pos_q.unsigned_abs(),
+                            fee_bps: 5,
+                        },
+                        &prices,
+                    ) {
+                        total_liq += 1;
+                        total_ins += out.insurance_used;
+                        total_res += out.residual_booked;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    after 400-slot crash: oracle 1=${} (-{}%)",
+        o1 / 1_000_000, (oracle - o1) * 100 / oracle);
+    println!("    total liquidations: {}", total_liq);
+    println!("    insurance used: {}", total_ins);
+    println!("    residual booked: {}", total_res);
+    println!("    asset 1 side modes: long={:?} short={:?}",
+        engine.group.assets[1].mode_long, engine.group.assets[1].mode_short);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Probe E: pump-and-withdraw with cross-margin offset.
+/// Attacker opens 2 legs at OPPOSITE directions. Moves one favorably,
+/// closes it instantly, withdraws "profit". Then market reverses,
+/// other leg goes deep underwater. Net: did attacker extract value?
+fn probe_pump_and_withdraw() {
+    println!("  Drift-style E: pump-and-withdraw — close profitable leg, leave losing leg");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let attacker = engine.add_account(2).unwrap();
+    engine.deposit(attacker, usdc(1_000)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Long asset 0 + short asset 1 (hedged)
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(attacker, lp, 0, size_q, oracle, 1).unwrap();
+    engine.trade(lp, attacker, 1, size_q, oracle, 1).unwrap();
+    println!("    opened: long $5k asset 0 + short $5k asset 1");
+
+    // Move ONLY asset 0 up 10% (long profitable, short flat)
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let o1 = oracle;
+    let mut slot = 2u64;
+    let target = oracle + oracle / 10;
+    while o0 < target {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = (o0.saturating_add(d)).min(target);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        slot += 1;
+    }
+
+    let prices = engine.effective_prices();
+    let mut acc = engine.accounts[attacker];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[attacker] = acc;
+    println!("    after asset 0 +10%: cap=${} pnl={} cert.equity={}",
+        engine.accounts[attacker].capital / USDC_DECIMALS,
+        engine.accounts[attacker].pnl,
+        engine.accounts[attacker].health_cert.certified_equity);
+
+    // Attacker tries to close ONLY the profitable leg
+    let leg0 = engine.accounts[attacker].legs[0];
+    let close_r = engine.trade(lp, attacker, 0, leg0.basis_pos_q.unsigned_abs(), o0, 1);
+    println!("    close profitable long: {:?}", close_r.map(|_|()).err());
+
+    // Now refresh + try to withdraw the "profit"
+    let mut acc = engine.accounts[attacker];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+    engine.accounts[attacker] = acc;
+    println!("    after closing leg 0: cap=${} pnl={} legs_active={}",
+        engine.accounts[attacker].capital / USDC_DECIMALS,
+        engine.accounts[attacker].pnl,
+        engine.accounts[attacker].active_bitmap.count_ones());
+
+    let mut acc = engine.accounts[attacker];
+    let r_w = engine.group.withdraw_not_atomic(&mut acc, usdc(400), &prices);
+    engine.accounts[attacker] = acc;
+    println!("    withdraw $400: {:?}", r_w);
+
+    // Now asset 1 (still open short) gets crushed (reversal)
+    let mut o1_mut = o1;
+    let mut total_liq = 0u32;
+    let mut total_ins = 0u128;
+    for _ in 0..200 {
+        let d = (o1_mut as u128 * max_move as u128 / 10_000) as u64;
+        o1_mut = o1_mut.saturating_add(d); // asset 1 goes UP → short losing
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1_mut, 0);
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[attacker];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[attacker] = acc;
+        if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
+            let leg = engine.accounts[attacker].legs[1];
+            if leg.active {
+                let mut acc = engine.accounts[attacker];
+                if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                    &mut acc,
+                    LiquidationRequestV14 {
+                        asset_index: 1,
+                        close_q: leg.basis_pos_q.unsigned_abs(),
+                        fee_bps: 5,
+                    },
+                    &prices,
+                ) {
+                    total_liq += 1;
+                    total_ins += out.insurance_used;
+                }
+                engine.accounts[attacker] = acc;
+            }
+        }
+        slot += 1;
+    }
+    println!("    after asset 1 rises (+{}%): liqs={} ins_used={}",
+        (o1_mut - oracle) * 100 / oracle, total_liq, total_ins);
+    println!("    attacker final cap=${} pnl={}",
+        engine.accounts[attacker].capital / USDC_DECIMALS,
+        engine.accounts[attacker].pnl);
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
+/// Probe F: cross-asset contagion.
+/// User A bankrupts on asset 0. User B has positions on asset 1.
+/// Verify B's account is NOT affected by A's bankruptcy (per-leg attribution).
+fn probe_cross_asset_contagion() {
+    println!("  Drift-style F: bankruptcy on asset 0 does NOT contaminate asset 1 holders");
+    let cfg = make_bounty_config(2);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+
+    let asset0_user = engine.add_account(2).unwrap();
+    engine.deposit(asset0_user, usdc(500)).unwrap();
+    let asset1_user = engine.add_account(3).unwrap();
+    engine.deposit(asset1_user, usdc(500)).unwrap();
+
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // asset0_user: high-lev long on asset 0
+    let size_q = usdc(8_000) * POS_SCALE / oracle as u128;
+    engine.trade(asset0_user, lp, 0, size_q, oracle, 1).unwrap();
+    // asset1_user: low-lev long on asset 1
+    let size_q2 = usdc(1_000) * POS_SCALE / oracle as u128;
+    engine.trade(asset1_user, lp, 1, size_q2, oracle, 1).unwrap();
+    println!("    asset0_user: 16x long on asset 0");
+    println!("    asset1_user: 2x long on asset 1");
+    let asset1_user_initial_cert = engine.accounts[asset1_user].health_cert.certified_equity;
+
+    // Crash asset 0 hard
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o0 = oracle;
+    let o1 = oracle;
+    let mut slot = 2u64;
+    let mut total_liq = 0u32;
+    let mut total_ins = 0u128;
+    let mut total_res = 0u128;
+    for _ in 0..200 {
+        let d = (o0 as u128 * max_move as u128 / 10_000) as u64;
+        o0 = o0.saturating_sub(d).max(1);
+        let _ = engine.accrue_asset(0, slot, o0, 0);
+        let _ = engine.accrue_asset(1, slot, o1, 0);
+        let prices = engine.effective_prices();
+        for &u in &[asset0_user, asset1_user] {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+            if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                let mut best = (0usize, 0u128);
+                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                    let leg = engine.accounts[u].legs[li];
+                    if leg.active {
+                        let a = leg.basis_pos_q.unsigned_abs();
+                        if a > best.1 { best = (li, a); }
+                    }
+                }
+                if best.1 > 0 {
+                    let mut acc = engine.accounts[u];
+                    if let Ok(out) = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV14 {
+                            asset_index: best.0,
+                            close_q: best.1,
+                            fee_bps: 5,
+                        },
+                        &prices,
+                    ) {
+                        total_liq += 1;
+                        total_ins += out.insurance_used;
+                        total_res += out.residual_booked;
+                    }
+                    engine.accounts[u] = acc;
+                }
+            }
+        }
+        slot += 1;
+    }
+    println!("    asset 0 crashed to ${} (-{}%)", o0 / 1_000_000, (oracle - o0) * 100 / oracle);
+    println!("    liqs={} ins_used={} residual={}", total_liq, total_ins, total_res);
+    println!("    asset0_user final: cap=${} pnl={}",
+        engine.accounts[asset0_user].capital / USDC_DECIMALS,
+        engine.accounts[asset0_user].pnl);
+    println!("    asset1_user final: cap=${} pnl={} cert.equity_change={}",
+        engine.accounts[asset1_user].capital / USDC_DECIMALS,
+        engine.accounts[asset1_user].pnl,
+        engine.accounts[asset1_user].health_cert.certified_equity - asset1_user_initial_cert);
+    println!("    asset 1 still functional: legs={}",
+        engine.accounts[asset1_user].active_bitmap.count_ones());
+    println!("    invariants: {:?} | battery fails: {}",
+        engine.assert_invariants().err(), run_invariant_battery(&engine));
+}
+
 fn run_probes_v12_corner_cases() {
     println!("=== v14 corner-case probes ported from v12 ===");
     probe_adl_drain_reset();
@@ -3084,6 +3720,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=xmargin") {
         run_probes_xmargin();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=drift") {
+        run_probes_drift();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {

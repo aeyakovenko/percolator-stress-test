@@ -114,6 +114,34 @@ The v13 audit findings carry over:
    asset A's long side does not socialize loss across asset B's longs.
    Per-leg attribution is preserved by spec §5 design.
 
+## Drift-style bad-asset attacks (`--test=drift`)
+
+The Drift Protocol exploit (2021) extracted real value via oracle/asset
+configuration vulnerabilities. v14's cross-margin design introduces a
+new theoretical surface for similar attacks: a bad/manipulable asset in
+the portfolio could be used to inflate equity that supports real losses
+on other assets. Six probes target this surface:
+
+| Probe | What it tests | Result |
+|---|---|---|
+| **A: thin-market** | Attacker holds majority of OI on asset 1; tries to manipulate its oracle | Open on attacker's "thin" leg failed — IM check blocks over-leverage across the portfolio |
+| **B: phantom PnL** | Hedged long+short across 2 assets, correlated crash; tries to extract via withdraw | Hedge worked correctly during 36% correlated crash (cap preserved). Withdraw allowed when account was actually healthy. Subsequent reversal caused real loss with 0 insurance use. |
+| **C: stale oracle ★** | Asset 0 crashes 60%; wrapper updates asset 1 oracle only every 20 slots (lazy keeper on asset 1) | **Withdraw blocked with `LockActive` due to oracle divergence between raw_oracle_target_price and effective_price.** The v14 `target_effective_lag` defense is what gates this. |
+| **D: one-sided OI** | 10 longs on asset 1 (all against LP, no real shorts); 83% crash | 10 clean liquidations, 0 insurance used, 0 residual. Engine's §1.4 envelope handles one-sided OI via LP-as-counterparty. |
+| **E: pump-and-withdraw** | Pump one leg, close+withdraw profit, let opposing leg blow up | Attacker withdrew $400 of capital when system was healthy; reverse move caused liquidation with 0 insurance use. Net attacker loss $330 on $1000 deposit. |
+| **F: cross-asset contagion** | One user bankrupts on asset 0; verify another user on asset 1 is unaffected | asset1_user's `cert.equity_change = 0` after asset0_user's bankruptcy. **Per-leg attribution preserves the `does_not_create_global_B_domain` invariant.** |
+
+**Headline finding (Probe C):** v14's `target_effective_lag` defense is
+the primary protection against oracle-divergence attacks on the cross-margin
+account equity. Any leg with a stale-vs-target oracle gate blocks all
+favorable actions (withdraw, convert PnL, close-favorably) on the entire
+account. This is the strongest defense against "Drift-style" extraction.
+
+**Per-leg attribution (Probe F):** v14's bankruptcy residual booking
+stays per-leg-attributed. Cross-margin gives equity benefits but NOT
+loss-sharing. An attacker who bankrupts on a bad asset cannot drag down
+healthy users on other assets.
+
 ## Empirical conclusion
 
 v14's safety surface is at least as strong as v13's across all tested
