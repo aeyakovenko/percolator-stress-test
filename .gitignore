@@ -1,2 +1,5 @@
-/target
-/stress_out
+target/
+stress_out_*/
+/tmp/
+*.bak
+.claude/
