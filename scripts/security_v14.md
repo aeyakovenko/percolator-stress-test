@@ -369,6 +369,94 @@ asset's `(asset, opposing_side)` insurance domain. Other assets'
 domains are not touched. Per-domain budgeting provides an additional
 operator-configurable cap on per-domain exposure.
 
+## Within-account cross-margin: empirical bounds (`--test=xmargin_within`)
+
+Tests whether a single user's profitable leg actually offsets their losing
+leg, as the spec implies. Setup: $1000 cap, long $5k on each of asset A and
+asset B.
+
+| Case | Asset A move | Asset B move | Expected | Actual |
+|---|---|---|---|---|
+| a | -20% (long A loses) | n/a | LIQUIDATABLE | cap=$0 pnl=-$500 deficit=$500 ✓ |
+| b | -20% (long A loses $1000) | -20% (short B gains $1000) | Healthy (net 0) | **cap=$0 pnl=-$1 deficit=$1** ★ |
+| c | -20% (long A loses) | +20% (short B loses) | Liquidatable (both lose) | cap=$0 pnl=-$1001 deficit=$1001 ✓ |
+| d | -30% (long A loses $1500) | +30% (long B gains $1500) | Healthy (net 0) | **cap=$0 pnl=-$501 deficit=$501** ★ |
+
+★ Surprising: cases (b) and (d) have **net-zero portfolio PnL** but the user
+is still liquidatable with capital fully drained.
+
+### Why: settlement order × residual-bounded haircut
+
+Tracing the engine flow (line numbers in `src/v14.rs`):
+
+1. `settle_leg_kf_effects` iterates legs in index order.
+2. **Losing leg settles first**: `apply_haircut_bounded_close_loss_to_pnl`
+   (line 4225) sets `account.pnl = -$1500` (cap untouched yet).
+3. **Profitable leg settles second**: `apply_signed_kf_delta_to_pnl` with
+   delta=+$1500 detects `account.pnl < 0` and calls `haircut_effective_support`
+   (line 4324) to compute how much of the +$1500 can offset the -$1500 loss.
+   - `effective_available = haircut(face_claim, residual, junior_bound)`
+   - **`residual = vault − c_tot − insurance`** — in a market where the LP
+     deposited and that deposit became their capital, c_tot ≈ vault → residual ≈ 0
+   - So `effective_available ≈ 0`: the +$1500 face support contributes
+     ~$0 to offsetting the loss.
+   - Line 4335-4337: if `remaining_loss != 0`, **all of `new_face_support`
+     is junior-burned**, so the +$1500 is fully consumed but barely
+     offsets anything.
+4. End-of-settle: `settle_negative_pnl_from_principal` drains the remaining
+   loss from capital. cap=$1000 → $0, pnl=-$500 (residual loss after cap exhaustion).
+
+### What this means
+
+**Cross-margin offset works in principle, but is bounded by `residual / junior_bound`** —
+i.e., by the protocol's *over-collateralization* relative to all positive-PnL claims.
+
+| System state | Cross-margin offset effective? |
+|---|---|
+| `residual >= junior_bound` (well-collateralized protocol) | Full face value of positive PnL offsets losses |
+| `residual < junior_bound` (tight) | Pro-rated: only `face × residual / junior_bound` offsets |
+| `residual ≈ 0` (LP capital ≈ total deposits) | **Effectively zero offset** (verified in cases b/d) |
+| `residual = 0` exactly | Engine returns `LockActive` on the haircut call |
+
+### Implications
+
+1. **The spec claim — "PnL from one leg may support losses on another" — is
+   technically true but conditional.** It requires the system to have
+   excess equity (residual) backing those claims.
+
+2. **For the bounty deployment**, the practical implication is:
+   - During calm markets with substantial insurance + LP buffer, cross-margin
+     offsets work as advertised
+   - During stress where the protocol is at-the-margin (residual near zero),
+     cross-margin offsets are *not* available; the system effectively reverts
+     to per-leg margin
+   - This is consistent with the v14.12 spec's design intent: *"no leg-local
+     paper profit may become unbooked senior value"*
+
+3. **A user who deposits $1000 and opens hedged $5k long-A + $5k short-B
+   positions is NOT guaranteed cross-margin offset** if the protocol's residual
+   is tight. Their cap can be drained by the K-pair settlement order even when
+   their net portfolio PnL is zero.
+
+4. **Settlement order matters.** Loss leg settles first → drains capital;
+   gain leg settles second → can only partially offset via haircut. Users with
+   the most-profitable legs in low-index positions get earlier capital absorption.
+
+### Verified vs. claim restatement
+
+So the correct restatement of v14's cross-margin property is:
+
+> Within a `PortfolioAccount`, positive PnL on one leg may support a loss
+> on another leg, but **only through the haircut-bounded support
+> mechanism** `effective_support = face_claim × residual / junior_bound`.
+> When the protocol's residual approaches zero, cross-margin offset is
+> effectively unavailable. Cross-margin is **not** an unconditional
+> hedge — it is a conditional offset gated by global junior solvency.
+
+This is empirically distinct from a "true cross-margin" system where any
+two legs can perfectly hedge. v14's cross-margin is a *bounded* form
+designed to prevent leg-local paper profit from being treated as senior.
+
 ## Empirical conclusion
 
 v14's safety surface is at least as strong as v13's across all tested
