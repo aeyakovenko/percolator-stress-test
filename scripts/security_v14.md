@@ -142,6 +142,75 @@ stays per-leg-attributed. Cross-margin gives equity benefits but NOT
 loss-sharing. An attacker who bankrupts on a bad asset cannot drag down
 healthy users on other assets.
 
+## HARD stress: 10/10 + aggressive Drift-hack (`--test=hard`)
+
+### probe_ten10_single_asset
+
+50 users × 9x leverage long on a single 10x-leverage market. Oracle crashes
+10% in 12 envelope-max slots, then continues to a total 50% crash.
+
+| Metric | Value |
+|---|---|
+| Liquidations | 50 (one per user, in time) |
+| Insurance used | **0** |
+| Residual booked | **0** |
+| Explicit loss | **0** |
+| Sum user cap (initial $50k) | $41,670 (~17% from fees + position close) |
+| Min user cap | $833 (no one fully bankrupted) |
+| LP capital change | $9.999955M ≈ unchanged (just fees) |
+| Side modes | both Normal throughout |
+
+The §1.4 envelope at 10x leverage allows max_move=90 bps/slot → engine catches
+all bankruptcies before deficit. No DrainOnly transitions, no ADL needed.
+
+### probe_ten10_cross_margin
+
+30 users × 3 legs on 3 assets at ~4.5x portfolio leverage. Only asset 0
+crashes 10%.
+
+| Metric | Value |
+|---|---|
+| Liquidations | **0** |
+| Insurance used | **0** |
+| Sum user cap loss | ~$9k of $60k (crash loss on asset 0 + fees) |
+| Avg active legs per user | 3 (no legs liquidated) |
+
+**Cross-margin diversification protects users.** A 10% drop on 1/3 of each
+user's exposure is a 3.3% portfolio loss — well within the 10% MM buffer.
+Zero liquidations triggered.
+
+### probe_drift_hack_aggressive ★
+
+Reconstructs the Drift Protocol attack pattern: pump a thin-market asset's
+oracle to inflate cross-margin equity, then attempt extraction.
+
+Setup:
+- 5 bystanders with legitimate $5k longs on asset 0
+- Attacker opens **$500 long on thin asset 1** (attacker is the only long; LP is sole counterparty)
+- Attacker pumps asset 1 oracle envelope-max for 155 slots: **$200 → $400 (+100%)**
+- Attacker's face PnL on asset 1 = **+$500** (100% of $500 notional)
+
+Observed cross-margin behavior:
+- `face_pnl = $500` (correctly tracked)
+- `cert.equity = $1999.95` (≈ capital only — **PnL haircut to near zero**)
+- `residual ≈ $0` (only ~$4 of vault excess over c_tot + insurance)
+- `pnl_pos_tot = $500` (junior bound)
+- haircut(500, 4, 500) ≈ $4 of effective support — **>99% of face PnL is haircut away**
+
+Extraction attempts:
+1. `withdraw $2000` → **`LockActive`** (insufficient equity beyond capital)
+2. Close the profitable thin leg to realize PnL (which succeeded as a trade)
+3. `withdraw $2000` post-close → **`LockActive`** still
+4. **Final: attacker ended with $1996, having lost ~$4 to fees**
+
+The defining v14 cross-margin guarantee — **no leg-local paper profit
+becomes withdrawable senior value** — holds even against an attacker
+who fully controls the oracle on a thin asset.
+
+The attacker DID succeed in opening a $30k notional position on asset 0
+(real capital backed the $1.5k IM at 5% IM), but could not extract any
+value from the pumped asset.
+
 ## Empirical conclusion
 
 v14's safety surface is at least as strong as v13's across all tested
