@@ -3171,6 +3171,389 @@ fn run_probes_xmargin_deep() {
     probe_settle_order_sensitivity();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// CAPITAL EFFICIENCY in normal-market conditions
+//
+// What's "normal"? Realistic perp markets:
+//   - Daily moves ±1-3% on majors (BTC, ETH, SOL)
+//   - Occasional 5-10% swings
+//   - No sustained crashes (different from stress tests)
+//   - 30-day windows with steady state activity
+//
+// Measure:
+//   - Max sustainable leverage (where users survive normal market noise)
+//   - Fee drag as % of capital per "month"
+//   - Diversification benefit (does multi-asset reduce liquidation rate?)
+//   - Capital utilization efficiency
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Generates a realistic price walk: small daily moves with occasional bigger
+/// swings. Returns the price path normalized so endpoint ≈ start.
+fn realistic_price_walk(rng: &mut Rng, start: u64, steps: u64, vol_bps_per_step: u64) -> Vec<u64> {
+    let mut path = Vec::with_capacity(steps as usize);
+    let mut o = start;
+    for _ in 0..steps {
+        // Uniform sample in [0, 2X). Subtract X to get [-X, X) signed.
+        let r_unsigned = rng.next_u64() % (2 * vol_bps_per_step + 1);
+        let r = (r_unsigned as i64) - (vol_bps_per_step as i64);
+        let move_bps = r.unsigned_abs() as u64;
+        let move_amount = (o as u128 * move_bps as u128 / 10_000) as u64;
+        if r >= 0 {
+            o = o.saturating_add(move_amount);
+        } else {
+            o = o.saturating_sub(move_amount).max(1);
+        }
+        path.push(o);
+    }
+    path
+}
+
+/// Single user, single asset, normal market. Measure fee drag and survival rate.
+///
+/// Volatility calibration: for a 30-day window with ~15% total volatility
+/// and 7000 ticks, per-tick σ should be 15% / √7000 ≈ 18 bps. Since the
+/// distribution is uniform[-X, +X] with σ = X/√3, X ≈ 30 bps.
+fn probe_capital_efficiency_single_asset(seeds: u64) {
+    println!("  Single-asset capital efficiency: 1 user × {} seeds × ~30 day window", seeds);
+    let cfg = make_bounty_config(1);
+    let total_slots = 7000;
+    let daily_vol_bps = 30; // ~30 bps per tick → ~15% total over 7000 ticks (realistic)
+
+    let leverages = [2u64, 5, 10, 15];
+    println!();
+    println!("    leverage | survival% | avg fee drag % | avg pnl %");
+    println!("    ---------|-----------|----------------|----------");
+    for lev in leverages {
+        let mut early_failures = 0u32;
+        let results: Vec<(bool, i128, u128)> = (0..seeds).into_par_iter().map(|seed| {
+            let mut engine = V14Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(10_000_000)).unwrap();
+            let user = engine.add_account(2).unwrap();
+            let initial_cap = usdc(1_000);
+            engine.deposit(user, initial_cap).unwrap();
+            let oracle = price_e6(200);
+            engine.accrue_asset(0, 1, oracle, 0).unwrap();
+            let notional = usdc(1_000) * lev as u128;
+            let size_q = notional * POS_SCALE / oracle as u128;
+            if engine.trade(user, lp, 0, size_q, oracle, 1).is_err() {
+                return (false, -1i128, 0u128); // mark trade fail
+            }
+            // Sanity check before walk: refresh and confirm healthy
+            {
+                let prices = engine.effective_prices();
+                let mut acc = engine.accounts[user];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[user] = acc;
+                if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                    return (false, -2i128, 0u128); // mark immediate deficit
+                }
+            }
+            let initial_balance = engine.accounts[user].capital;
+            let mut rng = Rng::new(seed);
+            let path = realistic_price_walk(&mut rng, oracle, total_slots, daily_vol_bps);
+            let max_move = cfg.max_price_move_bps_per_slot;
+            let mut o = oracle;
+            let mut slot = 2u64;
+            let mut liquidated = false;
+            for target in &path {
+                let clamped = clamp_oracle(*target, engine.group.assets[0].effective_price, max_move, 1);
+                o = clamped;
+                if engine.accrue_asset(0, slot, o, 0).is_err() {
+                    slot += 1;
+                    continue;
+                }
+                let prices = engine.effective_prices();
+                let mut acc = engine.accounts[user];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[user] = acc;
+                if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                    let leg = engine.accounts[user].legs[0];
+                    if leg.active {
+                        let mut acc = engine.accounts[user];
+                        let _ = engine.group.liquidate_account_not_atomic(
+                            &mut acc,
+                            LiquidationRequestV14 {
+                                asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
+                            }, &prices);
+                        engine.accounts[user] = acc;
+                        liquidated = true;
+                        break;
+                    }
+                }
+                slot += 1;
+            }
+            let final_cap = engine.accounts[user].capital;
+            let final_pnl = engine.accounts[user].pnl;
+            let final_total = final_cap as i128 + final_pnl;
+            let net_change = final_total - initial_balance as i128;
+            (!liquidated, net_change, initial_balance)
+        }).collect();
+        let survived = results.iter().filter(|r| r.0).count() as u64;
+        let trade_fail = results.iter().filter(|r| r.1 == -1).count();
+        let immediate_def = results.iter().filter(|r| r.1 == -2).count();
+        let survival_pct = (survived * 100) as f64 / seeds as f64;
+        let surviving: Vec<_> = results.iter().filter(|r| r.0).collect();
+        let avg_pnl_pct = if !surviving.is_empty() {
+            let sum_pnl: f64 = surviving.iter()
+                .map(|r| (r.1 as f64) / (r.2 as f64) * 100.0)
+                .sum();
+            sum_pnl / surviving.len() as f64
+        } else { 0.0 };
+        println!("    {:>3}x     | {:>5.1}%    | trade_fail={} imm_def={} | {:>+6.2}%",
+            lev, survival_pct, trade_fail, immediate_def, avg_pnl_pct);
+        let _ = early_failures;
+    }
+    println!();
+    println!("    Note: 'pnl %' includes both market moves AND fees. Survival rate measures liquidation-free.");
+    println!();
+    println!("  Single-run trace at 5x leverage (seed 0):");
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    let initial_cap = usdc(1_000);
+    engine.deposit(user, initial_cap).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    let _ = engine.trade(user, lp, 0, size_q, oracle, 1);
+    let mut rng = Rng::new(0);
+    let path = realistic_price_walk(&mut rng, oracle, total_slots, daily_vol_bps);
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut o = oracle;
+    let mut slot = 2u64;
+    for (i, target) in path.iter().enumerate() {
+        let clamped = clamp_oracle(*target, engine.group.assets[0].effective_price, max_move, 1);
+        o = clamped;
+        let _ = engine.accrue_asset(0, slot, o, 0);
+        if i % 1000 == 0 || i == path.len() - 1 {
+            let prices = engine.effective_prices();
+            let mut acc = engine.accounts[user];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[user] = acc;
+            let cert = engine.accounts[user].health_cert;
+            println!("    [step {:>5}] target=${:>5} clamped=${:>5} effective_price=${:>5}  cap=${} pnl={} liq_deficit={}",
+                i, target / 1_000_000, o / 1_000_000,
+                engine.group.assets[0].effective_price / 1_000_000,
+                engine.accounts[user].capital / USDC_DECIMALS,
+                engine.accounts[user].pnl,
+                cert.certified_liq_deficit);
+            if cert.certified_liq_deficit > 0 {
+                println!("    ⇒ first deficit at step {}", i);
+                break;
+            }
+        }
+        slot += 1;
+    }
+}
+
+/// Multi-asset diversification: same total notional spread across N assets vs 1.
+fn probe_diversification_benefit(seeds: u64) {
+    println!("  Diversification benefit: same notional concentrated vs spread");
+    let total_slots = 7000;
+    let daily_vol_bps = 30;
+
+    let cases = [
+        (1usize, "concentrated (1 asset)"),
+        (2,       "split 2 ways"),
+        (3,       "split 3 ways"),
+        (4,       "split 4 ways"),
+    ];
+
+    println!();
+    println!("    config              | survival% | avg net pnl %");
+    println!("    --------------------|-----------|--------------");
+    for (n_assets, label) in cases {
+        let cfg = make_bounty_config(n_assets as u8);
+        let results: Vec<(bool, i128, u128)> = (0..seeds).into_par_iter().map(|seed| {
+            let mut engine = V14Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(10_000_000)).unwrap();
+            let user = engine.add_account(2).unwrap();
+            let initial_cap = usdc(5_000); // $5k cap
+            engine.deposit(user, initial_cap).unwrap();
+            let oracle = price_e6(200);
+            for ai in 0..n_assets {
+                let _ = engine.accrue_asset(ai, 1, oracle, 0);
+            }
+            // Total $10k notional, spread across n_assets
+            let per_leg = usdc(10_000 / n_assets as u128);
+            for ai in 0..n_assets {
+                let size_q = per_leg * POS_SCALE / oracle as u128;
+                if engine.trade(user, lp, ai, size_q, oracle, 1).is_err() {
+                    return (false, 0i128, 0u128);
+                }
+            }
+            let initial_balance = engine.accounts[user].capital;
+            let mut rng = Rng::new(seed);
+            // Each asset gets its own (independent) walk
+            let paths: Vec<Vec<u64>> = (0..n_assets)
+                .map(|ai| {
+                    let mut sub_rng = Rng::new(seed.wrapping_mul(31 + ai as u64));
+                    realistic_price_walk(&mut sub_rng, oracle, total_slots, daily_vol_bps)
+                })
+                .collect();
+            let _ = rng;
+            let max_move = cfg.max_price_move_bps_per_slot;
+            let mut oracles = vec![oracle; n_assets];
+            let mut slot = 2u64;
+            let mut liquidated = false;
+            for step in 0..total_slots as usize {
+                for ai in 0..n_assets {
+                    let target = paths[ai][step];
+                    let clamped = clamp_oracle(target, engine.group.assets[ai].effective_price, max_move, 1);
+                    oracles[ai] = clamped;
+                    let _ = engine.accrue_asset(ai, slot, clamped, 0);
+                }
+                let prices = engine.effective_prices();
+                let mut acc = engine.accounts[user];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[user] = acc;
+                if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                    // Liquidate biggest leg
+                    let mut best = (0usize, 0u128);
+                    for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                        let leg = engine.accounts[user].legs[li];
+                        if leg.active {
+                            let a = leg.basis_pos_q.unsigned_abs();
+                            if a > best.1 { best = (li, a); }
+                        }
+                    }
+                    if best.1 > 0 {
+                        let mut acc = engine.accounts[user];
+                        let _ = engine.group.liquidate_account_not_atomic(
+                            &mut acc,
+                            LiquidationRequestV14 {
+                                asset_index: best.0, close_q: best.1, fee_bps: 5,
+                            }, &prices);
+                        engine.accounts[user] = acc;
+                        liquidated = true;
+                        break;
+                    }
+                }
+                slot += 1;
+            }
+            let final_cap = engine.accounts[user].capital;
+            let final_pnl = engine.accounts[user].pnl;
+            let final_total = final_cap as i128 + final_pnl;
+            let net_change = final_total - initial_balance as i128;
+            (!liquidated, net_change, initial_balance)
+        }).collect();
+        let survived = results.iter().filter(|r| r.0).count() as u64;
+        let survival_pct = (survived * 100) as f64 / seeds as f64;
+        let avg_pnl_pct = {
+            let sum_pnl: f64 = results.iter()
+                .filter(|r| r.0)
+                .map(|r| (r.1 as f64) / (r.2 as f64) * 100.0)
+                .sum();
+            let count = results.iter().filter(|r| r.0).count();
+            if count > 0 { sum_pnl / count as f64 } else { 0.0 }
+        };
+        println!("    {:<20}| {:>5.1}%    | {:>+6.2}%",
+            label, survival_pct, avg_pnl_pct);
+    }
+    println!();
+    println!("    Same total $10k notional, $5k cap (2x portfolio leverage in all cases).");
+    println!("    Each asset walks independently with ~2%/tick volatility.");
+}
+
+/// Mean-reversion test: oracle does a round trip back to its start. If v14
+/// were symmetric, the user's cap should be ≈ initial. If asymmetric
+/// absorption, cap will be < initial.
+fn probe_mean_reversion_ratchet() {
+    println!("  Mean-reversion ratchet test: oracle round-trips to its start");
+    let cfg = make_bounty_config(1);
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(10_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let oracle = price_e6(200);
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+
+    let size_q = usdc(2_000) * POS_SCALE / oracle as u128; // 2x lev
+    engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
+    println!("    setup: long $2k on $1k cap (2x lev)");
+
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let amplitudes = [200u64, 500, 1000]; // 2%, 5%, 10% amplitude
+    for amp_bps in amplitudes {
+        // Reset for each amplitude
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(10_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
+        let initial_cap = engine.accounts[user].capital;
+
+        let mut o = oracle;
+        let mut slot = 2u64;
+        // Up by amp_bps
+        let target_up = oracle + (oracle as u128 * amp_bps as u128 / 10_000) as u64;
+        while o < target_up {
+            let d = (o as u128 * max_move as u128 / 10_000) as u64;
+            o = (o.saturating_add(d)).min(target_up);
+            let _ = engine.accrue_asset(0, slot, o, 0);
+            slot += 1;
+        }
+        // Down to original
+        while o > oracle {
+            let d = (o as u128 * max_move as u128 / 10_000) as u64;
+            o = o.saturating_sub(d).max(oracle);
+            let _ = engine.accrue_asset(0, slot, o, 0);
+            slot += 1;
+        }
+        // Down by amp_bps (mirror)
+        let target_down = oracle - (oracle as u128 * amp_bps as u128 / 10_000) as u64;
+        while o > target_down {
+            let d = (o as u128 * max_move as u128 / 10_000) as u64;
+            o = o.saturating_sub(d).max(target_down);
+            let _ = engine.accrue_asset(0, slot, o, 0);
+            slot += 1;
+        }
+        // Back to original
+        while o < oracle {
+            let d = (o as u128 * max_move as u128 / 10_000) as u64;
+            o = (o.saturating_add(d)).min(oracle);
+            let _ = engine.accrue_asset(0, slot, o, 0);
+            slot += 1;
+        }
+
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        let final_cap = engine.accounts[user].capital;
+        let final_pnl = engine.accounts[user].pnl;
+        let final_total = final_cap as i128 + final_pnl;
+        let loss = initial_cap as i128 - final_total;
+        let amp_pct = amp_bps as f64 / 100.0;
+        println!("    ±{:.1}% round trip: cap=${} pnl=${}  total_lost=${} ({:>+.1}% of starting cap)",
+            amp_pct,
+            final_cap / USDC_DECIMALS,
+            final_pnl / 1_000_000,
+            loss / 1_000_000,
+            -loss as f64 / initial_cap as f64 * 100.0);
+    }
+}
+
+fn run_probes_capital_efficiency() {
+    println!("=== v14 capital efficiency in normal-market conditions ===");
+    probe_capital_efficiency_single_asset(500);
+    println!();
+    probe_diversification_benefit(500);
+    println!();
+    probe_mean_reversion_ratchet();
+}
+
 /// Direct empirical demonstration: a SINGLE user's profitable SOL leg
 /// supports their losing BTC leg's MM. The two probes are:
 ///   (a) baseline: user holds ONLY the losing leg → liquidated
@@ -5014,6 +5397,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=xmargin_deep") {
         run_probes_xmargin_deep();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=cap_eff") {
+        run_probes_capital_efficiency();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {

@@ -485,6 +485,110 @@ This is empirically distinct from a "true cross-margin" system where any
 two legs can perfectly hedge. v14's cross-margin is a *bounded* form
 designed to prevent leg-local paper profit from being treated as senior.
 
+## Capital efficiency in normal-market conditions (`--test=cap_eff`)
+
+Tests realistic-market behavior (not stress): random walks with ~30 bps
+per-step vol (≈15% over 7000-step / 30-day window).
+
+### Single-asset survival rate at various leverages
+
+User opens long $X notional on $1k cap, 30-day random walk, refresh after
+each step (typical keeper cadence):
+
+| Leverage | Survival | Avg net P&L on survivors |
+|---|---|---|
+| 2x  | **100%** | **-22%** |
+| 5x  |  43%     | **-21%** |
+| 10x |  0%      | (all liquidated) |
+| 15x |  0%      | (all liquidated) |
+
+**Holding a 2x position through 30 days of normal market noise costs ~22%
+of capital** — not from fees alone, but from the K-pair settlement asymmetry.
+
+### Diversification benefit (same $10k notional, $5k cap, 30 days)
+
+| Configuration | Survival | Avg net P&L |
+|---|---|---|
+| 1 asset (concentrated) | 100% | **-21%** |
+| 2 assets | 100% | **-16%** |
+| 3 assets | 100% | **-13%** |
+| 4 assets | 100% | **-11%** |
+
+Splitting notional across uncorrelated assets reduces the capital erosion
+because each individual asset's variance is smaller. 4-way diversification
+roughly halves the drag.
+
+### ★ Key finding: the "settle-frequency ratchet"
+
+Single-run trace at 5x leverage:
+
+| Step | Oracle | cap | pnl |
+|---|---|---|---|
+| 0 | $199 | $998 | $0 |
+| 1000 | $199 | $993 | $0 (just trade fee) |
+| 2000 | $189 (-5%) | $739 | $0 (lost $254 to cap absorption) |
+| 3000 | $206 (+3%) | **$739** | +$424 (cap did NOT recover) |
+| 4000 | $209 | $739 | +$487 |
+| 5000 | $203 | $739 | +$234 |
+| 6000 | $181 (-10%) | $424 | $0 |
+| 6999 | $182 | $424 | +$15 |
+
+When oracle reversed from $189 → $206, **the user's capital stayed at $739**.
+The recovery went into PnL (bounded by haircut). Then when oracle went back
+down, capital dropped again.
+
+**Mean-reversion test** (oracle round-trips to start, no settle in between):
+
+| Amplitude | Final cap | Final PnL | Total lost |
+|---|---|---|---|
+| ±2% | $999 | $0 | $0 (just fee) |
+| ±5% | $999 | $0 | $0 |
+| ±10% | $999 | $0 | $0 |
+
+★ **The ratchet only bites when settle is called between moves.** With no
+intermediate settle, K-pair flow accumulates symmetrically across the
+oracle path. With frequent settle (e.g., every slot for a keeper), each
+oracle reversal incurs the haircut math, asymmetrically consuming capital.
+
+### Why this happens
+
+The mechanism (verified by tracing `src/v14.rs:4290`):
+
+1. Settle when oracle moved UP: pnl += positive K-delta. If pnl was 0:
+   `account.pnl = +X`. cap unchanged.
+2. Settle when oracle reverses: negative K-delta. With pnl = +X positive:
+   - `apply_haircut_bounded_close_loss_to_pnl(account, X)` runs
+   - effective_available = haircut(X, residual, junior_bound)
+   - In a balanced market with residual ≈ 0: effective_available ≈ 0
+   - **junior_face_burned = X** (line 4264: if remaining_loss != 0, burn all)
+   - **All face PnL is burned but only ~residual of loss is offset**
+   - Remaining loss flows to capital via settle_negative_pnl_from_principal
+
+3. Now oracle moves UP again. New K-delta = positive. Adds to pnl.
+   - But cap has already been drained.
+
+Each settle-and-reverse cycle ratchets capital down. Over many cycles,
+capital erodes steadily.
+
+### Operational implication
+
+For the bounty deployment:
+
+- **Keepers should avoid unnecessary account touches.** Touching an account
+  forces `settle_account_side_effects` which materializes K-pair flow. Each
+  settle in a volatile-but-mean-reverting market locks in any K-pair flow
+  that exists at that instant, and reversal traffic burns face PnL.
+- **Touch accounts only when needed for liquidation, trade, or withdrawal.**
+- **Users who actively trade in/out** (close + reopen, partial withdraw, etc.)
+  effectively force frequent settle and pay the ratchet cost.
+- **Buy-and-hold users that don't trigger touches** would avoid the ratchet,
+  but in practice any keeper looking for liquidation candidates touches
+  them anyway. So the ratchet is hard to avoid.
+
+This is consistent with the v14.12 design intent of "no leg-local paper
+profit becomes senior" — positive PnL is only haircut-realizable. But it
+has the side effect that even normal market noise drains capital over time.
+
 ## Empirical conclusion
 
 v14's safety surface is at least as strong as v13's across all tested
