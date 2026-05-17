@@ -3554,6 +3554,553 @@ fn run_probes_capital_efficiency() {
     probe_mean_reversion_ratchet();
 }
 
+/// Spread trade WITH residual injection — what if the LP has built up
+/// significant residual from prior fees / liquidations? Does cross-margin
+/// offset start working?
+fn probe_spread_with_residual() {
+    println!("  Spread trade in a HEALTHY system (with injected residual)");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+
+    // Helper: build a market with N donors who each take a small loss to grow LP residual.
+    // We use trading fees to inject residual without bankruptcy.
+    let build_market_with_residual = |target_residual_usd: u128| -> V14Engine {
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+        let mut slot = 2u64;
+        let mut donor_idx = 100u8;
+        let mut current_residual = 0u128;
+        let target_atoms = usdc(target_residual_usd);
+        // Run donor open/close cycles, each pays trading fees → residual.
+        for _ in 0..2000 {
+            if current_residual >= target_atoms { break; }
+            let donor = engine.add_account(donor_idx).unwrap();
+            donor_idx = donor_idx.wrapping_add(1);
+            engine.deposit(donor, usdc(50_000)).unwrap();
+            // Large notional → larger fee absolute. Pay max_trading_fee_bps=5.
+            let size_q = usdc(500_000) * POS_SCALE / oracle as u128;
+            if engine.trade(donor, lp, 0, size_q, oracle, cfg.max_trading_fee_bps).is_err() { break; }
+            // Close immediately (donor pays 2x fees).
+            let _ = engine.trade(lp, donor, 0, size_q, oracle, cfg.max_trading_fee_bps);
+            slot += 1;
+            let _ = engine.accrue_asset(0, slot, oracle, 0);
+            let _ = engine.accrue_asset(1, slot, oracle, 0);
+            // Settle donor so capital is debited.
+            let prices = engine.effective_prices();
+            let mut da = engine.accounts[donor];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut da, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut da, &prices);
+            engine.accounts[donor] = da;
+            current_residual = engine.group.vault
+                .saturating_sub(engine.group.c_tot)
+                .saturating_sub(engine.group.insurance);
+        }
+        let v = engine.group.vault;
+        let c = engine.group.c_tot;
+        let ins = engine.group.insurance;
+        let residual = v.saturating_sub(c).saturating_sub(ins);
+        println!("    Residual built: ${} (vault=${}, c_tot=${}, ins=${})",
+            residual / 1_000_000, v / 1_000_000, c / 1_000_000, ins / 1_000_000);
+        engine
+    };
+
+    // Now test the spread trade across different residual levels:
+    for target in [0u128, 1_000, 10_000, 100_000, 1_000_000] {
+        println!("  --- Target residual: ${} ---", target);
+        let mut engine = if target == 0 {
+            let mut e = V14Engine::new(cfg).expect("init");
+            let lp = e.add_account(1).unwrap();
+            e.deposit(lp, usdc(50_000_000)).unwrap();
+            e.accrue_asset(0, 1, oracle, 0).unwrap();
+            e.accrue_asset(1, 1, oracle, 0).unwrap();
+            e
+        } else {
+            build_market_with_residual(target)
+        };
+        let pnl_pos_tot_before = engine.group.pnl_pos_tot;
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        // long SOL
+        if engine.trade(user, 0 /* lp */, 0, size_q, oracle, 0).is_err() {
+            println!("    SOL leg rejected"); continue;
+        }
+        // short ETH
+        if engine.trade(0, user, 1, size_q, oracle, 0).is_err() {
+            println!("    ETH leg rejected"); continue;
+        }
+        let initial_cap = engine.accounts[user].capital;
+        // Diverge prices: SOL down 10%, ETH up 10% (both bad for user)
+        // Then SOL up 10%, ETH down 10% (both good — spread should profit)
+        let mut slot = 100u64;
+        let max_move = cfg.max_price_move_bps_per_slot;
+        // Path: SOL down 10%, ETH up 10% over many small steps
+        let target_sol = (oracle as i128 * 90 / 100) as u64;
+        let target_eth = (oracle as i128 * 110 / 100) as u64;
+        loop {
+            let p_sol = engine.group.assets[0].effective_price;
+            let p_eth = engine.group.assets[1].effective_price;
+            if p_sol <= target_sol && p_eth >= target_eth { break; }
+            let next_sol = clamp_oracle(target_sol, p_sol, max_move, 1);
+            let next_eth = clamp_oracle(target_eth, p_eth, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next_sol, 0);
+            let _ = engine.accrue_asset(1, slot, next_eth, 0);
+            // Settle user
+            let prices = engine.effective_prices();
+            let mut ua = engine.accounts[user];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut ua, &prices);
+            engine.accounts[user] = ua;
+            slot += 1;
+            if slot > 10000 { break; }
+        }
+        // Now reverse: SOL back up 10%, ETH back down 10% — the spread closes
+        let target_sol2 = oracle;
+        let target_eth2 = oracle;
+        loop {
+            let p_sol = engine.group.assets[0].effective_price;
+            let p_eth = engine.group.assets[1].effective_price;
+            if p_sol >= target_sol2 && p_eth <= target_eth2 { break; }
+            let next_sol = clamp_oracle(target_sol2, p_sol, max_move, 1);
+            let next_eth = clamp_oracle(target_eth2, p_eth, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next_sol, 0);
+            let _ = engine.accrue_asset(1, slot, next_eth, 0);
+            let prices = engine.effective_prices();
+            let mut ua = engine.accounts[user];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut ua, &prices);
+            engine.accounts[user] = ua;
+            slot += 1;
+            if slot > 20000 { break; }
+        }
+        let final_cap = engine.accounts[user].capital;
+        let final_pnl = engine.accounts[user].pnl;
+        let pnl_pos_tot_after = engine.group.pnl_pos_tot;
+        let residual_now = engine.group.vault.saturating_sub(engine.group.c_tot).saturating_sub(engine.group.insurance);
+        println!("    Round-trip spread: SOL -10%/+10%, ETH +10%/-10% (return to start)");
+        println!("    initial cap=${}, final cap=${}, final pnl=${}",
+            initial_cap / 1_000_000, final_cap / 1_000_000, final_pnl / 1_000_000);
+        let total_eq = final_cap as i128 + final_pnl;
+        let delta = total_eq - initial_cap as i128;
+        println!("    user total equity change: ${} ({:+.2}%)",
+            delta / 1_000_000,
+            delta as f64 / initial_cap as f64 * 100.0);
+        println!("    pnl_pos_tot before={}, after={}, residual now=${}",
+            pnl_pos_tot_before / 1_000_000, pnl_pos_tot_after / 1_000_000, residual_now / 1_000_000);
+        println!();
+    }
+}
+
+/// Critical test: when the user has paper-PnL gain from spread, can they
+/// actually WITHDRAW or CLOSE the position? Or is the gain stuck?
+fn probe_spread_can_realize_gain() {
+    println!("  Spread profit realization: can the user withdraw their gain?");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+
+    let mut engine = V14Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, 0, size_q, oracle, 0).unwrap();
+    engine.trade(lp, user, 1, size_q, oracle, 0).unwrap();
+    // Favorable: SOL +10%, ETH -10%
+    let target_sol = (oracle as u128 * 110 / 100) as u64;
+    let target_eth = (oracle as u128 * 90 / 100) as u64;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 100u64;
+    loop {
+        let p_sol = engine.group.assets[0].effective_price;
+        let p_eth = engine.group.assets[1].effective_price;
+        if p_sol >= target_sol && p_eth <= target_eth { break; }
+        let next_sol = clamp_oracle(target_sol, p_sol, max_move, 1);
+        let next_eth = clamp_oracle(target_eth, p_eth, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, next_sol, 0);
+        let _ = engine.accrue_asset(1, slot, next_eth, 0);
+        let prices = engine.effective_prices();
+        let mut ua = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut ua, &prices);
+        engine.accounts[user] = ua;
+        slot += 1;
+        if slot > 5000 { break; }
+    }
+    let cap_before = engine.accounts[user].capital;
+    let pnl_before = engine.accounts[user].pnl;
+    let eq_cert_before = engine.accounts[user].health_cert.certified_equity;
+    let residual = engine.group.vault.saturating_sub(engine.group.c_tot).saturating_sub(engine.group.insurance);
+    let jb = engine.group.pnl_pos_bound_tot.max(engine.group.pnl_pos_tot);
+    println!("    State after favorable spread move:");
+    println!("      cap=${}, pnl=${}, certified_equity=${}",
+        cap_before / 1_000_000, pnl_before / 1_000_000, eq_cert_before / 1_000_000);
+    println!("      residual=${}, junior_bound=${} → haircut={:.0}%",
+        residual / 1_000_000, jb / 1_000_000,
+        if jb == 0 { 100.0 } else { (residual.min(jb) as f64 / jb as f64) * 100.0 });
+    println!();
+
+    // Try to close both legs (sell SOL back, buy ETH back)
+    println!("    Attempting to close both legs...");
+    let p_sol_now = engine.group.assets[0].effective_price;
+    let p_eth_now = engine.group.assets[1].effective_price;
+    let r1 = engine.trade(lp, user, 0, size_q, p_sol_now, 0);
+    let r2 = engine.trade(user, lp, 1, size_q, p_eth_now, 0);
+    println!("      Close SOL leg: {:?}", r1.as_ref().map(|_| ()).map_err(|e| format!("{:?}", e)));
+    println!("      Close ETH leg: {:?}", r2.as_ref().map(|_| ()).map_err(|e| format!("{:?}", e)));
+    let prices = engine.effective_prices();
+    let mut ua = engine.accounts[user];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut ua, &prices);
+    engine.accounts[user] = ua;
+    let cap_after_close = engine.accounts[user].capital;
+    let pnl_after_close = engine.accounts[user].pnl;
+    println!("    After closing both legs:");
+    println!("      cap=${}, pnl=${}", cap_after_close / 1_000_000, pnl_after_close / 1_000_000);
+    println!();
+
+    // Try to withdraw all capital
+    let prices2 = engine.effective_prices();
+    let withdraw_attempt = engine.group.withdraw_not_atomic(
+        &mut engine.accounts[user], cap_after_close, &prices2,
+    );
+    match withdraw_attempt {
+        Ok(_) => println!("    Withdraw ${} → OK, final cap=${}",
+            cap_after_close / 1_000_000, engine.accounts[user].capital / 1_000_000),
+        Err(e) => println!("    Withdraw ${} → REJECTED: {:?}", cap_after_close / 1_000_000, e),
+    }
+    println!();
+    println!("    User's realized USDC: ${} (started with $1000)",
+        engine.accounts[user].capital / 1_000_000);
+    if pnl_after_close > 0 {
+        println!("    *** Stuck paper PnL: ${} cannot be realized as cash ***",
+            pnl_after_close / 1_000_000);
+    }
+}
+
+/// Probe the spread trade behavior at the moment of max divergence (no reversal)
+/// — does the user get liquidated mid-spread?
+fn probe_spread_one_way() {
+    println!("  Spread trade — one-way moves (no reversal), various magnitudes");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+
+    for div_pct in [2u64, 5, 10, 15, 20, 30] {
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        if engine.trade(user, lp, 0, size_q, oracle, 0).is_err()
+           || engine.trade(lp, user, 1, size_q, oracle, 0).is_err() {
+            println!("    {}% div: trade rejected", div_pct);
+            continue;
+        }
+        let initial_cap = engine.accounts[user].capital;
+        // Diverge: SOL down div_pct%, ETH up div_pct% (spread shouldn't matter — symmetric pain)
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let target_sol = (oracle as u128 * (100 - div_pct) as u128 / 100) as u64;
+        let target_eth = (oracle as u128 * (100 + div_pct) as u128 / 100) as u64;
+        let mut slot = 100u64;
+        let mut liq = false;
+        let mut liq_at = 0u64;
+        loop {
+            let p_sol = engine.group.assets[0].effective_price;
+            let p_eth = engine.group.assets[1].effective_price;
+            if p_sol <= target_sol && p_eth >= target_eth { break; }
+            let next_sol = clamp_oracle(target_sol, p_sol, max_move, 1);
+            let next_eth = clamp_oracle(target_eth, p_eth, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next_sol, 0);
+            let _ = engine.accrue_asset(1, slot, next_eth, 0);
+            let prices = engine.effective_prices();
+            let mut ua = engine.accounts[user];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut ua, &prices);
+            engine.accounts[user] = ua;
+            if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                liq = true;
+                liq_at = slot;
+                break;
+            }
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        let final_cap = engine.accounts[user].capital;
+        let final_pnl = engine.accounts[user].pnl;
+        let total_eq = final_cap as i128 + final_pnl;
+        let delta = total_eq - initial_cap as i128;
+        let mm_req = engine.accounts[user].health_cert.certified_maintenance_req;
+        let eq_cert = engine.accounts[user].health_cert.certified_equity;
+        println!("    SOL {:>3}% down, ETH {:>3}% up | cap=${:>5} pnl=${:>5} | eq_cert=${:>5} mm=${:>4} | delta={:+}{} {}",
+            div_pct, div_pct,
+            final_cap / 1_000_000, final_pnl / 1_000_000,
+            eq_cert / 1_000_000, mm_req / 1_000_000,
+            delta / 1_000_000,
+            if liq { format!(" LIQ@slot{}", liq_at) } else { String::new() },
+            if engine.accounts[user].health_cert.certified_liq_deficit > 0 { "UNDERWATER" } else { "" });
+    }
+    println!();
+    println!("  ASYMMETRIC: spread that PROFITS the user (LP-side residual buildup)");
+    println!();
+    for div_pct in [2u64, 5, 10, 15, 20, 30] {
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        if engine.trade(user, lp, 0, size_q, oracle, 0).is_err()
+           || engine.trade(lp, user, 1, size_q, oracle, 0).is_err() {
+            continue;
+        }
+        let initial_cap = engine.accounts[user].capital;
+        // FAVORABLE: SOL up, ETH down → both legs profit
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let target_sol = (oracle as u128 * (100 + div_pct) as u128 / 100) as u64;
+        let target_eth = (oracle as u128 * (100 - div_pct) as u128 / 100) as u64;
+        let mut slot = 100u64;
+        loop {
+            let p_sol = engine.group.assets[0].effective_price;
+            let p_eth = engine.group.assets[1].effective_price;
+            if p_sol >= target_sol && p_eth <= target_eth { break; }
+            let next_sol = clamp_oracle(target_sol, p_sol, max_move, 1);
+            let next_eth = clamp_oracle(target_eth, p_eth, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next_sol, 0);
+            let _ = engine.accrue_asset(1, slot, next_eth, 0);
+            let prices = engine.effective_prices();
+            let mut ua = engine.accounts[user];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut ua, &prices);
+            engine.accounts[user] = ua;
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        let final_cap = engine.accounts[user].capital;
+        let final_pnl = engine.accounts[user].pnl;
+        let total_eq = final_cap as i128 + final_pnl;
+        let delta = total_eq - initial_cap as i128;
+        let residual = engine.group.vault.saturating_sub(engine.group.c_tot).saturating_sub(engine.group.insurance);
+        let jb = engine.group.pnl_pos_bound_tot.max(engine.group.pnl_pos_tot);
+        println!("    SOL {:>3}% up, ETH {:>3}% down | cap=${:>5} pnl=${:>5} delta=${:+>5} | residual=${} jb=${} | haircut={:.0}%",
+            div_pct, div_pct,
+            final_cap / 1_000_000, final_pnl / 1_000_000, delta / 1_000_000,
+            residual / 1_000_000, jb / 1_000_000,
+            if jb == 0 { 100.0 } else { (residual.min(jb) as f64 / jb as f64) * 100.0 });
+    }
+}
+
+/// Long SOL + Short ETH spread trade — empirical capital efficiency check.
+/// Does the "spread" trade actually use less margin than two independent
+/// positions? Does the cross-margin offset cover divergence between SOL and ETH?
+fn probe_spread_trade_efficiency() {
+    println!("  Spread trade: long SOL + short ETH on $1k cap");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+
+    // Three configurations to compare:
+    let labels = [
+        "long SOL only ($5k notional, 5x)",
+        "long SOL + long ETH ($5k each, 10x portfolio)",
+        "long SOL + short ETH ($5k each, RELATIVE VALUE)",
+    ];
+
+    for (i, label) in labels.iter().enumerate() {
+        let mut engine = V14Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(10_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        let trade_results = match i {
+            0 => vec![engine.trade(user, lp, 0, size_q, oracle, 1)],
+            1 => vec![
+                engine.trade(user, lp, 0, size_q, oracle, 1),
+                engine.trade(user, lp, 1, size_q, oracle, 1),
+            ],
+            2 => vec![
+                engine.trade(user, lp, 0, size_q, oracle, 1),
+                engine.trade(lp, user, 1, size_q, oracle, 1),
+            ],
+            _ => unreachable!(),
+        };
+        if trade_results.iter().any(|r| r.is_err()) {
+            println!("    {} → TRADE REJECTED (IM insufficient)", label);
+            for (j, r) in trade_results.iter().enumerate() {
+                if let Err(e) = r { println!("      trade {}: {:?}", j, e); }
+            }
+            continue;
+        }
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut acc, &prices);
+        engine.accounts[user] = acc;
+        let cert = engine.accounts[user].health_cert;
+        println!("    {} :", label);
+        println!("      cap=${} pnl=${} cert.equity=${} im_req=${} mm_req=${}",
+            engine.accounts[user].capital / USDC_DECIMALS,
+            engine.accounts[user].pnl,
+            cert.certified_equity / 1_000_000,
+            cert.certified_initial_req / 1_000_000,
+            cert.certified_maintenance_req / 1_000_000);
+        let free_eq = (cert.certified_equity - cert.certified_initial_req as i128).max(0);
+        println!("      free equity above IM: ${}", free_eq / 1_000_000);
+        println!();
+    }
+
+    // Now test capital efficiency under realistic moves
+    println!("  Survival rate over 30-day random walk (500 seeds):");
+    println!("  config                                | survival | avg P&L%");
+    for (i, label) in labels.iter().enumerate() {
+        let results: Vec<(bool, i128, u128)> = (0..500u64).into_par_iter().map(|seed| {
+            let mut engine = V14Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(10_000_000)).unwrap();
+            let user = engine.add_account(2).unwrap();
+            engine.deposit(user, usdc(1_000)).unwrap();
+            engine.accrue_asset(0, 1, oracle, 0).unwrap();
+            engine.accrue_asset(1, 1, oracle, 0).unwrap();
+            let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+            let r1 = match i {
+                0 => engine.trade(user, lp, 0, size_q, oracle, 1),
+                1 => {
+                    let _ = engine.trade(user, lp, 0, size_q, oracle, 1);
+                    engine.trade(user, lp, 1, size_q, oracle, 1)
+                },
+                2 => {
+                    let _ = engine.trade(user, lp, 0, size_q, oracle, 1);
+                    engine.trade(lp, user, 1, size_q, oracle, 1)
+                },
+                _ => unreachable!(),
+            };
+            if r1.is_err() { return (false, -1i128, 0u128); }
+            let initial_balance = engine.accounts[user].capital;
+            let mut rng_sol = Rng::new(seed.wrapping_mul(31));
+            let mut rng_eth = Rng::new(seed.wrapping_mul(31).wrapping_add(1));
+            let path_sol = realistic_price_walk(&mut rng_sol, oracle, 7000, 30);
+            let path_eth = realistic_price_walk(&mut rng_eth, oracle, 7000, 30);
+            let max_move = cfg.max_price_move_bps_per_slot;
+            let mut slot = 2u64;
+            let mut liq = false;
+            for step in 0..7000 {
+                let o_sol = clamp_oracle(path_sol[step], engine.group.assets[0].effective_price, max_move, 1);
+                let _ = engine.accrue_asset(0, slot, o_sol, 0);
+                if cfg.max_portfolio_assets > 1 {
+                    let o_eth = clamp_oracle(path_eth[step], engine.group.assets[1].effective_price, max_move, 1);
+                    let _ = engine.accrue_asset(1, slot, o_eth, 0);
+                }
+                let prices = engine.effective_prices();
+                let mut acc = engine.accounts[user];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[user] = acc;
+                if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                    liq = true;
+                    break;
+                }
+                slot += 1;
+            }
+            let final_total = engine.accounts[user].capital as i128 + engine.accounts[user].pnl;
+            (!liq, final_total - initial_balance as i128, initial_balance)
+        }).collect();
+        let survived = results.iter().filter(|r| r.0).count();
+        let avg = {
+            let surviving: Vec<_> = results.iter().filter(|r| r.0).collect();
+            if surviving.is_empty() { 0.0 } else {
+                surviving.iter().map(|r| r.1 as f64 / r.2 as f64 * 100.0).sum::<f64>() / surviving.len() as f64
+            }
+        };
+        println!("  {:38} | {:>5.1}%   | {:+.2}%",
+            label, survived as f64 / 500.0 * 100.0, avg);
+    }
+}
+
+/// Does h_min = h_max = 0 (instant everything) prevent the ratchet?
+/// Hypothesis: NO — the haircut math is residual-bounded, not h-lock bounded.
+fn probe_ratchet_with_hmin_zero() {
+    println!("  Ratchet test with h_min = h_max = 0 (instant everything)");
+    // Build a config with h_min = h_max = 0
+    let mut cfg = make_bounty_config(1);
+    cfg.h_min = 0;
+    cfg.h_max = 1; // h_max must be > 0 per validate_public_user_fund
+    // Try also with h_max = 0 to verify
+
+    // Wait — validate_public_user_fund requires h_max > 0. So we can't truly set
+    // BOTH to 0. The closest is h_min=0, h_max=1 (instant for both lanes).
+
+    let cases: &[(u64, u64, &str)] = &[
+        (0, 1, "instant (h_min=0, h_max=1)"),
+        (0, 30, "default bounty (h_min=0, h_max=30)"),
+        (5, 30, "warmup (h_min=5, h_max=30)"),
+    ];
+
+    for (h_min, h_max, label) in cases {
+        let mut cfg_test = make_bounty_config(1);
+        cfg_test.h_min = *h_min;
+        cfg_test.h_max = *h_max;
+        if cfg_test.validate_public_user_fund().is_err() {
+            println!("    {} → config invalid, skipping", label);
+            continue;
+        }
+
+        let mut engine = V14Engine::new(cfg_test).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(10_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let oracle = price_e6(200);
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let size_q = usdc(2_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, size_q, oracle, 1).unwrap();
+
+        let max_move = cfg_test.max_price_move_bps_per_slot;
+        let mut rng = Rng::new(42);
+        let path = realistic_price_walk(&mut rng, oracle, 3000, 30);
+        let mut slot = 2u64;
+        for target in &path {
+            let clamped = clamp_oracle(*target, engine.group.assets[0].effective_price, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, clamped, 0);
+            let prices = engine.effective_prices();
+            let mut acc = engine.accounts[user];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg_test.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[user] = acc;
+            slot += 1;
+        }
+        let cap = engine.accounts[user].capital;
+        let pnl = engine.accounts[user].pnl;
+        let net_total = cap as i128 + pnl;
+        let loss = 1_000_000_000i128 - net_total;
+        println!("    {} : cap=${} pnl=${}  total_lost=${} ({:.1}%)",
+            label,
+            cap / USDC_DECIMALS,
+            pnl / 1_000_000,
+            loss / 1_000_000,
+            loss as f64 / 1_000_000_000.0 * 100.0);
+    }
+    println!();
+    println!("    Hypothesis: ratchet is residual-bounded, NOT h-lock bounded.");
+    println!("    If results are similar across rows, the hypothesis holds.");
+}
+
 /// Direct empirical demonstration: a SINGLE user's profitable SOL leg
 /// supports their losing BTC leg's MM. The two probes are:
 ///   (a) baseline: user holds ONLY the losing leg → liquidated
@@ -5401,6 +5948,26 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=cap_eff") {
         run_probes_capital_efficiency();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=ratchet_hlock") {
+        probe_ratchet_with_hmin_zero();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=spread") {
+        probe_spread_trade_efficiency();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=spread_residual") {
+        probe_spread_with_residual();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=spread_oneway") {
+        probe_spread_one_way();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=spread_realize") {
+        probe_spread_can_realize_gain();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
