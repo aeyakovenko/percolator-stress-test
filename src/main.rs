@@ -192,6 +192,25 @@ fn make_bounty_sol_20x_max_config() -> V16Config {
     make_bounty_config(1)
 }
 
+fn make_instant_bounty_config(n_assets: u8) -> V16Config {
+    let mut c = V16Config::public_user_fund(n_assets, 0, 1);
+    c.min_nonzero_mm_req = 20;
+    c.min_nonzero_im_req = 30;
+    c.maintenance_margin_bps = 500;
+    c.initial_margin_bps = 500;
+    c.max_trading_fee_bps = 1;
+    c.liquidation_fee_bps = 5;
+    c.liquidation_fee_cap = usdc(50_000);
+    c.max_accrual_dt_slots = 10;
+    c.min_funding_lifetime_slots = 10;
+    c.max_price_move_bps_per_slot = 45;
+    c.max_account_b_settlement_chunks = 8;
+    c.max_bankrupt_close_chunks = 8;
+    c.max_bankrupt_close_lifetime_slots = 1000;
+    c.public_b_chunk_atoms = MAX_VAULT_TVL;
+    c
+}
+
 fn make_bounty_config(n_assets: u8) -> V16Config {
     let mut c = V16Config::public_user_fund(n_assets, 0, 30);
     c.min_nonzero_mm_req = 20;
@@ -3212,6 +3231,420 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
         path_b.push(ob);
     }
     (path_a, path_b)
+}
+
+/// Rerun the v16 attack suite under the most aggressive h-lock config:
+/// h_min=0, h_max=1. This is "instant favorable actions, single-slot
+/// bankruptcy lockout". Verifies the source-credit gating doesn't depend
+/// on long h-lock windows to protect against extraction.
+fn probe_v16_instant_h_lock_attacks() {
+    println!("  v16 attack suite with h_min=0, h_max=1 (most aggressive valid config)");
+    println!();
+    let cfg = make_instant_bounty_config(2);
+    let oracle = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    println!("  Config: h_min={}, h_max={}, MM=IM=5%, max_move={}bps/slot",
+        cfg.h_min, cfg.h_max, max_move);
+    println!();
+
+    // === A2 runs the partial-withdraw attack under each config. cfg is captured from outer scope.
+    let run_partial_withdraw_attack = |label: &str, cfg: V16Config| {
+        let oracle = price_e6(200);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        println!("  [{}] Drift-style oracle pump → convert → PARTIAL withdraw → revert  (h_min={}, h_max={})",
+            label, cfg.h_min, cfg.h_max);
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let attacker = engine.add_account(99).unwrap();
+        let deposit = usdc(1_000);
+        engine.deposit(attacker, deposit).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(attacker, lp, 0, sq, oracle, 1).unwrap();
+        let target = (oracle as u128 * 2) as u64;
+        let mut slot = 2u64;
+        while engine.group.assets[0].effective_price < target && slot < 5000 {
+            let next = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, attacker] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            slot += 1;
+        }
+        let conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+        let cap_after_conv = engine.accounts[attacker].capital;
+        println!("    convert returned {:?}  cap={}", conv.as_ref().map(|v| v / 1_000_000), cap_after_conv / 1_000_000);
+        let cert = engine.accounts[attacker].health_cert;
+        let prices = engine.effective_prices();
+        let safe = ((cert.certified_equity as u128).saturating_sub(cert.certified_initial_req)).saturating_sub(usdc(50));
+        let attempt_amount = safe.min(cap_after_conv);
+        let w = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], attempt_amount, &prices);
+        let withdrawn1 = cap_after_conv - engine.accounts[attacker].capital;
+        println!("    partial-withdraw ${} → {:?}, actually ${}",
+            attempt_amount / 1_000_000,
+            w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            withdrawn1 / 1_000_000);
+        // Oracle revert
+        while engine.group.assets[0].effective_price > oracle && slot < 10000 {
+            let next = clamp_oracle(oracle, engine.group.assets[0].effective_price, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, attacker] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
+                let leg = engine.accounts[attacker].legs[0];
+                if leg.active {
+                    let mut a = engine.accounts[attacker];
+                    let _ = engine.group.liquidate_account_not_atomic(
+                        &mut a,
+                        LiquidationRequestV16 { asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5 },
+                        &prices);
+                    engine.accounts[attacker] = a;
+                }
+                break;
+            }
+            slot += 1;
+        }
+        let final_cap = engine.accounts[attacker].capital;
+        let final_pnl = engine.accounts[attacker].pnl;
+        let lp_final = engine.accounts[lp].capital;
+        let net_change = withdrawn1 as i128 + final_cap as i128 + final_pnl - deposit as i128;
+        let lp_change = lp_final as i128 - 50_000_000 * USDC_DECIMALS as i128;
+        println!("    after revert: attacker_cap=${} pnl=${} | LP_cap_Δ=${} | NET to attacker: ${} {}",
+            final_cap / 1_000_000, final_pnl / 1_000_000,
+            lp_change / 1_000_000,
+            net_change / 1_000_000,
+            if net_change > 0 { "★★ EXTRACTION ★★" } else { "no extraction" });
+        println!("    engine invariants: {:?}", engine.group.assert_public_invariants());
+        println!();
+    };
+    run_partial_withdraw_attack("A2-instant", make_instant_bounty_config(2));
+    run_partial_withdraw_attack("A2-default", make_bounty_config(2));
+
+    // === Drift-style attack with partial withdraw attempt ===
+    println!("  [A2-original-instant-no-helper] Drift-style oracle pump → convert → PARTIAL withdraw → oracle revert");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let attacker = engine.add_account(99).unwrap();
+        let deposit = usdc(1_000);
+        engine.deposit(attacker, deposit).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(attacker, lp, 0, sq, oracle, 1).unwrap();
+        // Pump to +100%
+        let target = (oracle as u128 * 2) as u64;
+        let mut slot = 2u64;
+        while engine.group.assets[0].effective_price < target && slot < 5000 {
+            let next = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, attacker] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            slot += 1;
+        }
+        // Convert all pnl
+        let conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+        let cap_after_conv = engine.accounts[attacker].capital;
+        let pnl_after_conv = engine.accounts[attacker].pnl;
+        println!("    after pump+convert: cap=${}, pnl=${}, convert returned {:?}",
+            cap_after_conv / 1_000_000, pnl_after_conv / 1_000_000,
+            conv.as_ref().map(|v| v / 1_000_000));
+        // Cert state
+        let cert = engine.accounts[attacker].health_cert;
+        println!("    IM req=${}, MM req=${}, free above IM = ${}",
+            cert.certified_initial_req / 1_000_000,
+            cert.certified_maintenance_req / 1_000_000,
+            (cert.certified_equity - cert.certified_initial_req as i128) / 1_000_000);
+        // Try to withdraw ALL above IM
+        let prices = engine.effective_prices();
+        let safe = ((cert.certified_equity as u128).saturating_sub(cert.certified_initial_req)).saturating_sub(usdc(50));
+        let attempt_amount = safe.min(cap_after_conv);
+        println!("    attempting partial withdraw of ${} (cap=${}, leaves IM headroom)",
+            attempt_amount / 1_000_000, cap_after_conv / 1_000_000);
+        let w = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], attempt_amount, &prices);
+        let withdrawn1 = cap_after_conv - engine.accounts[attacker].capital;
+        println!("    withdraw result: {:?} -- actually withdrew ${}",
+            w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            withdrawn1 / 1_000_000);
+        // Now oracle returns to truth
+        let truth = oracle;
+        while engine.group.assets[0].effective_price > truth && slot < 10000 {
+            let next = clamp_oracle(truth, engine.group.assets[0].effective_price, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, attacker] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
+                let leg = engine.accounts[attacker].legs[0];
+                if leg.active {
+                    let mut a = engine.accounts[attacker];
+                    let _ = engine.group.liquidate_account_not_atomic(
+                        &mut a,
+                        LiquidationRequestV16 { asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5 },
+                        &prices);
+                    engine.accounts[attacker] = a;
+                }
+                break;
+            }
+            slot += 1;
+        }
+        let final_cap = engine.accounts[attacker].capital;
+        let final_pnl = engine.accounts[attacker].pnl;
+        let lp_final = engine.accounts[lp].capital;
+        let total_extracted = withdrawn1;
+        let net_in_account = final_cap as i128 + final_pnl;
+        println!("    after oracle revert:");
+        println!("      attacker cap=${}, pnl=${}", final_cap / 1_000_000, final_pnl / 1_000_000);
+        println!("      LP cap=${} (was $50000000)", lp_final / 1_000_000);
+        println!("      total extracted: ${}", total_extracted / 1_000_000);
+        println!("      attacker total economic position: ${} (deposit was $1000)",
+            (total_extracted as i128 + net_in_account) / 1_000_000);
+        let net_change = total_extracted as i128 + net_in_account - deposit as i128;
+        println!("      NET to attacker vs deposit: ${} {}",
+            net_change / 1_000_000,
+            if net_change > 0 { "★ EXTRACTION" } else { "no extraction" });
+        let lp_change = lp_final as i128 - 50_000_000 * USDC_DECIMALS as i128;
+        println!("      LP capital change: ${}", lp_change / 1_000_000);
+        let inv = engine.group.assert_public_invariants();
+        println!("      engine invariants: {:?}", inv);
+    }
+    println!();
+    println!("  [A] Drift-style oracle pump attack");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let attacker = engine.add_account(99).unwrap();
+        let deposit = usdc(1_000);
+        engine.deposit(attacker, deposit).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(attacker, lp, 0, sq, oracle, 1).unwrap();
+        // Pump asset 0 oracle to +100%
+        let target = (oracle as u128 * 2) as u64;
+        let mut slot = 2u64;
+        while engine.group.assets[0].effective_price < target && slot < 5000 {
+            let next = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
+            let _ = engine.accrue_asset(0, slot, next, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, attacker] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            slot += 1;
+        }
+        let cap_before = engine.accounts[attacker].capital;
+        let pnl_before = engine.accounts[attacker].pnl;
+        // Try to convert + withdraw
+        let conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+        let cap_after_conv = engine.accounts[attacker].capital;
+        let prices = engine.effective_prices();
+        let w = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap_after_conv, &prices);
+        let withdrew = cap_after_conv - engine.accounts[attacker].capital;
+        println!("    after pump: cap=${}, pnl=${}", cap_before / 1_000_000, pnl_before / 1_000_000);
+        println!("    convert_released_pnl: {:?}", conv.as_ref().map(|v| v / 1_000_000));
+        println!("    withdraw: {:?}", w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        println!("    actually withdrew: ${}", withdrew / 1_000_000);
+        println!("    net extraction vs $1000 deposit: ${}", withdrew as i128 / 1_000_000 - 1000);
+    }
+    println!();
+
+    // === Backing extraction fuzz with instant config ===
+    println!("  [B] Backing extraction fuzz (500 seeds, instant h-lock)");
+    {
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        let max_excess = AtomicI64::new(0);
+        let excess_count = AtomicU64::new(0);
+        let inv_fails = AtomicU64::new(0);
+        let seeds = 500u64;
+        (0..seeds).into_par_iter().for_each(|seed| {
+            let mut rng = Rng::new(seed.wrapping_mul(0xD133_7AF1));
+            let mut engine = V16Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(50_000_000)).unwrap();
+            let attacker = engine.add_account(99).unwrap();
+            let deposit = usdc(1_000);
+            engine.deposit(attacker, deposit).unwrap();
+            let _ = engine.accrue_asset(0, 1, oracle, 0);
+            let _ = engine.accrue_asset(1, 1, oracle, 0);
+            let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+            let _ = engine.trade(attacker, lp, 0, sq, oracle, 1);
+            if rng.next_u64() % 2 == 0 {
+                let _ = engine.trade(lp, attacker, 1, sq, oracle, 1);
+            }
+            let mut slot = 2u64;
+            for _ in 0..200 {
+                for a in 0..2 {
+                    let mv = (rng.next_u64() % 81) as i64 - 40;
+                    let cur = engine.group.assets[a].effective_price;
+                    let target = ((cur as i128) + (cur as i128 * mv as i128 / 10_000)) as u64;
+                    let _ = engine.accrue_asset(a, slot, clamp_oracle(target.max(1), cur, max_move, 1), 0);
+                }
+                let prices = engine.effective_prices();
+                for idx in [lp, attacker] {
+                    let mut acc = engine.accounts[idx];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                    engine.accounts[idx] = acc;
+                }
+                slot += 1;
+                if rng.next_u64() % 5 == 0 {
+                    let _ = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+                    let cap = engine.accounts[attacker].capital;
+                    if cap > 0 {
+                        let want = ((rng.next_u64() as u128) % cap) + 1;
+                        let _ = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], want, &prices);
+                    }
+                }
+                if engine.group.assert_public_invariants().is_err() {
+                    inv_fails.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // Close all + final extract
+            let prices = engine.effective_prices();
+            for li in 0..2 {
+                let leg = engine.accounts[attacker].legs[li];
+                if leg.active {
+                    let q = leg.basis_pos_q.unsigned_abs();
+                    let was_long = leg.side == SideV16::Long;
+                    let _ = if was_long { engine.trade(lp, attacker, li, q, prices[li], 1) }
+                            else { engine.trade(attacker, lp, li, q, prices[li], 1) };
+                }
+            }
+            let _ = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+            let cap = engine.accounts[attacker].capital;
+            let _ = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap, &prices);
+            let final_cap = engine.accounts[attacker].capital;
+            let withdrawn = deposit.saturating_sub(final_cap);
+            if withdrawn > deposit {
+                excess_count.fetch_add(1, Ordering::Relaxed);
+                let ex = (withdrawn - deposit) as i64;
+                if ex > max_excess.load(Ordering::Relaxed) {
+                    max_excess.store(ex, Ordering::Relaxed);
+                }
+            }
+        });
+        println!("    seeds: {}, excess-withdraw seeds: {}, max excess: ${}, invariant fails: {}",
+            seeds,
+            excess_count.load(Ordering::Relaxed),
+            max_excess.load(Ordering::Relaxed) / 1_000_000,
+            inv_fails.load(Ordering::Relaxed));
+    }
+    println!();
+
+    // === Spread realize with instant config ===
+    println!("  [C] Spread profit realization with instant config");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        engine.trade(lp, user, 1, sq, oracle, 1).unwrap();
+        let t_sol = (oracle as u128 * 110 / 100) as u64;
+        let t_eth = (oracle as u128 * 90 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p0 = engine.group.assets[0].effective_price;
+            let p1 = engine.group.assets[1].effective_price;
+            if p0 >= t_sol && p1 <= t_eth { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(t_sol, p0, max_move, 1), 0);
+            let _ = engine.accrue_asset(1, slot, clamp_oracle(t_eth, p1, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        // Close both legs
+        let prices = engine.effective_prices();
+        let _ = engine.trade(lp, user, 0, sq, prices[0], 1);
+        let _ = engine.trade(user, lp, 1, sq, prices[1], 1);
+        let mut ua = engine.accounts[user];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut ua, &prices);
+        engine.accounts[user] = ua;
+        let conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[user]);
+        let cap_after = engine.accounts[user].capital;
+        let prices2 = engine.effective_prices();
+        let w = engine.group.withdraw_not_atomic(&mut engine.accounts[user], cap_after, &prices2);
+        let withdrawn = cap_after - engine.accounts[user].capital;
+        println!("    convert: {:?}", conv.as_ref().map(|v| v / 1_000_000));
+        println!("    withdraw: {:?}", w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        println!("    User realized USDC: ${} (deposited $1000)", withdrawn / 1_000_000);
+    }
+    println!();
+
+    // === Sanity: ratchet round-trip ===
+    println!("  [D] Round-trip ratchet (±10%) with instant config");
+    for div_pct in [2u64, 5, 10] {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let sq = usdc(2_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        let walk = |engine: &mut V16Engine, target: u64, slot: &mut u64| {
+            while engine.group.assets[0].effective_price != target {
+                let next = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
+                let _ = engine.accrue_asset(0, *slot, next, 0);
+                let prices = engine.effective_prices();
+                for idx in [lp, user] {
+                    let mut acc = engine.accounts[idx];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                    engine.accounts[idx] = acc;
+                }
+                *slot += 1;
+                if *slot > 5000 { break; }
+            }
+        };
+        let mut slot = 2u64;
+        let down = (oracle as u128 * (100 - div_pct) as u128 / 100) as u64;
+        walk(&mut engine, down, &mut slot);
+        walk(&mut engine, oracle, &mut slot);
+        let acc = &engine.accounts[user];
+        let total = acc.capital as i128 + acc.pnl;
+        let lost = 1000_000_000i128 - total;
+        println!("    ±{}% round trip: cap=${}, pnl=${}, lost=${} ({:.1}%)",
+            div_pct, acc.capital / 1_000_000, acc.pnl / 1_000_000,
+            lost / 1_000_000, lost as f64 / 10_000_000.0);
+    }
 }
 
 /// Inspect the v16 per-domain bucket layout to verify isolation.
@@ -7361,6 +7794,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_buckets") {
         probe_v16_bucket_layout();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_instant") {
+        probe_v16_instant_h_lock_attacks();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
