@@ -1,104 +1,118 @@
-# v16 — critical: oracle pump + convert + partial withdraw extracts LP capital
+# v16 — partial fix verified, new corruption state on retry path
 
 **Date:** 2026-05-18
-**Engine:** `v16.8.0 Realizable Full Shared Cross-Margin` (engine commit `a37eb5f`)
-**Reproducible via:** `cargo run --release -- --test=v16_instant` (probe `[A2-instant]` and `[A2-default]`)
+**Engine:** v16 `4f1ff20 Lock source-backed converted capital` (on top of `a37eb5f`)
+**Stress branch:** `v16`
+**Reproducible via:** `cargo run --release -- --test=v16_instant`
 
-## Summary
+## TL;DR
 
-An attacker with $1,000 cap extracts $4,904 of real USDC from the LP by:
+The new commit `4f1ff20` adds `source_converted_capital_lock[V16_DOMAIN_COUNT]` and gates `withdraw_not_atomic` so the converted capital cannot be withdrawn while the source domain has active exposure. This **prevents the original LP→attacker cash extraction** but leaves the account in a corrupt state where `capital < lock`, with the attacker holding $4,973 of LP capital that they **cannot withdraw** and the LP cannot **recover**.
 
-1. Opening a long position on asset 0 at oracle truth ($200)
-2. Pumping the asset 0 oracle to $400 over ~150 slots at the engine's max permitted rate (45 bps/slot)
-3. Calling `convert_released_pnl_to_capital_not_atomic` — succeeds, $5,000 of inflated PnL moves into capital
-4. Calling `withdraw_not_atomic($5,449)` — succeeds because the engine's IM check sees post-withdraw cap ($550) ≥ IM req ($500)
-5. Oracle reverts to truth ($200); the open position takes a $5,000 loss; cap drains to $0; bankruptcy residual $4,450 is booked against the LP-side source domain
-
-The engine's `assert_public_invariants` reports `Ok` throughout. No invariant is violated. Every accounting step is internally consistent. But real value flows from LP to attacker.
-
-## Reproduction output
+Net economic flow under the attack with the new fix:
 
 ```
-[A2-instant] Drift-style oracle pump → convert → PARTIAL withdraw → revert  (h_min=0, h_max=1)
+LP_cap_Δ:              -$5000
+Attacker cash out:     $0           ← fix works for immediate extraction
+Attacker account cap:  $4973        ← phantom locked capital, unrecoverable
+Engine top-level invariants:  Ok    ← per-account inconsistency invisible to global check
+```
+
+The attacker doesn't profit, but the LP still loses $5000 — a permanent denial-of-funds rather than a theft.
+
+## The probe output
+
+```
+[A2-instant] h_min=0, h_max=1:
   convert returned Ok(5000)  cap=5999
-  partial-withdraw $5449 → Ok("Ok"), actually $5449
-  after revert: attacker_cap=$455 pnl=$0 | LP_cap_Δ=$-5000 | NET to attacker: $4904 ★★ EXTRACTION ★★
-  engine invariants: Ok(())
-
-[A2-default] Drift-style oracle pump → convert → PARTIAL withdraw → revert  (h_min=0, h_max=30)
-  convert returned Ok(5000)  cap=5999
-  partial-withdraw $5449 → Ok("Ok"), actually $5449
-  after revert: attacker_cap=$455 pnl=$0 | LP_cap_Δ=$-5000 | NET to attacker: $4904 ★★ EXTRACTION ★★
-  engine invariants: Ok(())
+  partial-withdraw $5449 → Err("LockActive"), actually $0          ← fix blocks this
+  after revert (before close): cap=$4973 pnl=$0
+  after close+convert+withdraw: cap=$4973 pnl=$0 | withdraw2=Err("InvalidLeg")
+  debug: source_converted_capital_lock sum = $5000 | active legs = [0]
+  engine invariants: Ok(())                                         ← top-level passes
+  after second refresh: lock sum = $5000 (refresh=Err("InvalidLeg")) ← per-account fails
+  retry withdraw $4973: Err("InvalidLeg")
 ```
 
-## Why the earlier `v16_drift` probe missed it
+The same outcome under `[A2-default]` with `h_max=30`.
 
-My original `v16_drift` probe attempted to withdraw the FULL converted cap ($5,999). The engine correctly rejected that because post-withdraw cap would be $0 (below IM). The probe stopped there with `Withdrawn: $0`.
+## Sequence of events
 
-The attack only works with a PARTIAL withdraw that leaves enough cap to satisfy IM. My probe didn't try that. With the partial withdraw, the engine permits the extraction.
+1. Attacker deposits $1,000, opens long $5k SOL at oracle $200 (5x, IM=$500).
+2. Pumps oracle $200 → $400 over ~150 slots at the engine's max-permitted 45 bps/slot.
+3. `convert_released_pnl_to_capital_not_atomic`: **Ok(5000)**.
+   - cap: $999 → $5999
+   - `source_converted_capital_lock[(SOL, Short)]`: 0 → $5000
+   - LP's reserved backing for `(SOL, Short)`: consumed
+4. `withdraw_not_atomic($5449)`: **Err(LockActive)** (the new fix).
+5. Oracle reverts $400 → $200.
+   - Settlement loop drains cap as the long position takes MTM loss
+   - Settle (`settle_negative_pnl_from_principal`) ignores the lock and pulls from `capital` directly: `paid = capital.min(loss)`
+   - When cap drops, the account state has `lock > capital` — the fix's invariant is violated, but `settle` doesn't enforce or re-balance it
+6. Liquidation triggers (since the leg's MTM at the lower oracle exceeds remaining unlocked cap)
+   - Leg remains `active = true` (clearing is presumably pending in the engine's state)
+   - The lock is NOT released (`release_inactive_source_converted_capital_locks` only fires when the source domain has *no active exposure*)
+7. Subsequent operations fail with `InvalidLeg`:
+   - `full_account_refresh`: validates account shape → `source_converted_capital_lock > capital` → `Err(InvalidLeg)`
+   - `withdraw_not_atomic`: same validation → `Err(InvalidLeg)`
+   - `convert_released_pnl_to_capital_not_atomic`: same
 
-## Why the engine permits it
+The attacker now has $4,973 of capital they cannot move, the LP has lost $5,000, and the engine considers itself "Ok" at the global level because no top-level invariant tracks per-account lock-vs-cap.
 
-In `convert_released_pnl_to_capital_not_atomic` (v16.rs:3367):
+## Why settle doesn't respect the lock
+
+`settle_negative_pnl_from_principal` (v16.rs:3338):
 
 ```
-let converted = if account_has_source_claims(account) {
-    global_support.min(account_source_realizable_support(account, released))
-} else {
-    global_support
-};
+let paid = account.capital.min(loss);  // <-- drains full cap, ignores lock
+account.capital -= paid;
 ```
 
-When the LP has refreshed during the pump, the engine has reserved LP capital as backing for `(SOL, Short)` source domain (via `reserve_new_capital_backed_loss_for_source_domain_not_atomic`). `account_source_realizable_support` returns the full inflated PnL because backing exists at 100% credit rate.
+It treats the locked amount as just capital. When the oracle reverts and the position loses, that loss has to settle somewhere; settle pulls from `capital` regardless of which portion is locked.
 
-Convert burns the face claim and **consumes** the backing — both are written down atomically. So at convert time the LP's USDC is committed irreversibly to the attacker, even though the underlying position is still open at an inflated price.
+`validate_source_converted_capital_locks` (v16.rs:3112) then says:
 
-Then `withdraw_not_atomic` performs only the standard IM check:
 ```
-post_withdraw_equity >= IM_requirement
+if locked > account.capital {
+    return Err(V16Error::InvalidLeg);
+}
 ```
 
-At pump peak, IM_req = 5% × $5k notional = $250 (×2 for asset 0/1 if applicable). Post-withdraw equity = $550 cap. Check passes, withdrawal succeeds.
+This is only called from `validate_account_shape`, which runs at the start of mutations but doesn't re-balance the account when it would otherwise produce an inconsistent state. So the state is allowed to drift into `lock > capital`, after which all favorable actions on the account are blocked.
 
-When the oracle returns to truth:
-- Long position MTM = (200 − 400) × 25 = −$5,000
-- settle drains all $550 of remaining cap
-- Bankruptcy residual = $4,450, booked against the source domain
-- Insurance / social loss absorbs it (in this case the LP)
+## What "extraction" means under this fix
 
-## What v16 is missing
+The original attack flow ($4,904 net to attacker) is blocked — the attacker doesn't get LP funds in their pocket. But:
 
-The convert path consumes counterparty backing for an unrealized gain. The gain comes from an oracle that can revert. The engine has no mechanism to:
+- LP capital change: **−$5,000** (real, irreversible)
+- Attacker account cap: **$4,973** (stuck, irrecoverable)
+- $27 disappears to fees and rounding
 
-1. **Lock the converted capital** to the position's continued solvency (e.g., reserved_pnl) — once converted, it's regular cap and can be withdrawn.
-2. **Reverse the convert** when the position takes an offsetting loss — instead the loss drains cap normally and the LP eats the residual.
-3. **Detect rapid sustained oracle moves** (the spec mentions `target_effective_lag`, but the per-slot max-move envelope is respected so no lag is detected).
-4. **Cooldown convert/withdraw** after large MTM swings (the h-lock would do this if it triggered, but `bankruptcy_hlock_active` only flips on actual bankruptcy events, not on large favorable MTM).
+So no net theft, but no symmetric reversal either. The LP eats a $5,000 loss and the attacker eats a $1,000 deposit loss. The net result is **$6,000 destroyed**, $4,973 of which sits as phantom capital with broken validity.
 
-## Severity
+This is "deny extraction at the cost of denying recovery." Whether that's acceptable depends on the deployment's risk tolerance — but it's not the clean defense the spec implies (§0.6 "Protected principal is senior" suggests LP capital should not be at risk from oracle manipulation within the per-slot envelope).
 
-For a bounty-relevant deployment, this is a working capital-extraction primitive that scales with:
-- Time to walk the oracle to a profitable extreme (~150 slots at 45 bps each — Solana slots are ~400ms, so ~60 seconds)
-- LP capitalization (the attacker can extract up to LP's reserved backing capacity)
-- The attacker's own deposit relative to position size (the higher the leverage, the larger the multiple)
+## What a complete fix needs
 
-At 5x leverage with $1k cap, the attacker extracted ~5x their deposit in a single attack cycle. At 20x leverage (which the spec envelope allows with smaller IM_bps), the multiplier scales accordingly.
+The half-fix locks **withdrawal** of the converted amount but doesn't tie that amount to the **position's continued solvency**. A complete fix needs one of:
 
-## Mitigation ideas (not implemented in engine)
+1. **Settle respects the lock**: when settle would drain cap below the source-locked amount, the unpaid portion routes to bankruptcy residual immediately rather than waiting. The lock then unwinds atomically with the residual booking.
+2. **Convert reserves against a reverse swing**: convert can only succeed if the account's remaining unlocked cap covers the worst-case MTM reversion to entry price (or some bounded envelope). This is closer to v14/v15 behavior — less capital efficient but provably safe.
+3. **Defer realization until close**: don't allow convert on open positions; require the position to be closed (cleanly or via liquidation) before PnL realizes into cap. The close trade locks in the price at execution time, not the prevailing oracle.
 
-1. **Lock converted capital to position lifetime:** when `convert_released_pnl_to_capital` runs, add the converted amount to `reserved_pnl`-equivalent on `capital`, preventing withdrawal until the position is closed at an actual settled price.
-2. **Defer realization until close:** disallow converting unrealized PnL on open positions; require close-trade or rebalance-reduce to flow PnL into the realized bucket first.
-3. **Rate-limit convert by recent oracle drift:** if the asset's effective_price has moved by more than X bps over the last N slots, gate `convert_released_pnl_to_capital` for that source domain.
-4. **Oracle-revert reversal of convert:** track converted amounts attributed to specific source-domain MTM, and reverse them if the source domain's MTM drops below the converted face.
+Option (1) is the smallest delta and preserves convert's spec semantics. Option (3) is closest to a battle-tested approach.
 
-Option (1) is the simplest and matches HL's withdrawal-lock semantics. Option (2) is the most conservative and matches v14/v15's safer (but less capital-efficient) behavior.
+## Coverage in other probes
 
-## Engine commits in scope
+The other probes in the v16 suite still pass clean:
 
-- `a37eb5f Update v16 source-credit spec`
-- `b1ee2a1 Verify v16 source credit engine`
-- Previously: rewiring of `apply_haircut_bounded_close_loss_to_pnl` and `apply_signed_kf_delta_to_pnl` to consult source-credit, plus `reserve_new_capital_backed_loss_for_source_domain_not_atomic` in `settle_leg_kf_effects`
+- `v16_backing_fuzz`: 200,000 transitions, 0 invariant fails
+- `v16_extract`: 500 adversarial seeds, max single-seed extraction $0
+- `v16_extras`: 5 invariants × 1000 seeds, 0 fails
+- `v16_buckets`: per-domain isolation holds
+- Capital efficiency, ratchet, spread-realize: all clean under both h_max=1 and h_max=30
+
+The extraction path requires DIRECTED oracle manipulation (pump → convert → withdraw) which random-walk fuzzes don't hit. The `v16_instant` probe ([A2-*]) is the targeted scenario.
 
 ## Reproduction
 
@@ -106,4 +120,4 @@ Option (1) is the simplest and matches HL's withdrawal-lock semantics. Option (2
 cargo run --release -- --test=v16_instant
 ```
 
-Look for the `[A2-*]` lines showing `NET to attacker: $4904 ★★ EXTRACTION ★★`.
+Look at `[A2-instant]` / `[A2-default]` for the post-fix behavior.

@@ -3316,17 +3316,77 @@ fn probe_v16_instant_h_lock_attacks() {
             }
             slot += 1;
         }
+        let cap_after_revert = engine.accounts[attacker].capital;
+        let pnl_after_revert = engine.accounts[attacker].pnl;
+        // POST: try to fully close the leg, then withdraw everything.
+        let prices = engine.effective_prices();
+        let leg = engine.accounts[attacker].legs[0];
+        if leg.active {
+            let q = leg.basis_pos_q.unsigned_abs();
+            // user is long, so closing means user becomes short in a new trade
+            let _ = engine.trade(lp, attacker, 0, q, prices[0], 1);
+        }
+        // Refresh
+        for idx in [lp, attacker] {
+            let mut acc = engine.accounts[idx];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[idx] = acc;
+        }
+        let _ = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+        let cap_post_close = engine.accounts[attacker].capital;
+        let post_w = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap_post_close, &prices);
+        let final_withdrawn2 = cap_post_close - engine.accounts[attacker].capital;
+        let total_withdrawn = withdrawn1 + final_withdrawn2;
         let final_cap = engine.accounts[attacker].capital;
         let final_pnl = engine.accounts[attacker].pnl;
         let lp_final = engine.accounts[lp].capital;
-        let net_change = withdrawn1 as i128 + final_cap as i128 + final_pnl - deposit as i128;
+        let net_change = total_withdrawn as i128 + final_cap as i128 + final_pnl - deposit as i128;
         let lp_change = lp_final as i128 - 50_000_000 * USDC_DECIMALS as i128;
-        println!("    after revert: attacker_cap=${} pnl=${} | LP_cap_Δ=${} | NET to attacker: ${} {}",
+        println!("    after revert (before close): cap=${} pnl=${}",
+            cap_after_revert / 1_000_000, pnl_after_revert / 1_000_000);
+        println!("    after close+convert+withdraw: cap=${} pnl=${} | withdraw2={:?} (${})",
             final_cap / 1_000_000, final_pnl / 1_000_000,
+            post_w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            final_withdrawn2 / 1_000_000);
+        println!("    total extracted from engine: ${} | LP_cap_Δ=${} | NET to attacker: ${} {}",
+            total_withdrawn / 1_000_000,
             lp_change / 1_000_000,
             net_change / 1_000_000,
             if net_change > 0 { "★★ EXTRACTION ★★" } else { "no extraction" });
+        // Show source-credit-lock state and any active legs
+        let acc = &engine.accounts[attacker];
+        let mut lock_sum = 0u128;
+        for d in 0..(cfg.max_portfolio_assets as usize * 2) {
+            lock_sum += acc.source_converted_capital_lock[d];
+        }
+        let active_legs: Vec<usize> = (0..(cfg.max_portfolio_assets as usize)).filter(|&i| acc.legs[i].active).collect();
+        println!("    debug: source_converted_capital_lock sum = ${} | active legs = {:?}",
+            lock_sum / 1_000_000, active_legs);
         println!("    engine invariants: {:?}", engine.group.assert_public_invariants());
+        // Try another refresh + withdraw cycle (lock release should happen on refresh)
+        let prices = engine.effective_prices();
+        let mut acc2 = engine.accounts[attacker];
+        let r_refresh = engine.group.full_account_refresh(&mut acc2, &prices);
+        engine.accounts[attacker] = acc2;
+        let lock_after_refresh: u128 = (0..(cfg.max_portfolio_assets as usize * 2))
+            .map(|d| engine.accounts[attacker].source_converted_capital_lock[d]).sum();
+        println!("    after second refresh: lock sum = ${} (refresh={:?})",
+            lock_after_refresh / 1_000_000,
+            r_refresh.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        let cap_now = engine.accounts[attacker].capital;
+        let w3 = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap_now, &prices);
+        let withdrew3 = cap_now - engine.accounts[attacker].capital;
+        println!("    retry withdraw ${}: {:?} (actually ${})",
+            cap_now / 1_000_000,
+            w3.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            withdrew3 / 1_000_000);
+        let final_grand_total = total_withdrawn + withdrew3;
+        let grand_net = final_grand_total as i128 + engine.accounts[attacker].capital as i128 + engine.accounts[attacker].pnl - deposit as i128;
+        println!("    GRAND TOTAL extracted = ${}, NET = ${} {}",
+            final_grand_total / 1_000_000,
+            grand_net / 1_000_000,
+            if grand_net > 0 { "★★ EXTRACTION ★★" } else { "no extraction" });
         println!();
     };
     run_partial_withdraw_attack("A2-instant", make_instant_bounty_config(2));
