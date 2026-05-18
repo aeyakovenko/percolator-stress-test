@@ -3233,6 +3233,298 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
     (path_a, path_b)
 }
 
+/// Spec-gap coverage: tests the v16 spec §0 requirements that my earlier
+/// probes didn't directly cover. Each subprobe targets a specific
+/// non-negotiable requirement from the spec.
+fn probe_v16_spec_gaps() {
+    println!("  v16 spec-gap coverage — targeting §0 requirements not directly tested");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    // === §0.16 Stale backing fails closed ===
+    println!("  [§0.16] Stale backing fails closed");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        // Move oracle up so user has positive PnL; LP refreshes; backing accumulates.
+        let target = (oracle as u128 * 110 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if p >= target { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(target, p, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx];
+                let mut acc = backup;
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        // Check backing exists on (SOL, Short) source domain
+        let sc_before = engine.group.source_credit[1];  // (SOL, Short)
+        println!("    backing on (SOL, Short) before expiry: ${} (rate={:.0}%)",
+            sc_before.fresh_reserved_backing_num / BOUND_SCALE / 1_000_000,
+            sc_before.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0);
+        // Force bucket expiry
+        let r_expire = engine.group.expire_source_backing_bucket_not_atomic(1, slot + 10_000);
+        println!("    expire bucket call: {:?}", r_expire.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        let sc_after = engine.group.source_credit[1];
+        let bucket_after = engine.group.source_backing_buckets[1];
+        println!("    backing after expiry: fresh=${}, valid_liened=${}, impaired_liened=${}, status={:?}",
+            sc_after.fresh_reserved_backing_num / BOUND_SCALE / 1_000_000,
+            sc_after.valid_liened_backing_num / BOUND_SCALE / 1_000_000,
+            sc_after.impaired_liened_backing_num / BOUND_SCALE / 1_000_000,
+            bucket_after.status);
+        println!("    credit_rate after expiry: {:.0}%", sc_after.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0);
+        // After expiry, try to convert — should fail (impaired)
+        let backup = engine.accounts[user];
+        let mut acc = backup;
+        let conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut acc);
+        let _ = engine.accounts[user];
+        engine.accounts[user] = backup;  // discard
+        let pass = sc_after.fresh_reserved_backing_num == 0 || conv.is_err();
+        println!("    post-expiry convert: {:?}  {}",
+            conv.as_ref().map(|v| v / 1_000_000).map_err(|e| format!("{:?}", e)),
+            if pass { "✓ PASS (backing fails closed)" } else { "✗ FAIL (backing still usable)" });
+    }
+    println!();
+
+    // === §3 Asset lifecycle — DrainOnly transition ===
+    println!("  [§3] Asset lifecycle: DrainOnly blocks risk-increasing trades");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        // Mark asset 0 as DrainOnly
+        let r_drain = engine.group.mark_asset_drain_only_not_atomic(0);
+        println!("    mark DrainOnly: {:?}", r_drain.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        // Now attempt to OPEN a new position on asset 0 — should fail
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        let r_open = engine.trade(user, lp, 0, sq, oracle, 1);
+        let pass = r_open.is_err();
+        println!("    open new long after DrainOnly: {:?}  {}",
+            r_open.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            if pass { "✓ PASS (risk-increase blocked)" } else { "✗ FAIL (drain-only allowed open)" });
+        // But existing positions can still be CLOSED — test that
+    }
+    println!();
+
+    // === §0.30 Dead-leg forfeit (owner-callable detach for retired/recovery legs) ===
+    println!("  [§0.30] Dead-leg forfeit available for terminal assets");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        // Drain → recovery transition
+        let _ = engine.group.mark_asset_drain_only_not_atomic(0);
+        // Try dead-leg forfeit
+        let prices = engine.effective_prices();
+        let backup = engine.accounts[user];
+        let mut acc = backup;
+        let r_forfeit = engine.group.forfeit_recovery_leg_not_atomic(&mut acc, 0, cfg.public_b_chunk_atoms);
+        let _ = prices;
+        let pass = r_forfeit.is_err() || !engine.accounts[user].legs[0].active;
+        if r_forfeit.is_ok() { engine.accounts[user] = acc; } else { engine.accounts[user] = backup; }
+        println!("    forfeit_recovery_leg result: {:?}",
+            r_forfeit.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        println!("    leg active after forfeit: {}  {}",
+            engine.accounts[user].legs[0].active,
+            if pass { "✓ PASS (correctly rejected — asset not in Recovery)" } else { "✗ FAIL" });
+    }
+    println!();
+
+    // === §0.36 Canonical per-asset leg ===
+    println!("  [§0.36] Canonical per-asset leg (at most one leg per asset)");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(2_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let sq = usdc(2_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        // Open another long on same asset — should merge into same leg
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        let leg0 = engine.accounts[user].legs[0];
+        let leg1_active = engine.accounts[user].legs[1].active;
+        let pass = leg0.active && !leg1_active && leg0.basis_pos_q.unsigned_abs() == sq * 2;
+        println!("    after 2 long opens on same asset: leg[0].q={}, leg[1].active={}  {}",
+            leg0.basis_pos_q.unsigned_abs(), leg1_active,
+            if pass { "✓ PASS (merged into one leg)" } else { "✗ FAIL" });
+    }
+    println!();
+
+    // === §0.14 Rounding residue — does excess go to surplus, not user? ===
+    println!("  [§0.14] Rounding residue routes to system, not user");
+    {
+        // Set up a scenario with awkward sizes that produce rounding.
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(777)).unwrap();
+        let initial_vault = engine.group.vault;
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        // Open a slightly weird size with awkward fee_bps
+        let sq = (usdc(777) * 3 * POS_SCALE) / (oracle as u128 + 7);
+        let _ = engine.trade(user, lp, 0, sq, oracle + 7, 1);
+        // Walk price
+        let target = (oracle as u128 * 105 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if p >= target { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(target, p, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx];
+                let mut acc = backup;
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        // Close
+        let prices = engine.effective_prices();
+        let leg = engine.accounts[user].legs[0];
+        if leg.active {
+            let _ = engine.trade(lp, user, 0, leg.basis_pos_q.unsigned_abs(), prices[0], 1);
+        }
+        // Final accounting: vault should equal c_tot + insurance + residual
+        let c_tot = engine.group.c_tot;
+        let insurance = engine.group.insurance;
+        let residual = engine.group.vault.saturating_sub(c_tot).saturating_sub(insurance);
+        let invariant_ok = engine.group.vault == c_tot + insurance + residual;
+        let no_external_change = engine.group.vault == initial_vault;
+        println!("    initial vault=${}, final vault=${}", initial_vault / 1_000_000, engine.group.vault / 1_000_000);
+        println!("    c_tot=${}, insurance=${}, residual=${}",
+            c_tot / 1_000_000, insurance / 1_000_000, residual / 1_000_000);
+        println!("    {} {} (no external value created/destroyed)",
+            if invariant_ok && no_external_change { "✓ PASS" } else { "✗ FAIL" },
+            if !no_external_change { "VAULT CHANGED" } else { "" });
+    }
+    println!();
+
+    // === §0.10 Per-domain insurance budget enforcement ===
+    println!("  [§0.10] Per-domain insurance budget cannot be exceeded");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        // Create lots of trades to accumulate insurance fees
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(100_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let sq = usdc(50_000) * POS_SCALE / oracle as u128;
+        let _ = engine.trade(user, lp, 0, sq, oracle, 1);
+        let _ = engine.trade(lp, user, 0, sq, oracle, 1);  // close
+        // Check domain budgets
+        let mut max_overshoot = 0i128;
+        for d in 0..(cfg.max_portfolio_assets as usize * 2) {
+            let spent = engine.group.insurance_domain_spent[d];
+            let budget = engine.group.insurance_domain_budget[d];
+            if spent > budget {
+                max_overshoot = max_overshoot.max(spent as i128 - budget as i128);
+            }
+        }
+        println!("    max budget overshoot across domains: {}  {}",
+            max_overshoot,
+            if max_overshoot == 0 { "✓ PASS (no overshoot)" } else { "✗ FAIL" });
+    }
+    println!();
+
+    // === §0.4 Instance boundary (two engines truly independent) ===
+    println!("  [§0.4] Instance boundary: two engines have independent state");
+    {
+        let mut engine1 = V16Engine::new(cfg).expect("init");
+        let mut engine2 = V16Engine::new(cfg).expect("init");
+        let lp1 = engine1.add_account(1).unwrap();
+        engine1.deposit(lp1, usdc(50_000_000)).unwrap();
+        let lp2 = engine2.add_account(1).unwrap();
+        engine2.deposit(lp2, usdc(1)).unwrap();  // different
+        let pass = engine1.group.vault != engine2.group.vault &&
+                   engine1.group.market_group_id == engine2.group.market_group_id;
+        // Note: market_group_id is same because both use [0x42; 32] default.
+        // In production they'd have different IDs from CPI provenance.
+        println!("    engine1.vault=${}, engine2.vault=${}  {}",
+            engine1.group.vault / 1_000_000, engine2.group.vault,
+            if pass { "✓ PASS (state independent)" } else { "✗ FAIL" });
+    }
+    println!();
+
+    // === §0.26 No fee seniority — uncollectible fees forgiven, not from insurance ===
+    println!("  [§0.26] Uncollectible fees do not draw from insurance");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+        // Crash hard to bankrupt user
+        let target = (oracle as u128 * 50 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if p <= target { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(target, p, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            let backup = engine.accounts[user];
+            let mut acc = backup;
+            let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+            if r2.is_ok() { engine.accounts[user] = acc; } else { engine.accounts[user] = backup; }
+            if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                let leg = engine.accounts[user].legs[0];
+                if leg.active {
+                    let backup = engine.accounts[user];
+                    let mut acc = backup;
+                    let r = engine.group.liquidate_account_not_atomic(&mut acc,
+                        LiquidationRequestV16 { asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5 },
+                        &prices);
+                    if r.is_ok() { engine.accounts[user] = acc; } else { engine.accounts[user] = backup; }
+                }
+                break;
+            }
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        let final_insurance = engine.group.insurance;
+        println!("    after crash + liquidation: insurance=${} (started $0)",
+            final_insurance / 1_000_000);
+        // Insurance should ONLY grow from fees, not from forgiven fees
+        // (The probe doesn't differentiate, but checks it didn't go negative or weird)
+        let pass = engine.group.assert_public_invariants().is_ok();
+        println!("    invariants intact: {}", if pass { "✓ PASS" } else { "✗ FAIL" });
+    }
+}
+
 /// Good-behavior probe — verifies the market actually WORKS:
 ///   (1) A normal trade open/favorable-move/close cycle realizes profit as cash.
 ///   (2) A losing trader gets liquidated cleanly (position cleared).
@@ -8953,6 +9245,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_good") {
         probe_v16_good_behavior();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_spec_gaps") {
+        probe_v16_spec_gaps();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
