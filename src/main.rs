@@ -3256,6 +3256,14 @@ fn probe_capital_efficiency_single_asset(seeds: u64) {
                     continue;
                 }
                 let prices = engine.effective_prices();
+                // Refresh LP first so v16 BackingReservationPlan can reserve
+                // LP capital as backing for user's source-domain claims.
+                {
+                    let mut lp_acc = engine.accounts[lp];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+                    let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+                    engine.accounts[lp] = lp_acc;
+                }
                 let mut acc = engine.accounts[user];
                 let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
                 let _ = engine.group.full_account_refresh(&mut acc, &prices);
@@ -3401,6 +3409,13 @@ fn probe_diversification_benefit(seeds: u64) {
                     let _ = engine.accrue_asset(ai, slot, clamped, 0);
                 }
                 let prices = engine.effective_prices();
+                // Refresh LP first so v16 reserves backing for user's source-domain claims.
+                {
+                    let mut lp_acc = engine.accounts[lp];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+                    let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+                    engine.accounts[lp] = lp_acc;
+                }
                 let mut acc = engine.accounts[user];
                 let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
                 let _ = engine.group.full_account_refresh(&mut acc, &prices);
@@ -4023,6 +4038,13 @@ fn probe_spread_can_realize_gain() {
         let _ = engine.accrue_asset(0, slot, next_sol, 0);
         let _ = engine.accrue_asset(1, slot, next_eth, 0);
         let prices = engine.effective_prices();
+        // Refresh LP so v16 reserves backing for the user's source-domain claims.
+        {
+            let mut lp_acc = engine.accounts[lp];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+            engine.accounts[lp] = lp_acc;
+        }
         let mut ua = engine.accounts[user];
         let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
         let _ = engine.group.full_account_refresh(&mut ua, &prices);
@@ -4062,22 +4084,34 @@ fn probe_spread_can_realize_gain() {
     println!("      cap=${}, pnl=${}", cap_after_close / 1_000_000, pnl_after_close / 1_000_000);
     println!();
 
-    // Try to withdraw all capital
+    // v16: try to realize pnl into capital first (the spec's withdrawal lien path).
+    let convert = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[user]);
+    println!("    convert_released_pnl_to_capital: {:?}",
+        match &convert { Ok(v) => format!("Ok({})", v / 1_000_000), Err(e) => format!("Err({:?})", e) });
+    let cap_after_convert = engine.accounts[user].capital;
+    let pnl_after_convert = engine.accounts[user].pnl;
+    println!("    After convert: cap=${}, pnl=${}",
+        cap_after_convert / 1_000_000, pnl_after_convert / 1_000_000);
+
+    // Withdraw all the cap we have now.
     let prices2 = engine.effective_prices();
     let withdraw_attempt = engine.group.withdraw_not_atomic(
-        &mut engine.accounts[user], cap_after_close, &prices2,
+        &mut engine.accounts[user], cap_after_convert, &prices2,
     );
+    let cap_after_close = cap_after_convert;
+    let withdrawn = cap_after_close - engine.accounts[user].capital;
     match withdraw_attempt {
         Ok(_) => println!("    Withdraw ${} → OK, final cap=${}",
             cap_after_close / 1_000_000, engine.accounts[user].capital / 1_000_000),
         Err(e) => println!("    Withdraw ${} → REJECTED: {:?}", cap_after_close / 1_000_000, e),
     }
     println!();
+    let stuck_pnl = engine.accounts[user].pnl;
     println!("    User's realized USDC: ${} (started with $1000)",
-        engine.accounts[user].capital / 1_000_000);
-    if pnl_after_close > 0 {
-        println!("    *** Stuck paper PnL: ${} cannot be realized as cash ***",
-            pnl_after_close / 1_000_000);
+        withdrawn / 1_000_000);
+    if stuck_pnl > 0 {
+        println!("    Stuck paper PnL: ${} (gain not yet realizable)",
+            stuck_pnl / 1_000_000);
     }
 }
 
@@ -4303,6 +4337,13 @@ fn probe_spread_trade_efficiency() {
                     let _ = engine.accrue_asset(1, slot, o_eth, 0);
                 }
                 let prices = engine.effective_prices();
+                // Refresh LP first so v16 reserves backing for the user's source-domain claims.
+                {
+                    let mut lp_acc = engine.accounts[lp];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+                    let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+                    engine.accounts[lp] = lp_acc;
+                }
                 let mut acc = engine.accounts[user];
                 let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
                 let _ = engine.group.full_account_refresh(&mut acc, &prices);
