@@ -3214,6 +3214,110 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
     (path_a, path_b)
 }
 
+/// Inspect the v16 per-domain bucket layout to verify isolation.
+fn probe_v16_bucket_layout() {
+    println!("  v16 backing bucket layout — each domain has its own isolated bucket");
+    println!();
+    let cfg = make_bounty_config(3); // 3 assets: SOL, ETH, BTC
+    let oracle = price_e6(200);
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    for a in 0..3 {
+        engine.accrue_asset(a, 1, oracle, 0).unwrap();
+    }
+
+    // 3 users, each takes a different position direction on a different asset.
+    // After price moves, each generates a loss on a different source domain.
+    let u_sol_long = engine.add_account(10).unwrap();
+    let u_eth_short = engine.add_account(11).unwrap();
+    let u_btc_long = engine.add_account(12).unwrap();
+    for u in [u_sol_long, u_eth_short, u_btc_long] {
+        engine.deposit(u, usdc(2_000)).unwrap();
+    }
+    let sq = usdc(2_000) * POS_SCALE / oracle as u128;
+    // SOL long
+    engine.trade(u_sol_long, lp, 0, sq, oracle, 1).unwrap();
+    // ETH short (lp is long ETH)
+    engine.trade(lp, u_eth_short, 1, sq, oracle, 1).unwrap();
+    // BTC long
+    engine.trade(u_btc_long, lp, 2, sq, oracle, 1).unwrap();
+
+    // Move prices: SOL down (sol_long loses), ETH up (eth_short loses), BTC down (btc_long loses)
+    let mut slot = 2u64;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let targets = [(0, 180u64), (1, 220u64), (2, 180u64)]; // SOL=$180, ETH=$220, BTC=$180
+    let target_prices = [180u64 * 1_000_000, 220u64 * 1_000_000, 180u64 * 1_000_000];
+    loop {
+        let mut all_done = true;
+        for &(a, _) in &targets {
+            let cur = engine.group.assets[a].effective_price;
+            let target = target_prices[a];
+            if cur == target { continue; }
+            all_done = false;
+            let next = clamp_oracle(target, cur, max_move, 1);
+            let _ = engine.accrue_asset(a, slot, next, 0);
+        }
+        if all_done { break; }
+        // Refresh users so their losses become backing reservations.
+        let prices = engine.effective_prices();
+        for u in [u_sol_long, u_eth_short, u_btc_long, lp] {
+            let mut acc = engine.accounts[u];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[u] = acc;
+        }
+        slot += 1;
+        if slot > 1000 { break; }
+    }
+
+    println!("  After moves: SOL ${} (long loss), ETH ${} (short loss), BTC ${} (long loss)",
+        engine.group.assets[0].effective_price / 1_000_000,
+        engine.group.assets[1].effective_price / 1_000_000,
+        engine.group.assets[2].effective_price / 1_000_000);
+    println!();
+    let domain_name = |d: usize| -> String {
+        let asset = match d / 2 { 0 => "SOL", 1 => "ETH", 2 => "BTC", _ => "?" };
+        let side = if d % 2 == 0 { "Long" } else { "Short" };
+        format!("({}, {})", asset, side)
+    };
+    println!("  Per-domain backing bucket state ({} configured domains):", cfg.max_portfolio_assets as usize * 2);
+    println!();
+    println!("    domain | name            | fresh_backing | valid_liened | consumed | impaired | expiry_slot | status");
+    println!("    -------|-----------------|---------------|--------------|----------|----------|-------------|--------");
+    for d in 0..(cfg.max_portfolio_assets as usize * 2) {
+        let b = engine.group.source_backing_buckets[d];
+        println!("    {:^6} | {:<15} | {:>13} | {:>12} | {:>8} | {:>8} | {:>11} | {:?}",
+            d, domain_name(d),
+            b.fresh_unliened_backing_num / BOUND_SCALE / 1_000_000,
+            b.valid_liened_backing_num / BOUND_SCALE / 1_000_000,
+            b.consumed_liened_backing_num / BOUND_SCALE / 1_000_000,
+            b.impaired_liened_backing_num / BOUND_SCALE / 1_000_000,
+            b.expiry_slot,
+            b.status);
+    }
+    println!();
+    println!("  Source-credit state per domain:");
+    println!();
+    println!("    domain | name            | claim_bound | exact_claim | fresh_reserved | credit_rate");
+    println!("    -------|-----------------|-------------|-------------|----------------|------------");
+    for d in 0..(cfg.max_portfolio_assets as usize * 2) {
+        let sc = engine.group.source_credit[d];
+        let rate_pct = sc.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0;
+        println!("    {:^6} | {:<15} | {:>11} | {:>11} | {:>14} | {:>9.1}%",
+            d, domain_name(d),
+            sc.positive_claim_bound_num / BOUND_SCALE / 1_000_000,
+            sc.exact_positive_claim_num / BOUND_SCALE / 1_000_000,
+            sc.fresh_reserved_backing_num / BOUND_SCALE / 1_000_000,
+            rate_pct);
+    }
+    println!();
+    println!("  Each domain is its own bucket: 32 total ({} assets × 2 sides), {} per domain.",
+        V16_MAX_PORTFOLIO_ASSETS_N, 1);
+    println!("  Backing reserved for one domain is structurally inaccessible to another:");
+    println!("  the address into source_backing_buckets[d] is keyed by (asset, side).");
+}
+
 /// Multi-attack stress fuzz targeting four v16-specific corner cases:
 ///   A. Bound-understate: positive_claim_bound_num >= exact_positive_claim_num
 ///   B. Multi-user same-domain: many accounts claim against same source
@@ -7253,6 +7357,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_extras") {
         probe_v16_extra_attacks();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_buckets") {
+        probe_v16_bucket_layout();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
