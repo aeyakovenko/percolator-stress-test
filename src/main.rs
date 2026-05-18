@@ -3233,6 +3233,176 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
     (path_a, path_b)
 }
 
+/// Minimal Drift-style attack probe with strict SVM-atomic semantics:
+/// every engine call is wrapped — on Err the account state is restored to
+/// its pre-call value (simulating SVM tx rollback). If the final state
+/// fails wire round-trip, that means some COMMITTING tx wrote a corrupt
+/// state, which would be a real engine bug.
+fn probe_v16_drift_atomic() {
+    println!("  v16 Drift-style attack with strict SVM-atomic semantics");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    // Atomic helpers: restore on Err.
+    fn atomic_settle(engine: &mut V16Engine, idx: usize, chunk: u128) -> bool {
+        let backup = engine.accounts[idx];
+        let mut acc = backup;
+        if engine.group.settle_account_side_effects_not_atomic(&mut acc, chunk).is_err() {
+            engine.accounts[idx] = backup;
+            return false;
+        }
+        engine.accounts[idx] = acc;
+        true
+    }
+    fn atomic_refresh(engine: &mut V16Engine, idx: usize, prices: &[u64; V16_MAX_PORTFOLIO_ASSETS_N]) -> bool {
+        let backup = engine.accounts[idx];
+        let mut acc = backup;
+        if engine.group.full_account_refresh(&mut acc, prices).is_err() {
+            engine.accounts[idx] = backup;
+            return false;
+        }
+        engine.accounts[idx] = acc;
+        true
+    }
+    fn atomic_liquidate(engine: &mut V16Engine, idx: usize, req: LiquidationRequestV16, prices: &[u64; V16_MAX_PORTFOLIO_ASSETS_N]) -> bool {
+        let backup = engine.accounts[idx];
+        let mut acc = backup;
+        if engine.group.liquidate_account_not_atomic(&mut acc, req, prices).is_err() {
+            engine.accounts[idx] = backup;
+            return false;
+        }
+        engine.accounts[idx] = acc;
+        true
+    }
+    fn atomic_withdraw(engine: &mut V16Engine, idx: usize, amount: u128, prices: &[u64; V16_MAX_PORTFOLIO_ASSETS_N]) -> bool {
+        let backup = engine.accounts[idx];
+        let mut acc = backup;
+        if engine.group.withdraw_not_atomic(&mut acc, amount, prices).is_err() {
+            engine.accounts[idx] = backup;
+            return false;
+        }
+        engine.accounts[idx] = acc;
+        true
+    }
+    fn atomic_convert(engine: &mut V16Engine, idx: usize) -> Option<u128> {
+        let backup = engine.accounts[idx];
+        let mut acc = backup;
+        match engine.group.convert_released_pnl_to_capital_not_atomic(&mut acc) {
+            Ok(v) => { engine.accounts[idx] = acc; Some(v) },
+            Err(_) => { engine.accounts[idx] = backup; None },
+        }
+    }
+
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    let attacker = engine.add_account(99).unwrap();
+    let deposit = usdc(1_000);
+    engine.deposit(attacker, deposit).unwrap();
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(attacker, lp, 0, sq, oracle, 1).unwrap();
+    let deposit_cap = engine.accounts[attacker].capital;
+
+    // Pump asset 0 oracle to +100% with atomic settle+refresh per tick
+    let target = (oracle as u128 * 2) as u64;
+    let mut slot = 2u64;
+    let mut pump_settle_failures = 0u32;
+    while engine.group.assets[0].effective_price < target && slot < 5000 {
+        let next = clamp_oracle(target, engine.group.assets[0].effective_price, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, next, 0);
+        let prices = engine.effective_prices();
+        for idx in [lp, attacker] {
+            if !atomic_settle(&mut engine, idx, cfg.public_b_chunk_atoms) { pump_settle_failures += 1; }
+            if !atomic_refresh(&mut engine, idx, &prices) { pump_settle_failures += 1; }
+        }
+        slot += 1;
+    }
+    println!("  pump complete: oracle ${} → ${} ({} settle/refresh rollbacks)",
+        oracle / 1_000_000, engine.group.assets[0].effective_price / 1_000_000, pump_settle_failures);
+
+    // Try convert (should be blocked)
+    let conv = atomic_convert(&mut engine, attacker);
+    println!("  convert_released_pnl: {:?}", conv);
+
+    // Try partial withdraw (attacker's own original cap, leaving IM headroom)
+    let cap_now = engine.accounts[attacker].capital;
+    let prices = engine.effective_prices();
+    let cert = engine.accounts[attacker].health_cert;
+    let safe = ((cert.certified_equity as u128).saturating_sub(cert.certified_initial_req)).saturating_sub(usdc(50));
+    let attempt = safe.min(cap_now);
+    let cap_before_w = engine.accounts[attacker].capital;
+    let ok_w = atomic_withdraw(&mut engine, attacker, attempt, &prices);
+    let withdrew_1 = cap_before_w - engine.accounts[attacker].capital;
+    println!("  partial-withdraw ${} → {} (actually ${})",
+        attempt / 1_000_000, if ok_w { "Ok" } else { "Err" }, withdrew_1 / 1_000_000);
+
+    // Oracle reverts to truth, all calls atomic.
+    let mut revert_settle_failures = 0u32;
+    let mut revert_refresh_failures = 0u32;
+    let mut liq_attempts = 0u32;
+    let mut liq_failures = 0u32;
+    while engine.group.assets[0].effective_price > oracle && slot < 10000 {
+        let next = clamp_oracle(oracle, engine.group.assets[0].effective_price, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, next, 0);
+        let prices = engine.effective_prices();
+        for idx in [lp, attacker] {
+            if !atomic_settle(&mut engine, idx, cfg.public_b_chunk_atoms) { revert_settle_failures += 1; }
+            if !atomic_refresh(&mut engine, idx, &prices) { revert_refresh_failures += 1; }
+        }
+        if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
+            let leg = engine.accounts[attacker].legs[0];
+            if leg.active {
+                liq_attempts += 1;
+                if !atomic_liquidate(&mut engine, attacker, LiquidationRequestV16 {
+                    asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
+                }, &prices) { liq_failures += 1; }
+            }
+        }
+        slot += 1;
+    }
+    println!("  oracle revert: {} settle-rollbacks, {} refresh-rollbacks, {}/{} liquidations succeeded",
+        revert_settle_failures, revert_refresh_failures,
+        liq_attempts - liq_failures, liq_attempts);
+
+    // Final state
+    let acc = &engine.accounts[attacker];
+    let lp_acc = &engine.accounts[lp];
+    let lp_total = lp_acc.capital as i128 + lp_acc.pnl;
+    println!();
+    println!("  FINAL STATE (after all atomic txs):");
+    println!("    attacker: cap=${}, pnl=${} | original deposit=$1000, withdrew=${}",
+        acc.capital / 1_000_000, acc.pnl / 1_000_000, withdrew_1 / 1_000_000);
+    println!("    LP: cap=${}, pnl=${}, total=${} (started $50M)",
+        lp_acc.capital / 1_000_000, lp_acc.pnl / 1_000_000, lp_total / 1_000_000);
+    println!("    engine: vault=${} c_tot=${} insurance=${} residual=${}",
+        engine.group.vault / 1_000_000,
+        engine.group.c_tot / 1_000_000,
+        engine.group.insurance / 1_000_000,
+        (engine.group.vault.saturating_sub(engine.group.c_tot).saturating_sub(engine.group.insurance)) / 1_000_000);
+    println!("    engine invariants: {:?}", engine.group.assert_public_invariants());
+    println!();
+
+    // Wire round-trip — if any account fails to decode, this represents
+    // committed corrupt state which would be a real bug.
+    println!("  Wire round-trip (SVM-validity check):");
+    for (label, idx) in [("attacker", attacker), ("lp", lp)] {
+        let acc_runtime = engine.accounts[idx];
+        let wire = PortfolioAccountV16Account::from_runtime(&acc_runtime);
+        let decoded = wire.try_to_runtime();
+        let status = match decoded.as_ref() {
+            Ok(_) => "Ok ✓".to_string(),
+            Err(e) => format!("Err({:?})", e),
+        };
+        println!("    {}: {}", label, status);
+    }
+    let _ = deposit_cap;
+}
+
 /// Rerun the v16 attack suite under the most aggressive h-lock config:
 /// h_min=0, h_max=1. This is "instant favorable actions, single-slot
 /// bankruptcy lockout". Verifies the source-credit gating doesn't depend
@@ -3249,6 +3419,25 @@ fn probe_v16_instant_h_lock_attacks() {
     println!();
 
     // === A2 runs the partial-withdraw attack under each config. cfg is captured from outer scope.
+    // Atomic settle+refresh: persist mutations ONLY if BOTH calls succeed.
+    // Mimics SVM tx-level rollback semantics — failed txs leave no state behind.
+    let atomic_settle_refresh = |engine: &mut V16Engine, idx: usize, cfg: V16Config, prices: &[u64; V16_MAX_PORTFOLIO_ASSETS_N]| -> bool {
+        let backup = engine.accounts[idx];
+        let mut acc = engine.accounts[idx];
+        let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+        if r1.is_err() {
+            engine.accounts[idx] = backup;
+            return false;
+        }
+        let r2 = engine.group.full_account_refresh(&mut acc, prices);
+        if r2.is_err() {
+            engine.accounts[idx] = backup;
+            return false;
+        }
+        engine.accounts[idx] = acc;
+        true
+    };
+    let _ = atomic_settle_refresh;
     let run_partial_withdraw_attack = |label: &str, cfg: V16Config| {
         let oracle = price_e6(200);
         let max_move = cfg.max_price_move_bps_per_slot;
@@ -3366,6 +3555,17 @@ fn probe_v16_instant_h_lock_attacks() {
         println!("    engine: vault=${} c_tot=${} insurance=${} residual=${}",
             vault / 1_000_000, c_tot / 1_000_000,
             insurance / 1_000_000, residual / 1_000_000);
+        // SVM atomicity check: wire round-trip both accounts. If they decode
+        // cleanly, the state is production-valid (not stuck). If decode fails,
+        // it would mean a committing tx persisted invalid state, which IS a bug.
+        println!("    wire round-trip (SVM atomicity test):");
+        for (label, idx) in [("attacker", attacker), ("lp", lp)] {
+            let acc_runtime = engine.accounts[idx];
+            let wire = PortfolioAccountV16Account::from_runtime(&acc_runtime);
+            let decoded = wire.try_to_runtime();
+            println!("      {} account encode→decode: {:?}", label,
+                decoded.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        }
         // Can LP recover their $5000 pnl? Try convert + withdraw.
         let lp_cap_pre_recovery = engine.accounts[lp].capital;
         let lp_conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[lp]);
@@ -7873,6 +8073,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_instant") {
         probe_v16_instant_h_lock_attacks();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_atomic") {
+        probe_v16_drift_atomic();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {

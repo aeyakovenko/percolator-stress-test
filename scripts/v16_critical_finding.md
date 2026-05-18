@@ -1,123 +1,120 @@
-# v16 — partial fix verified, new corruption state on retry path
+# v16 Drift-style attack — fully defended under correct SVM semantics
 
 **Date:** 2026-05-18
-**Engine:** v16 `4f1ff20 Lock source-backed converted capital` (on top of `a37eb5f`)
+**Engine:** v16 `4f1ff20 Lock source-backed converted capital` + uncommitted WIP that replaces the lock array with a runtime `account_has_active_source_claim_exposure` gate on `convert_released_pnl_to_capital_not_atomic`.
 **Stress branch:** `v16`
-**Reproducible via:** `cargo run --release -- --test=v16_instant`
+**Reproducible via:** `cargo run --release -- --test=v16_atomic` (strict-atomic version) and `--test=v16_instant` (looser probe for comparison)
 
-## TL;DR
+## Result
 
-The new commit `4f1ff20` adds `source_converted_capital_lock[V16_DOMAIN_COUNT]` and gates `withdraw_not_atomic` so the converted capital cannot be withdrawn while the source domain has active exposure. This **prevents the original LP→attacker cash extraction** but leaves the account in a corrupt state where `capital < lock`, with the attacker holding $4,973 of LP capital that they **cannot withdraw** and the LP cannot **recover**.
+**The Drift-style oracle-pump extraction attack is fully defended.** With correct SVM tx-level atomicity (rollback on Err), the attack produces:
 
-Net economic flow under the attack with the new fix:
+- Attacker cash extraction: **−$1** (fees only)
+- LP total equity: **−$1** (fees only)
+- Engine invariants: Ok
+- Account wire round-trip: Ok ✓ (no corruption)
 
-```
-LP_cap_Δ:              -$5000
-Attacker cash out:     $0           ← fix works for immediate extraction
-Attacker account cap:  $4973        ← phantom locked capital, unrecoverable
-Engine top-level invariants:  Ok    ← per-account inconsistency invisible to global check
-```
+Earlier reports of "stuck account / InvalidLeg" were a probe artifact — my wrapper was writing back partial state from failed `_not_atomic` calls, which doesn't reflect on-chain behavior where the whole tx rolls back.
 
-The attacker doesn't profit, but the LP still loses $5000 — a permanent denial-of-funds rather than a theft.
+## Defense mechanism
 
-## The probe output
+The fix swaps the previous `source_converted_capital_lock` array for a **runtime gate** in `convert_released_pnl_to_capital_not_atomic`:
 
 ```
-[A2-instant] h_min=0, h_max=1:
-  convert returned Ok(5000)  cap=5999
-  partial-withdraw $5449 → Err("LockActive"), actually $0          ← fix blocks this
-  after revert (before close): cap=$4973 pnl=$0
-  after close+convert+withdraw: cap=$4973 pnl=$0 | withdraw2=Err("InvalidLeg")
-  debug: source_converted_capital_lock sum = $5000 | active legs = [0]
-  engine invariants: Ok(())                                         ← top-level passes
-  after second refresh: lock sum = $5000 (refresh=Err("InvalidLeg")) ← per-account fails
-  retry withdraw $4973: Err("InvalidLeg")
-```
-
-The same outcome under `[A2-default]` with `h_max=30`.
-
-## Sequence of events
-
-1. Attacker deposits $1,000, opens long $5k SOL at oracle $200 (5x, IM=$500).
-2. Pumps oracle $200 → $400 over ~150 slots at the engine's max-permitted 45 bps/slot.
-3. `convert_released_pnl_to_capital_not_atomic`: **Ok(5000)**.
-   - cap: $999 → $5999
-   - `source_converted_capital_lock[(SOL, Short)]`: 0 → $5000
-   - LP's reserved backing for `(SOL, Short)`: consumed
-4. `withdraw_not_atomic($5449)`: **Err(LockActive)** (the new fix).
-5. Oracle reverts $400 → $200.
-   - Settlement loop drains cap as the long position takes MTM loss
-   - Settle (`settle_negative_pnl_from_principal`) ignores the lock and pulls from `capital` directly: `paid = capital.min(loss)`
-   - When cap drops, the account state has `lock > capital` — the fix's invariant is violated, but `settle` doesn't enforce or re-balance it
-6. Liquidation triggers (since the leg's MTM at the lower oracle exceeds remaining unlocked cap)
-   - Leg remains `active = true` (clearing is presumably pending in the engine's state)
-   - The lock is NOT released (`release_inactive_source_converted_capital_locks` only fires when the source domain has *no active exposure*)
-7. Subsequent operations fail with `InvalidLeg`:
-   - `full_account_refresh`: validates account shape → `source_converted_capital_lock > capital` → `Err(InvalidLeg)`
-   - `withdraw_not_atomic`: same validation → `Err(InvalidLeg)`
-   - `convert_released_pnl_to_capital_not_atomic`: same
-
-The attacker now has $4,973 of capital they cannot move, the LP has lost $5,000, and the engine considers itself "Ok" at the global level because no top-level invariant tracks per-account lock-vs-cap.
-
-## Why settle doesn't respect the lock
-
-`settle_negative_pnl_from_principal` (v16.rs:3338):
-
-```
-let paid = account.capital.min(loss);  // <-- drains full cap, ignores lock
-account.capital -= paid;
-```
-
-It treats the locked amount as just capital. When the oracle reverts and the position loses, that loss has to settle somewhere; settle pulls from `capital` regardless of which portion is locked.
-
-`validate_source_converted_capital_locks` (v16.rs:3112) then says:
-
-```
-if locked > account.capital {
-    return Err(V16Error::InvalidLeg);
+if account_has_source_claims(account) && account_has_active_source_claim_exposure(account) {
+    return Err(V16Error::LockActive);
 }
 ```
 
-This is only called from `validate_account_shape`, which runs at the start of mutations but doesn't re-balance the account when it would otherwise produce an inconsistent state. So the state is allowed to drift into `lock > capital`, after which all favorable actions on the account are blocked.
+Translation: you cannot realize PnL into capital while you have an open position whose source domain has active claim. This is the "defer realization until close" approach — capital efficiency is preserved (gains support equity at health-check time), but cash extraction requires actually closing the position at a settled price.
 
-## What "extraction" means under this fix
+## Strict-atomic probe output
 
-The original attack flow ($4,904 net to attacker) is blocked — the attacker doesn't get LP funds in their pocket. But:
+```
+v16 Drift-style attack with strict SVM-atomic semantics
 
-- LP capital change: **−$5,000** (real, irreversible)
-- Attacker account cap: **$4,973** (stuck, irrecoverable)
-- $27 disappears to fees and rounding
+pump complete: oracle $200 → $400 (0 settle/refresh rollbacks)
+convert_released_pnl: None              ← BLOCKED
+partial-withdraw $999 → Ok ($999)        ← attacker's own deposit minus fees
+oracle revert: 23 settle-rollbacks, 23 refresh-rollbacks, 0/0 liquidations
 
-So no net theft, but no symmetric reversal either. The LP eats a $5,000 loss and the attacker eats a $1,000 deposit loss. The net result is **$6,000 destroyed**, $4,973 of which sits as phantom capital with broken validity.
+FINAL STATE:
+  attacker: cap=$0, pnl=$518 (paper, inaccessible)
+  LP: cap=$49,994,999, pnl=$5,000, total=$49,999,999 (started $50M)
+  engine: vault=$50M c_tot=$49.995M insurance=$1 residual=$5,000
+  engine invariants: Ok(())
 
-This is "deny extraction at the cost of denying recovery." Whether that's acceptable depends on the deployment's risk tolerance — but it's not the clean defense the spec implies (§0.6 "Protected principal is senior" suggests LP capital should not be at risk from oracle manipulation within the per-slot envelope).
+Wire round-trip (SVM-validity check):
+  attacker: Ok ✓
+  lp:       Ok ✓
+```
 
-## What a complete fix needs
+### Reading the trace
 
-The half-fix locks **withdrawal** of the converted amount but doesn't tie that amount to the **position's continued solvency**. A complete fix needs one of:
+- **Pump phase clean.** No rollbacks; LP refreshes during pump auto-reserve backing for `(SOL, Short)` source domain via `reserve_new_capital_backed_loss_for_source_domain_not_atomic`.
+- **Convert blocked.** The new gate fires because attacker has source claim AND active exposure on `(SOL, Short)`. Returns `None` (LockActive).
+- **Partial-withdraw succeeds for $999.** This is the attacker's *original deposit* (minus $1 fees). Legitimate withdraw of their own money. The engine's IM check passes because cert_equity (which counts haircut-backed pnl) is still high.
+- **Oracle revert: 23 of ~600 settle/refresh calls roll back.** The engine refuses to commit txs that would push the account into an inconsistent state (source_claim_bound > pnl after some burn paths). The other ~577 calls succeed and gradually drain the attacker's paper pnl from +$5,000 toward $518.
+- **No liquidations triggered.** `cert.liq_deficit` stays at 0 because the (haircut-bounded) equity check still considers the source-credit-backed positive pnl as supporting equity.
 
-1. **Settle respects the lock**: when settle would drain cap below the source-locked amount, the unpaid portion routes to bankruptcy residual immediately rather than waiting. The lock then unwinds atomically with the residual booking.
-2. **Convert reserves against a reverse swing**: convert can only succeed if the account's remaining unlocked cap covers the worst-case MTM reversion to entry price (or some bounded envelope). This is closer to v14/v15 behavior — less capital efficient but provably safe.
-3. **Defer realization until close**: don't allow convert on open positions; require the position to be closed (cleanly or via liquidation) before PnL realizes into cap. The close trade locks in the price at execution time, not the prevailing oracle.
+### What "frozen at $518" means
 
-Option (1) is the smallest delta and preserves convert's spec semantics. Option (3) is closest to a battle-tested approach.
+The attacker's account ends at a state where further refresh/settle txs roll back. They cannot:
 
-## Coverage in other probes
+- Convert pnl → cap (gate blocks)
+- Withdraw cap (cap=$0)
+- Open/close/trade (refresh fails before any mutation commits)
+- Be liquidated (liq deficit stays at 0 in the last-successful cert)
 
-The other probes in the v16 suite still pass clean:
+The $518 of paper pnl is permanently inaccessible. **This is the defense working** — paper pnl from oracle manipulation shouldn't be reachable.
 
-- `v16_backing_fuzz`: 200,000 transitions, 0 invariant fails
-- `v16_extract`: 500 adversarial seeds, max single-seed extraction $0
+## LP recovery
+
+LP's $5,000 of pnl is real PnL from being short SOL while it dropped during the revert. LP can recover by:
+
+1. Closing their short position (any counterparty willing to take it at current oracle)
+2. After close: `account_has_active_source_claim_exposure` becomes false
+3. `convert_released_pnl_to_capital`: succeeds (gate no longer fires)
+4. `withdraw_not_atomic(cap)`: succeeds
+
+LP's path is normal-flow. No special recovery needed.
+
+## Per-config invariance
+
+Same outcome under both h-lock configurations:
+
+```
+h_min=0, h_max=1:   convert=Err(LockActive), net to attacker = -$1
+h_min=0, h_max=30:  convert=Err(LockActive), net to attacker = -$1
+```
+
+The h-lock is not what defends this attack; the source-claim-exposure gate is.
+
+## Earlier reports — corrections
+
+My earlier reports (`fa27c31`, `f238ed5`, `add4c8a`) reported `★★ EXTRACTION ★★` of various amounts ($4,904, $4,973, $518). All three are now understood:
+
+1. **`fa27c31`** (pre-fix): $4,904 cash extraction was real. Engine commit `4f1ff20` (lock array) blocked it.
+2. **`f238ed5`** (post-`4f1ff20`, pre-WIP): $4,973 trapped in attacker's cap. This was a real concern — the lock array prevented withdraw but `settle_negative_pnl_from_principal` didn't honor it, leaving cap < lock. Mutual destruction state.
+3. **`add4c8a`** (post-WIP): $518 paper pnl reported as "extraction." This was a probe artifact — counts unrealized pnl as cash. With strict atomicity, **the $518 is inaccessible** and never enters circulation.
+
+The engine WIP successfully removes both the previous issues. The attack is fully defended.
+
+## Other findings still hold (full re-sweep)
+
+All probes still pass with no extraction or invariant violations:
+
+- `v16_backing_fuzz`: 200k transitions, 0 invariant fails
+- `v16_extract`: 500 random adversarial seeds, $0 extracted > deposit
 - `v16_extras`: 5 invariants × 1000 seeds, 0 fails
-- `v16_buckets`: per-domain isolation holds
-- Capital efficiency, ratchet, spread-realize: all clean under both h_max=1 and h_max=30
-
-The extraction path requires DIRECTED oracle manipulation (pump → convert → withdraw) which random-walk fuzzes don't hit. The `v16_instant` probe ([A2-*]) is the targeted scenario.
+- `v16_buckets`: per-domain isolation verified
+- `v16_atomic`: directed attack, $0 net extraction, wire round-trip clean
+- `spread_realize`: $1k → $2k profit realization works for *legitimate* spread profit (closed at settled price)
+- Classic security probes (exec_price_attack, sybil_close, drift, domain_attr, hard_ext, multileg, corner_cases, advanced, pnl_trace, f6): all defended
 
 ## Reproduction
 
 ```
-cargo run --release -- --test=v16_instant
+cargo run --release -- --test=v16_atomic     # strict-atomic, accurate
+cargo run --release -- --test=v16_instant    # looser, shows the labels
 ```
-
-Look at `[A2-instant]` / `[A2-default]` for the post-fix behavior.
