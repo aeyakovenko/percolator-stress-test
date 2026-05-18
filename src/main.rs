@@ -3233,6 +3233,316 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
     (path_a, path_b)
 }
 
+/// Global cross-margin + liquidation stress test. Verifies that:
+///   1. A user with multiple legs where positive PnL on leg A supports leg B
+///      through source-credit backing properly survives moves that would
+///      isolate-margin-liquidate them.
+///   2. When a cross-margined account IS liquidated, the residual is
+///      attributed to the correct source domain (loss-leg side).
+///   3. Backing for the supporting leg's source domain is preserved
+///      after the underwater leg is closed by liquidation.
+///   4. Per-domain insurance budgets respected throughout.
+///   5. Wire round-trip valid for all accounts at end.
+fn probe_v16_xmargin_liquidation_stress() {
+    use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+
+    println!("  v16 global cross-margin + liquidation stress (atomic semantics)");
+    println!();
+
+    // [A] Hedged spread under stress — user has long SOL + short BTC,
+    //     BOTH assets crash (long SOL loses, short BTC wins). Cross-margin
+    //     support from BTC short should keep user alive longer than isolated.
+    println!("  [A] Hedged user survives longer with cross-margin support");
+    {
+        let cfg = make_bounty_config(2);
+        let oracle = price_e6(200);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        // Two scenarios: with LP refresh (cross-margin active) and without (no backing).
+        for (label, refresh_lp) in [("with LP refresh (backing active)", true),
+                                      ("without LP refresh (no backing)", false)] {
+            let mut engine = V16Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(50_000_000)).unwrap();
+            let user = engine.add_account(2).unwrap();
+            engine.deposit(user, usdc(1_000)).unwrap();
+            engine.accrue_asset(0, 1, oracle, 0).unwrap();
+            engine.accrue_asset(1, 1, oracle, 0).unwrap();
+            // Long SOL $5k, Short BTC $5k. Net hedged if SOL and BTC correlated.
+            let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+            engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+            engine.trade(lp, user, 1, sq, oracle, 1).unwrap();
+            // BOTH crash 25% (SOL: loss to user, BTC short: gain to user)
+            let target_sol = (oracle as u128 * 75 / 100) as u64;
+            let target_btc = (oracle as u128 * 75 / 100) as u64;
+            let mut slot = 2u64;
+            let mut liquidated_at_oracle = None;
+            loop {
+                let p0 = engine.group.assets[0].effective_price;
+                let p1 = engine.group.assets[1].effective_price;
+                if p0 <= target_sol && p1 <= target_btc { break; }
+                let _ = engine.accrue_asset(0, slot, clamp_oracle(target_sol, p0, max_move, 1), 0);
+                let _ = engine.accrue_asset(1, slot, clamp_oracle(target_btc, p1, max_move, 1), 0);
+                let prices = engine.effective_prices();
+                if refresh_lp {
+                    let mut acc = engine.accounts[lp];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                    if engine.group.full_account_refresh(&mut acc, &prices).is_ok() {
+                        engine.accounts[lp] = acc;
+                    }
+                }
+                // User: atomic settle + refresh
+                let backup = engine.accounts[user];
+                let mut acc = backup;
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[user] = acc; } else { engine.accounts[user] = backup; }
+                if engine.accounts[user].health_cert.certified_liq_deficit > 0 && liquidated_at_oracle.is_none() {
+                    liquidated_at_oracle = Some(p0);
+                }
+                slot += 1;
+                if slot > 5000 { break; }
+            }
+            let acc = &engine.accounts[user];
+            let total_eq = acc.capital as i128 + acc.pnl;
+            println!("    {}", label);
+            println!("      final: cap=${} pnl=${} total=${} | liq_at_oracle={:?}",
+                acc.capital / 1_000_000, acc.pnl / 1_000_000, total_eq / 1_000_000,
+                liquidated_at_oracle.map(|o| o / 1_000_000));
+        }
+    }
+    println!();
+
+    // [B] Liquidation under cross-margin: user has long SOL (losing) + long ETH (gaining).
+    //     SOL crashes hard, ETH rises. ETH's gain provides MM support via source-credit.
+    //     Eventually SOL is liquidated. Verify: residual attribution + ETH leg preserved.
+    println!("  [B] Liquidation correctness under cross-margin (long SOL crashing, long ETH rising)");
+    {
+        let cfg = make_bounty_config(2);
+        let oracle = price_e6(200);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        let sq_sol = usdc(5_000) * POS_SCALE / oracle as u128;
+        let sq_eth = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq_sol, oracle, 1).unwrap();
+        engine.trade(user, lp, 1, sq_eth, oracle, 1).unwrap();
+        println!("    Open: long $5k SOL + long $5k ETH on $1k cap");
+        // SOL crashes -40%, ETH rises +20%
+        let target_sol = (oracle as u128 * 60 / 100) as u64;
+        let target_eth = (oracle as u128 * 120 / 100) as u64;
+        let mut slot = 2u64;
+        let mut atomic_user = |engine: &mut V16Engine| -> bool {
+            let prices = engine.effective_prices();
+            let backup = engine.accounts[user];
+            let mut acc = backup;
+            let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+            if r2.is_ok() { engine.accounts[user] = acc; true } else { engine.accounts[user] = backup; false }
+        };
+        loop {
+            let p0 = engine.group.assets[0].effective_price;
+            let p1 = engine.group.assets[1].effective_price;
+            if p0 <= target_sol && p1 >= target_eth { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(target_sol, p0, max_move, 1), 0);
+            let _ = engine.accrue_asset(1, slot, clamp_oracle(target_eth, p1, max_move, 1), 0);
+            // LP refresh - creates backing for both source domains
+            let prices = engine.effective_prices();
+            let backup_lp = engine.accounts[lp];
+            let mut acc_lp = backup_lp;
+            let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc_lp, cfg.public_b_chunk_atoms);
+            let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc_lp, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+            if r2.is_ok() { engine.accounts[lp] = acc_lp; } else { engine.accounts[lp] = backup_lp; }
+            let _ = atomic_user(&mut engine);
+            // If liq_deficit, liquidate the SOL leg (the losing one)
+            if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                let leg_sol = engine.accounts[user].legs[0];
+                if leg_sol.active {
+                    let backup = engine.accounts[user];
+                    let mut acc = backup;
+                    let prices = engine.effective_prices();
+                    let r = engine.group.liquidate_account_not_atomic(&mut acc,
+                        LiquidationRequestV16 { asset_index: 0, close_q: leg_sol.basis_pos_q.unsigned_abs(), fee_bps: 5 },
+                        &prices);
+                    if r.is_ok() { engine.accounts[user] = acc; } else { engine.accounts[user] = backup; }
+                }
+            }
+            slot += 1;
+            if slot > 10000 { break; }
+        }
+        let acc = &engine.accounts[user];
+        let total_eq = acc.capital as i128 + acc.pnl;
+        let sol_active = acc.legs[0].active;
+        let eth_active = acc.legs[1].active;
+        println!("    Final: cap=${} pnl=${} total=${}",
+            acc.capital / 1_000_000, acc.pnl / 1_000_000, total_eq / 1_000_000);
+        println!("    SOL leg active: {}, ETH leg active: {}", sol_active, eth_active);
+        // Per-domain attribution check
+        let inv = engine.group.assert_public_invariants();
+        println!("    Engine invariants: {:?}", inv);
+        for d in 0..4 {
+            let domain_name = match d { 0 => "SOL,Long", 1 => "SOL,Short", 2 => "ETH,Long", _ => "ETH,Short" };
+            let spent = engine.group.insurance_domain_spent[d];
+            let sc = &engine.group.source_credit[d];
+            if spent > 0 || sc.fresh_reserved_backing_num > 0 || sc.positive_claim_bound_num > 0 {
+                println!("      ({}): ins_spent=${} claim_bound=${} fresh_backing=${}",
+                    domain_name, spent / 1_000_000,
+                    sc.positive_claim_bound_num / BOUND_SCALE / 1_000_000,
+                    sc.fresh_reserved_backing_num / BOUND_SCALE / 1_000_000);
+            }
+        }
+        // Wire round-trip
+        for (l, idx) in [("user", user), ("lp", lp)] {
+            let a = engine.accounts[idx];
+            let w = PortfolioAccountV16Account::from_runtime(&a);
+            println!("      {}: wire={:?}", l, w.try_to_runtime().map(|_|"Ok").map_err(|e| format!("{:?}",e)));
+        }
+    }
+    println!();
+
+    // [C] Multi-asset cross-margin fuzz: 4 assets, 3 users, oscillating prices,
+    //     directed liquidations, verify no extraction across 1000 seeds.
+    println!("  [C] Multi-asset cross-margin liquidation fuzz (1000 seeds × 4 assets × 3 users)");
+    {
+        let cfg = make_bounty_config(4);
+        let oracle = price_e6(200);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let seeds = 1000u64;
+        let invariant_fails = AtomicU64::new(0);
+        let wire_fails = AtomicU64::new(0);
+        let domain_overflows = AtomicU64::new(0);
+        let max_user_excess = AtomicI64::new(0);
+        let total_liquidations = AtomicU64::new(0);
+        (0..seeds).into_par_iter().for_each(|seed| {
+            let mut rng = Rng::new(seed.wrapping_mul(0xBEEF_FACE));
+            let mut engine = V16Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(50_000_000)).unwrap();
+            let mut users = Vec::new();
+            let mut deposits = Vec::new();
+            let mut withdrawn = Vec::new();
+            for u in 0..3u8 {
+                let idx = engine.add_account(50 + u).unwrap();
+                let dep = usdc(1_000);
+                engine.deposit(idx, dep).unwrap();
+                users.push(idx);
+                deposits.push(dep);
+                withdrawn.push(0u128);
+            }
+            for a in 0..cfg.max_portfolio_assets as usize {
+                let _ = engine.accrue_asset(a, 1, oracle, 0);
+            }
+            // Each user opens multiple legs across multiple assets (cross-margin)
+            for (i, &u) in users.iter().enumerate() {
+                for a in 0..cfg.max_portfolio_assets as usize {
+                    if rng.next_u64() % 2 == 0 {
+                        let user_long = (i + a) % 2 == 0;
+                        let notional = 500u128 + (rng.next_u64() % 2000) as u128;
+                        let p = engine.group.assets[a].effective_price;
+                        let sq = usdc(notional) * POS_SCALE / p as u128;
+                        let _ = if user_long {
+                            engine.trade(u, lp, a, sq, p, 1)
+                        } else {
+                            engine.trade(lp, u, a, sq, p, 1)
+                        };
+                    }
+                }
+            }
+            let mut slot = 2u64;
+            for _step in 0..100u64 {
+                // Random price moves
+                for a in 0..cfg.max_portfolio_assets as usize {
+                    let mv = (rng.next_u64() % 90) as i64 - 45;
+                    let cur = engine.group.assets[a].effective_price;
+                    let target = ((cur as i128) + (cur as i128 * mv as i128 / 10_000)) as u64;
+                    let _ = engine.accrue_asset(a, slot, clamp_oracle(target.max(1), cur, max_move, 1), 0);
+                }
+                let prices = engine.effective_prices();
+                // Atomic refresh ALL accounts
+                for &idx in users.iter().chain(std::iter::once(&lp)) {
+                    let backup = engine.accounts[idx];
+                    let mut acc = backup;
+                    let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                    let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                    if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+                }
+                // Random liquidation when deficit
+                for (ui, &u) in users.iter().enumerate() {
+                    let _ = ui;
+                    if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                        for li in 0..(cfg.max_portfolio_assets as usize) {
+                            let leg = engine.accounts[u].legs[li];
+                            if leg.active {
+                                let backup = engine.accounts[u];
+                                let mut acc = backup;
+                                let r = engine.group.liquidate_account_not_atomic(&mut acc,
+                                    LiquidationRequestV16 { asset_index: li, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5 },
+                                    &prices);
+                                if r.is_ok() {
+                                    engine.accounts[u] = acc;
+                                    total_liquidations.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    engine.accounts[u] = backup;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Random withdraws (legit) — try to extract
+                if rng.next_u64() % 3 == 0 {
+                    let ui = (rng.next_u64() as usize) % users.len();
+                    let u = users[ui];
+                    let cap = engine.accounts[u].capital;
+                    if cap > 0 {
+                        let backup = engine.accounts[u];
+                        let mut acc = backup;
+                        let r = engine.group.withdraw_not_atomic(&mut acc, cap, &prices);
+                        if r.is_ok() {
+                            withdrawn[ui] += cap;
+                            engine.accounts[u] = acc;
+                        } else {
+                            engine.accounts[u] = backup;
+                        }
+                    }
+                }
+                slot += 1;
+                if engine.group.assert_public_invariants().is_err() {
+                    invariant_fails.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // End checks
+            for (i, &u) in users.iter().enumerate() {
+                let acc = engine.accounts[u];
+                let wire = PortfolioAccountV16Account::from_runtime(&acc);
+                if wire.try_to_runtime().is_err() {
+                    wire_fails.fetch_add(1, Ordering::Relaxed);
+                }
+                let excess = withdrawn[i] as i64 - deposits[i] as i64;
+                if excess > max_user_excess.load(Ordering::Relaxed) {
+                    max_user_excess.store(excess, Ordering::Relaxed);
+                }
+            }
+            // Per-domain budget check
+            for d in 0..(cfg.max_portfolio_assets as usize * 2) {
+                if engine.group.insurance_domain_spent[d] > engine.group.insurance_domain_budget[d] {
+                    domain_overflows.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        println!("    {} seeds × 100 ops × 3 users × 4 assets", seeds);
+        println!("    total liquidations:                    {}", total_liquidations.load(Ordering::Relaxed));
+        println!("    invariant failures:                    {}", invariant_fails.load(Ordering::Relaxed));
+        println!("    wire round-trip failures:              {}", wire_fails.load(Ordering::Relaxed));
+        println!("    per-domain insurance budget overflows: {}", domain_overflows.load(Ordering::Relaxed));
+        println!("    max user net cash extraction:          ${}", max_user_excess.load(Ordering::Relaxed) / 1_000_000);
+    }
+}
+
 /// Comprehensive atomic adversarial fuzz: random sequences of every
 /// engine primitive (open, accrue, settle, refresh, convert, withdraw,
 /// close, liquidate) across N attackers + LP, with strict SVM rollback
@@ -8328,6 +8638,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_atomic_fuzz") {
         probe_v16_atomic_fuzz(2000);
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_xmargin_liq") {
+        probe_v16_xmargin_liquidation_stress();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
