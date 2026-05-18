@@ -2,146 +2,122 @@
 
 **Date:** 2026-05-18
 **Engine:** `v16.8.0 Realizable Full Shared Cross-Margin`
-**Stress branch:** `v16` (commit `8d96d36` + this commit)
-**Probes run:** 31 / 31 pass
+**Stress branch:** `v16`
+**Probes run:** 31 / 31 pass execution; capital-efficiency probes show a regression vs the prior wiring.
 
-## Build & probe summary
+## What changed in the engine since previous run
 
-All 31 probes ported cleanly via mechanical V14→V16 rename + V16Config
-constructor delegation. All probes execute on v16 without errors.
+The K-pair settlement path now consults source-credit:
 
-## Key findings
+- `apply_haircut_bounded_close_loss_to_pnl` (v16.rs:7373): branches on `account_has_source_claims`. If true, uses `account_unliened_source_realizable_support` and `create_and_consume_account_source_credit_for_effective_not_atomic` instead of residual gating.
+- `apply_signed_kf_delta_to_pnl` (v16.rs:7449): now accepts `source_domain: Option<usize>` and takes `MAX(global_effective_available, source_effective_available)` when supporting an existing loss.
+- `settle_leg_kf_effects` (v16.rs:7833): passes `source_domain = Some(opposite_side(leg.side))` for `net > 0` settlement.
+- `set_account_pnl_with_source` (v16.rs:8133): auto-tracks `account.source_claim_bound_num[domain]` and `source_credit[domain].positive_claim_bound_num` on positive PnL.
 
-### 1. Spec promise NOT yet delivered
-
-The `v16_pre_settle` probe injects full counterparty backing (credit_rate=100%)
-BEFORE settlement. The user's spread trade still loses $500 of $1000 capital.
-
-**Root cause:** `apply_signed_kf_delta_to_pnl` (v16.rs:7334) and
-`apply_haircut_bounded_close_loss_to_pnl` (v16.rs:7269) — the K-pair
-settlement path — still use only `self.residual()` and
-`self.junior_claim_bound()` (v15 gating). They never consult the new
-`source_credit[domain].credit_rate_num`.
-
-The new `account_haircut_equity` (v16.rs:7211) correctly takes
-`MIN(global_support, source_realizable)`, but this runs AFTER per-leg
-settlement has already drained capital.
-
-### 2. No auto-orchestration of BackingReservationPlan
-
-`full_account_refresh` calls `reconcile_account_source_credit_liens_not_atomic`,
-but that function only handles expiry/impairment — it never creates new
-backing reservations. The spec's "A full account refresh computes ... a
-deterministic BackingReservationPlan" is not implemented.
-
-`SourceCreditStateV16` slots remain `EMPTY` after refreshing an account
-with losses — backing must be reserved manually by the wrapper via
-`add_fresh_counterparty_backing_not_atomic`.
-
-### 3. Healthy-market behavior matches v15
-
-| Scenario | v15 result | v16 result |
-|---|---|---|
-| Spread profit, residual=0 | Stuck paper PnL, $0 cash recovery | **Same** — `spread_realize` log unchanged |
-| Long SOL + short ETH 30-day walk | 2.6% survival | **2.0% survival** |
-| Single 5x leverage 30-day walk | 44.6% survival | **38.2% survival** |
-| Long SOL + long ETH 10x portfolio | 0.8% survival | **0.4% survival** |
-| Diversification (4 split vs 1) | -11% vs -21% | **-11% vs -21%** |
-| h_min/h_max ratchet test | identical across configs | **identical across configs** |
-| Per-domain bankruptcy attribution | SOL bankruptcy isolated | **SOL bankruptcy isolated** |
-| Round-trip spread (loss feeds residual) | Nets to $0 | **Same — `spread_residual` log unchanged** |
-
-## Capital efficiency probes (key data)
-
-### Single-asset random walk (500 seeds, ~30 day window, 30 bps daily vol)
+This is exactly the rewiring identified as missing in the previous report. The settle path is now correctly source-credit-aware — verified by `v16_pre_settle`:
 
 ```
-leverage | survival% | avg pnl %
----------|-----------|----------
-  2x     | 100.0%    | -21.79%
-  5x     |  38.2%    | -21.75%
- 10x     |   0.0%    | (liquidated)
- 15x     |   0.0%    | (liquidated)
+v16_pre_settle: inject backing BEFORE settle, credit_rate=100%
+Result: cap=$1000, pnl=$0, cert_eq=$1000
+        → SPREAD FUNGIBILITY DELIVERED (HL-like)
 ```
 
-### Diversification (same $10k notional split across N assets, $5k cap)
+This is a real improvement. **Manual backing now produces capital-preserving spread trades.**
 
-```
-config            | survival% | avg net pnl %
-------------------|-----------|--------------
-concentrated (1)  | 100.0%    | -21.03%
-split 2 ways      | 100.0%    | -15.81%
-split 3 ways      | 100.0%    | -12.97%
-split 4 ways      | 100.0%    | -11.44%
-```
+## But: regression in healthy-market behavior
 
-### Spread trade (long SOL + short ETH, $5k each, $1k cap)
+The new wiring uses source-credit **exclusively** when the account has source claims. It no longer falls back to residual-as-cushion. Since `full_account_refresh` still doesn't auto-create `BackingReservationPlan`, backing remains empty in healthy markets, and the account loses the residual-based protection it had under v15/old-v16.
 
-```
-config                                       | survival% | avg P&L%
----------------------------------------------|-----------|----------
-long SOL only ($5k notional, 5x)             |   39.0%   | -23.67%
-long SOL + long ETH ($5k each, 10x portfolio)|    0.4%   | -22.89%
-long SOL + short ETH (RELATIVE VALUE spread) |    2.0%   | -12.70%
-```
+Net effect on capital efficiency probes:
 
-The "hedged" spread liquidates 98% of the time — same as the unhedged 10x
-portfolio. No realized cross-margin benefit in healthy markets.
+| Probe | Previous (old wiring) | Current (new wiring) | Change |
+|---|---|---|---|
+| Single-asset 2x lev, 30-day walk | 100% survival | **0% survival** | regression |
+| Single-asset 5x lev, 30-day walk | 38% survival | **0% survival** | regression |
+| Spread long SOL only (5x) | 39% survival | **0% survival** | regression |
+| Spread long SOL + long ETH | 0.4% survival | **0% survival** | regression |
+| Spread long SOL + short ETH | 2.0% survival | **0% survival** | regression |
+| Diversification 1/2/3/4 ways | 100%/100%/100%/100% | **0%/0%/0%/0%** | regression |
+| Mean-reversion ratchet ±10% | $0 lost | **−$1041 / −104%** | regression — worse than -100% (over-burn) |
+| Round-trip spread (`spread_residual`) | $0 net change | $0 net change | unchanged |
+| Manual backing pre-settle (`v16_pre_settle`) | $500 lost | **$0 lost** | new mechanism works |
 
-### Mean-reversion ratchet (oracle round-trips)
+## Root cause
 
-```
-±2.0%, ±5.0%, ±10.0%, ±15.0% round trips on 2x long position:
-total_lost = $0 (0.0%) in every case
-```
+In the new `apply_haircut_bounded_close_loss_to_pnl`:
 
-When the LP refreshes between accruals, the ratchet does NOT bite. (The
-asymmetric capital absorption is bounded by residual, which is reset on
-round-trip moves.)
-
-### h-lock comparison (no effect)
-
-```
-instant     (h_min=0, h_max=1)  : cap=$860 pnl=$135  total_lost=$4 (0.5%)
-default     (h_min=0, h_max=30) : cap=$860 pnl=$135  total_lost=$4 (0.5%)
-warmup      (h_min=5, h_max=30) : cap=$860 pnl=$135  total_lost=$4 (0.5%)
+```rust
+let has_source_claims = Self::account_has_source_claims(account)?;
+let effective_available = if has_source_claims {
+    self.account_unliened_source_realizable_support(account, old_positive_face)?
+} else {
+    self.haircut_effective_support(old_positive_face, residual, junior_bound)?
+};
 ```
 
-Identical results across all h-lock configurations — confirms the ratchet
-is residual-bounded, not h-lock bounded.
+When `set_account_pnl_with_source` auto-populates `account.source_claim_bound_num[domain]` from any positive PnL, `has_source_claims` becomes `true`. The branch then uses only `account_unliened_source_realizable_support`, which returns 0 when no backing was reserved.
 
-## Security probes (all pass)
+**Previously**, even with residual = 0 globally, a single user's own prior losses would grow vault−c_tot and provide residual-as-cushion for their later gain leg. That path is now skipped.
+
+Walked-out example at 5x lev, single seed (from `cap_eff` trace):
+
+| Step | Price | Old cap | Old pnl | New cap | New pnl |
+|---|---|---|---|---|---|
+| 0    | $199 | $998 | $0     | $998 | $0     |
+| 2000 | $189 | $739 | $0     | $739 | $0     |
+| 3000 | $206 | $739 | +$424M | $739 | +$424M |
+| 4000 | $209 | $739 | +$486M | $739 | +$486M |
+| 5000 | $203 | $739 | +$234M | **$604** | **$0** |
+| 6000 | $181 | $424 | $0     | **$55**  | $0 (deficit $171) |
+| 6999 | $182 | $424 | +$15M (alive) | (already liquidated) | — |
+
+At step 5000, the price drop should haircut the existing $486M positive PnL. Old wiring used residual ($254 = $998−$739 stuck in vault) to cushion → pnl falls to +$234M, cap unchanged. New wiring uses source-only (no backing) → entire $486M gain is burned, remaining loss settles $135 from cap.
+
+## Fix
+
+The fix is a one-line change in `apply_haircut_bounded_close_loss_to_pnl`: take the **MAX** of source and residual support, not the either-or branch.
+
+```rust
+let effective_available = std::cmp::max(
+    self.account_unliened_source_realizable_support(account, old_positive_face)?,
+    self.haircut_effective_support(old_positive_face, residual, junior_bound)?,
+);
+```
+
+`apply_signed_kf_delta_to_pnl` already does this for the `account.pnl < 0` case (v16.rs:7490-7500). The same pattern is needed for `apply_haircut_bounded_close_loss_to_pnl`.
+
+The second half of the spec promise — `BackingReservationPlan` auto-orchestration inside `full_account_refresh` — is still missing. Without it, the realizable-backing credit_rate stays at 0 unless a keeper/wrapper explicitly calls `add_fresh_counterparty_backing_not_atomic`. Until that lands, capital efficiency depends on the wrapper.
+
+## Security probes (all still pass)
 
 | Probe | Status |
 |---|---|
-| exec_price_attack | engine defended (LockActive at 9999bps deviation) |
-| sybil_close       | $0 attacker extraction across 100/1000/5000/9999 bps |
-| drift             | bad-asset isolated; no contagion to healthy asset |
-| hard / hard_ext   | 2000-seed fuzz: all 2000 withdraws limited to deposited cap, no insurance drain |
-| domain_attr       | bankruptcy residual charged only to source domain (SOL spent=$0 when budget=$0) |
-| corner_cases      | adversarial keeper: no extraction across 20 liquidations |
-| multileg          | 4-leg user crash: insurance_used=$0, residual=$0, explicit_loss=$0 |
-| f6                | conservative-pause wrapper-controlled (returns LockActive when stress=true) |
-| boundary / config | configuration envelopes validated; rebalance path works |
-| resolve           | market resolve + emergency exit path works |
-| pnl_trace         | per-leg PnL materialization correct; liquidation outcomes valid |
+| exec_price_attack | engine defended at 9999 bps deviation (LockActive) |
+| sybil_close | 0 extraction across 100/1000/5000/9999 bps |
+| hard_ext (2000-seed fuzz) | total withdrawn = $2,688,104 (= sum of deposits, no excess); max single withdraw = $2500 (= max deposit); 0 invariant fails |
+| drift | bad-asset crash isolated to that asset; asset 1 (2x long) preserves cap=$499 (no contagion) |
+| domain_attr | SOL bankruptcy charged $6.6M only to domain[1] (SOL long-side opp); BTC domains unaffected |
+| corner_cases | adversarial keeper liquidates richest first; sum user cap $6,770 preserved |
+| multileg | 4-leg user crash: insurance_used=$0, residual=$0, explicit_loss=$0 |
+| f6 | conservative-pause wrapper-controlled (LockActive on stress=true) |
+| boundary / config / resolve / pnl_trace | all paths exercised, no extraction |
 
-## Conclusion
+## Manual-backing path — empirical proof of the spec mechanism
 
-The v16 implementation is **structurally complete** (all data structures,
-primitives, and proofs present) but the **K-pair settlement path is not
-yet wired to the new source-credit gating mechanism**. In healthy markets
-where `residual = 0`, v16 currently behaves identically to v15 — the
-"Realizable Full Shared Cross-Margin" UX from the spec is structurally
-unreachable until two changes land in the engine:
+When the wrapper supplies backing (simulating what `BackingReservationPlan` would do automatically):
 
-1. `apply_signed_kf_delta_to_pnl` and `apply_haircut_bounded_close_loss_to_pnl`
-   consult `source_credit[domain].credit_rate_num` rather than (or in addition
-   to) `residual / junior_claim_bound`.
-2. `full_account_refresh` computes a `BackingReservationPlan` and calls
-   `add_fresh_counterparty_backing_not_atomic` for every domain where
-   the account owes loss — so backing exists by the time the next account
-   tries to claim against it.
+```
+v16_pre_settle (inject before settle):
+  Pre-settle inject (domain 2 = ETH Long): claim=true backing=true
+  credit_rate = 100.00%
+  After settle + refresh:
+    cap=$1000, pnl=$0, cert_eq=$1000
+  → SPREAD FUNGIBILITY DELIVERED (HL-like)
+```
 
-Without these, the spread-trade survival in normal markets remains <3%
-and gain legs are paper-only.
+This is the v16 promise working end-to-end. The construction is correct. The missing pieces are:
+
+1. **Auto-orchestration in `full_account_refresh`** — when an account refreshes with a loss, the engine should reserve that account's senior capital as backing for the opposing source domain. Currently the wrapper must call `add_fresh_counterparty_backing_not_atomic` manually.
+2. **Residual-as-cushion fallback** — when source-credit gives zero support but global residual > 0, the engine should fall back to the residual mechanism rather than burning the gain leg entirely.
+
+With those two changes, the spec's healthy-market capital efficiency claim should hold under stress.
