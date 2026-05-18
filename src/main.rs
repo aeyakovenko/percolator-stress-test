@@ -3341,38 +3341,53 @@ fn probe_v16_instant_h_lock_attacks() {
         let final_cap = engine.accounts[attacker].capital;
         let final_pnl = engine.accounts[attacker].pnl;
         let lp_final = engine.accounts[lp].capital;
+        let lp_pnl_final = engine.accounts[lp].pnl;
+        let lp_total = lp_final as i128 + lp_pnl_final;
         let net_change = total_withdrawn as i128 + final_cap as i128 + final_pnl - deposit as i128;
-        let lp_change = lp_final as i128 - 50_000_000 * USDC_DECIMALS as i128;
+        let lp_change = lp_total - 50_000_000 * USDC_DECIMALS as i128;
         println!("    after revert (before close): cap=${} pnl=${}",
             cap_after_revert / 1_000_000, pnl_after_revert / 1_000_000);
         println!("    after close+convert+withdraw: cap=${} pnl=${} | withdraw2={:?} (${})",
             final_cap / 1_000_000, final_pnl / 1_000_000,
             post_w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
             final_withdrawn2 / 1_000_000);
-        println!("    total extracted from engine: ${} | LP_cap_Δ=${} | NET to attacker: ${} {}",
+        println!("    LP: cap=${}, pnl=${}, total=${}",
+            lp_final / 1_000_000, lp_pnl_final / 1_000_000, lp_total / 1_000_000);
+        println!("    total extracted from engine: ${} | LP_total_Δ=${} | NET to attacker: ${} {}",
             total_withdrawn / 1_000_000,
             lp_change / 1_000_000,
             net_change / 1_000_000,
             if net_change > 0 { "★★ EXTRACTION ★★" } else { "no extraction" });
-        // Show source-credit-lock state and any active legs
+        // Also show insurance and residual
+        let vault = engine.group.vault;
+        let c_tot = engine.group.c_tot;
+        let insurance = engine.group.insurance;
+        let residual = vault.saturating_sub(c_tot).saturating_sub(insurance);
+        println!("    engine: vault=${} c_tot=${} insurance=${} residual=${}",
+            vault / 1_000_000, c_tot / 1_000_000,
+            insurance / 1_000_000, residual / 1_000_000);
+        // Can LP recover their $5000 pnl? Try convert + withdraw.
+        let lp_cap_pre_recovery = engine.accounts[lp].capital;
+        let lp_conv = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[lp]);
+        let prices_lp = engine.effective_prices();
+        let lp_cap_now = engine.accounts[lp].capital;
+        let _ = engine.group.withdraw_not_atomic(&mut engine.accounts[lp], lp_cap_now, &prices_lp);
+        let lp_extracted_to_external = lp_cap_pre_recovery + lp_conv.unwrap_or(0);  // approx
+        let _ = lp_extracted_to_external;
+        let lp_after = engine.accounts[lp].capital + engine.accounts[lp].pnl as u128;
+        println!("    LP recovery: convert={:?}, LP final balance=${}",
+            lp_conv.as_ref().map(|v| v / 1_000_000),
+            lp_after / 1_000_000);
         let acc = &engine.accounts[attacker];
-        let mut lock_sum = 0u128;
-        for d in 0..(cfg.max_portfolio_assets as usize * 2) {
-            lock_sum += acc.source_converted_capital_lock[d];
-        }
         let active_legs: Vec<usize> = (0..(cfg.max_portfolio_assets as usize)).filter(|&i| acc.legs[i].active).collect();
-        println!("    debug: source_converted_capital_lock sum = ${} | active legs = {:?}",
-            lock_sum / 1_000_000, active_legs);
+        println!("    debug: active legs = {:?}, pnl=${}", active_legs, acc.pnl / 1_000_000);
         println!("    engine invariants: {:?}", engine.group.assert_public_invariants());
-        // Try another refresh + withdraw cycle (lock release should happen on refresh)
+        // Try another refresh + withdraw cycle
         let prices = engine.effective_prices();
         let mut acc2 = engine.accounts[attacker];
         let r_refresh = engine.group.full_account_refresh(&mut acc2, &prices);
         engine.accounts[attacker] = acc2;
-        let lock_after_refresh: u128 = (0..(cfg.max_portfolio_assets as usize * 2))
-            .map(|d| engine.accounts[attacker].source_converted_capital_lock[d]).sum();
-        println!("    after second refresh: lock sum = ${} (refresh={:?})",
-            lock_after_refresh / 1_000_000,
+        println!("    after second refresh: {:?}",
             r_refresh.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
         let cap_now = engine.accounts[attacker].capital;
         let w3 = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap_now, &prices);
