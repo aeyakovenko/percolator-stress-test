@@ -27,17 +27,17 @@ const SOL_ASSET: usize = 0;
 /// Engine state held by the wrapper: a MarketGroup plus a Vec of accounts.
 /// In v14 the engine no longer owns the account slab; the wrapper passes
 /// accounts in by mut-ref to each call.
-struct V14Engine {
-    group: MarketGroupV14,
-    accounts: Vec<PortfolioAccountV14>,
+struct V16Engine {
+    group: MarketGroupV16,
+    accounts: Vec<PortfolioAccountV16>,
     market_group_id: [u8; 32],
     next_account_seq: u64,
 }
 
-impl V14Engine {
-    fn new(config: V14Config) -> V14Result<Self> {
+impl V16Engine {
+    fn new(config: V16Config) -> V16Result<Self> {
         let group_id = [0x42u8; 32];
-        let group = MarketGroupV14::new(group_id, config)?;
+        let group = MarketGroupV16::new(group_id, config)?;
         Ok(Self {
             group,
             accounts: Vec::new(),
@@ -47,29 +47,29 @@ impl V14Engine {
     }
 
     /// Create a new portfolio account and register it with the market group.
-    fn add_account(&mut self, owner_byte: u8) -> V14Result<usize> {
+    fn add_account(&mut self, owner_byte: u8) -> V16Result<usize> {
         let mut id = [0u8; 32];
         id[..8].copy_from_slice(&self.next_account_seq.to_le_bytes());
         self.next_account_seq += 1;
         let owner = [owner_byte; 32];
-        let header = ProvenanceHeaderV14::new(self.market_group_id, id, owner);
-        let account = PortfolioAccountV14::empty(header);
+        let header = ProvenanceHeaderV16::new(self.market_group_id, id, owner);
+        let account = PortfolioAccountV16::empty(header);
         self.group.create_portfolio_account(&account)?;
         let idx = self.accounts.len();
         self.accounts.push(account);
         Ok(idx)
     }
 
-    fn deposit(&mut self, idx: usize, amount: u128) -> V14Result<()> {
+    fn deposit(&mut self, idx: usize, amount: u128) -> V16Result<()> {
         let mut acc = self.accounts[idx];
         self.group.deposit_not_atomic(&mut acc, amount)?;
         self.accounts[idx] = acc;
         Ok(())
     }
 
-    fn effective_prices(&self) -> [u64; V14_MAX_PORTFOLIO_ASSETS_N] {
-        let mut p = [0u64; V14_MAX_PORTFOLIO_ASSETS_N];
-        for i in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+    fn effective_prices(&self) -> [u64; V16_MAX_PORTFOLIO_ASSETS_N] {
+        let mut p = [0u64; V16_MAX_PORTFOLIO_ASSETS_N];
+        for i in 0..V16_MAX_PORTFOLIO_ASSETS_N {
             p[i] = self.group.assets[i].effective_price;
         }
         p
@@ -85,11 +85,11 @@ impl V14Engine {
         size_q: u128,
         exec_price: u64,
         fee_bps: u64,
-    ) -> V14Result<TradeOutcomeV14> {
+    ) -> V16Result<TradeOutcomeV16> {
         let prices = self.effective_prices();
         let mut long_acc = self.accounts[long_idx];
         let mut short_acc = self.accounts[short_idx];
-        let req = TradeRequestV14 {
+        let req = TradeRequestV16 {
             asset_index,
             size_q,
             exec_price,
@@ -112,7 +112,7 @@ impl V14Engine {
         now_slot: u64,
         effective_price: u64,
         funding_rate_e9: i128,
-    ) -> V14Result<AccrueAssetOutcomeV14> {
+    ) -> V16Result<AccrueAssetOutcomeV16> {
         // Keep the raw-oracle target in sync with the effective price so
         // target_effective_lag stays false.
         self.group.assets[asset_index].raw_oracle_target_price = effective_price;
@@ -134,7 +134,7 @@ impl V14Engine {
         self.group.assets[asset_index].raw_oracle_target_price = target;
     }
 
-    fn assert_invariants(&self) -> V14Result<()> {
+    fn assert_invariants(&self) -> V16Result<()> {
         self.group.assert_public_invariants()
     }
 }
@@ -143,33 +143,34 @@ impl V14Engine {
 /// the strict v14 solvency envelope check. Stage 1 uses this to verify the
 /// flow; the bounty_sol_20x_max config comes in stage 2 once we know what
 /// the v14 envelope allows.
-fn make_full_margin_config() -> V14Config {
-    V14Config::public_user_fund(1, 0, 30)
+fn make_full_margin_config() -> V16Config {
+    V16Config::public_user_fund(1, 0, 30)
 }
 
 /// Probe: try variants of the bounty_sol_20x_max config to find what
 /// v14's validate_exact_solvency_envelope accepts.
 fn probe_bounty_variants() {
-    let mk = |max_move: u64, max_dt: u64, liq: u64, fee: u64| V14Config {
-        max_portfolio_assets: 1, min_nonzero_mm_req: 20, min_nonzero_im_req: 30,
-        h_min: 0, h_max: 30,
-        maintenance_margin_bps: 500, initial_margin_bps: 500,
-        max_trading_fee_bps: fee, liquidation_fee_bps: liq,
-        liquidation_fee_cap: usdc(50_000), min_liquidation_abs: 0,
-        max_accrual_dt_slots: max_dt, max_abs_funding_e9_per_slot: 0,
-        min_funding_lifetime_slots: max_dt, max_price_move_bps_per_slot: max_move,
-        max_account_b_settlement_chunks: 8, max_bankrupt_close_chunks: 8,
-        public_b_chunk_atoms: MAX_VAULT_TVL,
-        permissionless_recovery_enabled: true,
-        stale_certificate_penalty_enabled: true,
-        full_refresh_required_for_favorable_actions: true,
-        public_liveness_profile_crank_forward: true,
-        recovery_fallback_price_enabled: true,
-        max_bankrupt_close_lifetime_slots: 1000,
+    let mk = |max_move: u64, max_dt: u64, liq: u64, fee: u64| {
+        let mut c = V16Config::public_user_fund(1, 0, 30);
+        c.min_nonzero_mm_req = 20;
+        c.min_nonzero_im_req = 30;
+        c.maintenance_margin_bps = 500;
+        c.initial_margin_bps = 500;
+        c.max_trading_fee_bps = fee;
+        c.liquidation_fee_bps = liq;
+        c.liquidation_fee_cap = usdc(50_000);
+        c.max_accrual_dt_slots = max_dt;
+        c.min_funding_lifetime_slots = max_dt;
+        c.max_price_move_bps_per_slot = max_move;
+        c.max_account_b_settlement_chunks = 8;
+        c.max_bankrupt_close_chunks = 8;
+        c.max_bankrupt_close_lifetime_slots = 1000;
+        c.public_b_chunk_atoms = MAX_VAULT_TVL;
+        c
     };
-    let cases: Vec<(String, V14Config)> = vec![
+    let cases: Vec<(String, V16Config)> = vec![
         ("baseline v12 max_risk".to_string(), make_bounty_sol_20x_max_config()),
-        ("mm=im=10000 (full)".to_string(), V14Config::public_user_fund(1, 0, 30)),
+        ("mm=im=10000 (full)".to_string(), V16Config::public_user_fund(1, 0, 30)),
     ].into_iter()
     .chain([10, 20, 30, 40, 45, 48, 49].iter().flat_map(|&mv| {
         [0u64, 5].iter().map(move |&lf| {
@@ -187,47 +188,37 @@ fn probe_bounty_variants() {
 /// stricter solvency envelope. v12 allowed max_move=49 bps/slot; v14's exact
 /// envelope reserves more headroom, max it accepts is 45.
 /// Effective per-accrual oracle tolerance: 45 × 10 = 450 bps = 4.5%.
-fn make_bounty_sol_20x_max_config() -> V14Config {
+fn make_bounty_sol_20x_max_config() -> V16Config {
     make_bounty_config(1)
 }
 
-fn make_bounty_config(n_assets: u8) -> V14Config {
-    V14Config {
-        max_portfolio_assets: n_assets,
-        min_nonzero_mm_req: 20,
-        min_nonzero_im_req: 30,
-        h_min: 0,
-        h_max: 30,
-        maintenance_margin_bps: 500,
-        initial_margin_bps: 500,
-        max_trading_fee_bps: 1,
-        liquidation_fee_bps: 5,
-        liquidation_fee_cap: usdc(50_000),
-        min_liquidation_abs: 0,
-        max_accrual_dt_slots: 10,
-        max_abs_funding_e9_per_slot: 0,
-        min_funding_lifetime_slots: 10,
-        max_price_move_bps_per_slot: 45,
-        max_account_b_settlement_chunks: 8,
-        max_bankrupt_close_chunks: 8,
-        public_b_chunk_atoms: MAX_VAULT_TVL,
-        permissionless_recovery_enabled: true,
-        stale_certificate_penalty_enabled: true,
-        full_refresh_required_for_favorable_actions: true,
-        public_liveness_profile_crank_forward: true,
-        recovery_fallback_price_enabled: true,
-        max_bankrupt_close_lifetime_slots: 1000,
-    }
+fn make_bounty_config(n_assets: u8) -> V16Config {
+    let mut c = V16Config::public_user_fund(n_assets, 0, 30);
+    c.min_nonzero_mm_req = 20;
+    c.min_nonzero_im_req = 30;
+    c.maintenance_margin_bps = 500;
+    c.initial_margin_bps = 500;
+    c.max_trading_fee_bps = 1;
+    c.liquidation_fee_bps = 5;
+    c.liquidation_fee_cap = usdc(50_000);
+    c.max_accrual_dt_slots = 10;
+    c.min_funding_lifetime_slots = 10;
+    c.max_price_move_bps_per_slot = 45;
+    c.max_account_b_settlement_chunks = 8;
+    c.max_bankrupt_close_chunks = 8;
+    c.max_bankrupt_close_lifetime_slots = 1000;
+    c.public_b_chunk_atoms = MAX_VAULT_TVL;
+    c
 }
 
 /// Stage 1 smoke test: create engine, add LP + user, deposit, trade, accrue, close.
-fn smoke_test() -> V14Result<()> {
+fn smoke_test() -> V16Result<()> {
     let cfg = make_bounty_sol_20x_max_config();
     println!("V14 stage-2 smoke: bounty_sol_20x_max config (v14-tuned)");
     cfg.validate_public_user_fund()?;
     println!("  config validated");
 
-    let mut engine = V14Engine::new(cfg)?;
+    let mut engine = V16Engine::new(cfg)?;
     let lp = engine.add_account(1)?;
     let user = engine.add_account(2)?;
     engine.deposit(lp, usdc(10_000_000))?;
@@ -355,7 +346,7 @@ impl Scenario {
 /// Explicit invariant battery — v12-style granular checks. Returns a list of
 /// (label, ok) pairs so the caller can attribute the specific invariant that
 /// failed.
-fn invariant_battery(engine: &V14Engine) -> Vec<(&'static str, bool)> {
+fn invariant_battery(engine: &V16Engine) -> Vec<(&'static str, bool)> {
     let g = &engine.group;
     let mut results = vec![];
 
@@ -377,10 +368,10 @@ fn invariant_battery(engine: &V14Engine) -> Vec<(&'static str, bool)> {
         if asset.f_long_num.unsigned_abs() > (i128::MAX as u128) / 2 { f_ok = false; }
         if asset.f_short_num.unsigned_abs() > (i128::MAX as u128) / 2 { f_ok = false; }
         // A_side >= MIN_A_SIDE unless in DrainOnly/ResetPending
-        if asset.oi_eff_long_q > 0 && asset.mode_long == SideModeV14::Normal && asset.a_long < MIN_A_SIDE {
+        if asset.oi_eff_long_q > 0 && asset.mode_long == SideModeV16::Normal && asset.a_long < MIN_A_SIDE {
             a_ok = false;
         }
-        if asset.oi_eff_short_q > 0 && asset.mode_short == SideModeV14::Normal && asset.a_short < MIN_A_SIDE {
+        if asset.oi_eff_short_q > 0 && asset.mode_short == SideModeV16::Normal && asset.a_short < MIN_A_SIDE {
             a_ok = false;
         }
     }
@@ -405,15 +396,15 @@ fn invariant_battery(engine: &V14Engine) -> Vec<(&'static str, bool)> {
     let mut f7_ok = true;
     for i in 0..g.config.max_portfolio_assets as usize {
         let asset = g.assets[i];
-        if asset.mode_long == SideModeV14::DrainOnly
+        if asset.mode_long == SideModeV16::DrainOnly
             && asset.oi_eff_short_q == 0
-            && asset.mode_short != SideModeV14::ResetPending
+            && asset.mode_short != SideModeV16::ResetPending
         {
             f7_ok = false;
         }
-        if asset.mode_short == SideModeV14::DrainOnly
+        if asset.mode_short == SideModeV16::DrainOnly
             && asset.oi_eff_long_q == 0
-            && asset.mode_long != SideModeV14::ResetPending
+            && asset.mode_long != SideModeV16::ResetPending
         {
             f7_ok = false;
         }
@@ -423,7 +414,7 @@ fn invariant_battery(engine: &V14Engine) -> Vec<(&'static str, bool)> {
     results
 }
 
-fn run_invariant_battery(engine: &V14Engine) -> u32 {
+fn run_invariant_battery(engine: &V16Engine) -> u32 {
     let results = invariant_battery(engine);
     let mut failures = 0u32;
     for (_, ok) in &results {
@@ -494,7 +485,7 @@ fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_mo
 fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
     let n_assets = if matches!(scen, Scenario::Mega) { 3 } else { 1 };
     let cfg = make_bounty_config(n_assets);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let mut rng = Rng::new(seed);
 
     let lp = engine.add_account(1).unwrap();
@@ -593,7 +584,7 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
                 // Find the largest active leg and close it fully
                 let mut largest_leg_idx = None;
                 let mut largest_abs = 0u128;
-                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                     let leg = engine.accounts[u].legs[li];
                     if leg.active {
                         let a = leg.basis_pos_q.unsigned_abs();
@@ -608,7 +599,7 @@ fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
                     let mut acc = engine.accounts[u];
                     let r = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: li,
                             close_q: largest_abs,
                             fee_bps: 5,
@@ -724,13 +715,13 @@ fn run_fuzz(scen: Scenario, n_seeds: usize) {
 
 /// V14 port of v12 exec_price_attack test. Engine v14 also doesn't bound
 /// exec_price vs oracle directly; defense is the post-trade IM check.
-fn test_exec_price_attack_v14() -> V14Result<()> {
+fn test_exec_price_attack_v14() -> V16Result<()> {
     println!("=== v14 exec_price attack: bounty_sol_20x_max ===");
     let cfg = make_bounty_sol_20x_max_config();
     let oracle = price_e6(200);
 
     for deviation_bps in [100u64, 1000, 5000, 9999] {
-        let mut engine = V14Engine::new(cfg)?;
+        let mut engine = V16Engine::new(cfg)?;
         let lp = engine.add_account(1)?;
         let attacker = engine.add_account(2)?;
         engine.deposit(lp, usdc(10_000_000))?;
@@ -758,13 +749,13 @@ fn test_exec_price_attack_v14() -> V14Result<()> {
 
 /// V14 port of v12 sybil_close_attack: open A↔B at fair price, then close
 /// at adversarial exec to dump loss onto one side.
-fn test_sybil_close_v14() -> V14Result<()> {
+fn test_sybil_close_v14() -> V16Result<()> {
     println!("=== v14 sybil close: bounty_sol_20x_max ===");
     let cfg = make_bounty_sol_20x_max_config();
     let oracle = price_e6(200);
 
     for deviation_bps in [100u64, 1000, 5000, 9999] {
-        let mut engine = V14Engine::new(cfg)?;
+        let mut engine = V16Engine::new(cfg)?;
         let lp = engine.add_account(1)?;
         let a = engine.add_account(2)?;
         let b = engine.add_account(3)?;
@@ -835,7 +826,7 @@ fn run_probes() {
 fn probe_multi_asset_crash() {
     println!("  Multi-asset: 2 assets, hedged long-short, one crashes");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -878,7 +869,7 @@ fn probe_multi_asset_crash() {
         if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
             // Find biggest leg and liquidate
             let mut best = (0usize, 0u128);
-            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+            for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = engine.accounts[user].legs[li];
                 if leg.active {
                     let a = leg.basis_pos_q.unsigned_abs();
@@ -889,7 +880,7 @@ fn probe_multi_asset_crash() {
                 let mut acc = engine.accounts[user];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 { asset_index: best.0, close_q: best.1, fee_bps: 5 },
+                    LiquidationRequestV16 { asset_index: best.0, close_q: best.1, fee_bps: 5 },
                     &prices,
                 ) {
                     total_liquidations += 1;
@@ -914,7 +905,7 @@ fn probe_multi_asset_crash() {
 fn probe_stale_extract() {
     println!("  Stale-state extraction: mark stale, try convert/withdraw");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -954,7 +945,7 @@ fn probe_stale_extract() {
 fn probe_withdraw_undercollateralize() {
     println!("  Withdraw undercollateralize: open 15x, try to withdraw down to IM violation");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1001,7 +992,7 @@ fn run_probes_v14_extra() {
 fn probe_account_close() {
     println!("  Account close path: full deposit → trade → close cycle");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1041,7 +1032,7 @@ fn probe_account_close() {
 fn probe_long_dt_gap() {
     println!("  Long-dt gap: skip cranks for max_dt+5 slots, attempt accrue");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1072,7 +1063,7 @@ fn probe_long_dt_gap() {
 fn probe_rapid_churn() {
     println!("  Rapid churn: 100 open-close cycles");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1144,7 +1135,7 @@ fn run_probes_v14_more() {
 fn probe_resolve_exit() {
     println!("  Market resolve + emergency exit: 5 users, resolve, close_resolved");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -1181,10 +1172,10 @@ fn probe_resolve_exit() {
             let r = engine.group.close_resolved_account_not_atomic(&mut acc, 0);
             engine.accounts[u] = acc;
             match r {
-                Ok(ResolvedCloseOutcomeV14::ProgressOnly) => {
+                Ok(ResolvedCloseOutcomeV16::ProgressOnly) => {
                     progresses += 1;
                 }
-                Ok(ResolvedCloseOutcomeV14::Closed { payout }) => {
+                Ok(ResolvedCloseOutcomeV16::Closed { payout }) => {
                     exits += 1;
                     println!("    user {} closed on attempt {}: payout=${}",
                         u, attempt, payout / USDC_DECIMALS);
@@ -1211,7 +1202,7 @@ fn run_probes_resolve() {
 fn probe_boundary_values() {
     println!("  Boundary values: extreme size_q, exec_price, notional");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(5_000_000_000)).unwrap(); // $5B LP (well under MAX_VAULT_TVL=$10B)
     let user = engine.add_account(2).unwrap();
@@ -1255,7 +1246,7 @@ fn probe_boundary_values() {
 fn probe_rebalance() {
     println!("  Rebalance path: open large, reduce via rebalance_reduce_position");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1274,7 +1265,7 @@ fn probe_rebalance() {
     let mut acc = engine.accounts[user];
     let r = engine.group.rebalance_reduce_position_not_atomic(
         &mut acc,
-        RebalanceRequestV14 {
+        RebalanceRequestV16 {
             asset_index: SOL_ASSET,
             reduce_q,
         },
@@ -1302,7 +1293,7 @@ fn run_probes_boundary() {
 fn probe_adl_drain_reset() {
     println!("  ADL drain-reset: force a_side to floor, observe DrainOnly → ResetPending");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -1370,7 +1361,7 @@ fn probe_adl_drain_reset() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: 0,
                             close_q: leg.basis_pos_q.unsigned_abs(),
                             fee_bps: 5,
@@ -1386,13 +1377,13 @@ fn probe_adl_drain_reset() {
         }
         // Observe side-mode transitions
         match engine.group.assets[0].mode_long {
-            SideModeV14::DrainOnly => drain_only_long_seen = true,
-            SideModeV14::ResetPending => reset_pending_seen = true,
+            SideModeV16::DrainOnly => drain_only_long_seen = true,
+            SideModeV16::ResetPending => reset_pending_seen = true,
             _ => {}
         }
         match engine.group.assets[0].mode_short {
-            SideModeV14::DrainOnly => drain_only_short_seen = true,
-            SideModeV14::ResetPending => reset_pending_seen = true,
+            SideModeV16::DrainOnly => drain_only_short_seen = true,
+            SideModeV16::ResetPending => reset_pending_seen = true,
             _ => {}
         }
         slot += 1;
@@ -1415,7 +1406,7 @@ fn probe_adl_drain_reset() {
 fn probe_dust_gc() {
     println!("  Dust GC: open many tiny positions, observe phantom dust handling");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -1459,7 +1450,7 @@ fn probe_dust_gc() {
             let leg = engine.accounts[u].legs[0];
             if leg.active {
                 let qty = leg.basis_pos_q.unsigned_abs();
-                let (long, short) = if leg.side == SideV14::Long { (lp, u) } else { (u, lp) };
+                let (long, short) = if leg.side == SideV16::Long { (lp, u) } else { (u, lp) };
                 if engine.trade(long, short, SOL_ASSET, qty, o, 1).is_ok() {
                     churn_cycles += 1;
                     // reopen on the opposite side
@@ -1491,7 +1482,7 @@ fn probe_dust_gc() {
 fn probe_adversarial_keeper() {
     println!("  Adversarial keeper: liquidate richest accounts first under crash");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let mut longs = Vec::new();
@@ -1539,7 +1530,7 @@ fn probe_adversarial_keeper() {
                 let mut acc = engine.accounts[u];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: 0,
                         close_q: leg.basis_pos_q.unsigned_abs(),
                         fee_bps: 5,
@@ -1577,7 +1568,7 @@ fn probe_adversarial_keeper() {
 fn probe_xmargin_offset() {
     println!("  Cross-margin offset: profitable leg supports losing leg");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1642,7 +1633,7 @@ fn probe_xmargin_offset() {
 fn probe_xmargin_asymmetric() {
     println!("  Cross-margin asymmetric: long-A + long-B, only A crashes");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -1682,7 +1673,7 @@ fn probe_xmargin_asymmetric() {
         if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
             // Liquidate the largest active leg
             let mut best = (0usize, 0u128);
-            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+            for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = engine.accounts[user].legs[li];
                 if leg.active {
                     let a = leg.basis_pos_q.unsigned_abs();
@@ -1693,7 +1684,7 @@ fn probe_xmargin_asymmetric() {
                 let mut acc = engine.accounts[user];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: best.0,
                         close_q: best.1,
                         fee_bps: 5,
@@ -1728,7 +1719,7 @@ fn probe_xmargin_asymmetric() {
 fn probe_xmargin_haircut() {
     println!("  Cross-margin haircut: stress positive-PnL support haircut");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(1_000_000)).unwrap(); // smaller LP — limits residual
 
@@ -1816,7 +1807,7 @@ fn run_probes_xmargin() {
 /// Make a config with N assets where asset 0 is "good" and asset N-1 is
 /// "loose" (low MM, fast moves allowed). Tests whether v14 keeps the bad
 /// asset's bankruptcy contained per-leg.
-fn make_mixed_quality_config(n_assets: u8) -> V14Config {
+fn make_mixed_quality_config(n_assets: u8) -> V16Config {
     // Use the most conservative (good) config — engine applies same params
     // across all assets. The "badness" comes from oracle behavior, OI
     // concentration, or wrapper misconfiguration, not config heterogeneity
@@ -1831,7 +1822,7 @@ fn make_mixed_quality_config(n_assets: u8) -> V14Config {
 fn probe_thin_market_xmargin() {
     println!("  Drift-style A: thin asset (1 user, manipulated oracle) supports loss on real asset");
     let cfg = make_mixed_quality_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -1921,7 +1912,7 @@ fn probe_thin_market_xmargin() {
             engine.accounts[u] = acc;
             if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
                 let mut best = (0usize, 0u128);
-                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                     let leg = engine.accounts[u].legs[li];
                     if leg.active {
                         let a = leg.basis_pos_q.unsigned_abs();
@@ -1932,7 +1923,7 @@ fn probe_thin_market_xmargin() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: best.0,
                             close_q: best.1,
                             fee_bps: 5,
@@ -1966,7 +1957,7 @@ fn probe_thin_market_xmargin() {
 fn probe_phantom_pnl_extract() {
     println!("  Drift-style B: profitable leg supports losing leg, attempt extraction");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let attacker = engine.add_account(2).unwrap();
@@ -2039,7 +2030,7 @@ fn probe_phantom_pnl_extract() {
         engine.accounts[attacker] = acc;
         if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
             let mut best = (0usize, 0u128);
-            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+            for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = engine.accounts[attacker].legs[li];
                 if leg.active {
                     let a = leg.basis_pos_q.unsigned_abs();
@@ -2050,7 +2041,7 @@ fn probe_phantom_pnl_extract() {
                 let mut acc = engine.accounts[attacker];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: best.0,
                         close_q: best.1,
                         fee_bps: 5,
@@ -2081,7 +2072,7 @@ fn probe_phantom_pnl_extract() {
 fn probe_oracle_divergence() {
     println!("  Drift-style C: stale oracle on one asset inflates hedge value");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let attacker = engine.add_account(2).unwrap();
@@ -2164,7 +2155,7 @@ fn run_probes_drift() {
 fn probe_ten10_single_asset() {
     println!("  Hard 10/10: 50 users × 10x lev, 10% crash, single asset");
     // mm=1000 (10%) for 10x leverage envelope
-    let cfg = V14Config {
+    let cfg = V16Config {
         max_portfolio_assets:               1,
         min_nonzero_mm_req:                20,
         min_nonzero_im_req:                30,
@@ -2188,13 +2179,13 @@ fn probe_ten10_single_asset() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
-        max_bankrupt_close_lifetime_slots: 1000,
+        max_bankrupt_close_lifetime_slots: 1000, asset_activation_cooldown_slots: 1, max_recovery_fallback_deviation_bps: MAX_RECOVERY_FALLBACK_DEVIATION_BPS, backing_freshness_buckets: 1, margin_mode_realizable_full_shared_cross_margin: true, source_credit_lien_required: true, insurance_credit_reservation_required: true, recovery_fallback_envelope_enabled: true, credit_lien_revalidation_required: true,
     };
     if cfg.validate_public_user_fund().is_err() {
         println!("    cfg validation failed");
         return;
     }
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -2241,7 +2232,7 @@ fn probe_ten10_single_asset() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: 0,
                             close_q: leg.basis_pos_q.unsigned_abs(),
                             fee_bps: 5,
@@ -2283,7 +2274,7 @@ fn probe_ten10_single_asset() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: 0,
                             close_q: leg.basis_pos_q.unsigned_abs(),
                             fee_bps: 5,
@@ -2320,7 +2311,7 @@ fn probe_ten10_single_asset() {
 /// simultaneously even though only one asset moved.
 fn probe_ten10_cross_margin() {
     println!("  Hard 10/10 cross-margin: 30 users × 3 legs each, one asset crashes 10%");
-    let cfg = V14Config {
+    let cfg = V16Config {
         max_portfolio_assets:               3,
         min_nonzero_mm_req:                20,
         min_nonzero_im_req:                30,
@@ -2344,9 +2335,9 @@ fn probe_ten10_cross_margin() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
-        max_bankrupt_close_lifetime_slots: 1000,
+        max_bankrupt_close_lifetime_slots: 1000, asset_activation_cooldown_slots: 1, max_recovery_fallback_deviation_bps: MAX_RECOVERY_FALLBACK_DEVIATION_BPS, backing_freshness_buckets: 1, margin_mode_realizable_full_shared_cross_margin: true, source_credit_lien_required: true, insurance_credit_reservation_required: true, recovery_fallback_envelope_enabled: true, credit_lien_revalidation_required: true,
     };
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(50_000_000)).unwrap();
     let mut users = Vec::new();
@@ -2394,7 +2385,7 @@ fn probe_ten10_cross_margin() {
             engine.accounts[u] = acc;
             if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
                 let mut best = (0usize, 0u128);
-                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                     let leg = engine.accounts[u].legs[li];
                     if leg.active {
                         let a = leg.basis_pos_q.unsigned_abs();
@@ -2405,7 +2396,7 @@ fn probe_ten10_cross_margin() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: best.0,
                             close_q: best.1,
                             fee_bps: 5,
@@ -2447,7 +2438,7 @@ fn probe_ten10_cross_margin() {
 fn probe_drift_hack_aggressive() {
     println!("  Drift-hack aggressive: thin-asset oracle pump → real-asset over-leverage attempt");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -2562,7 +2553,7 @@ fn run_probes_hard_stress() {
 fn probe_drift_iterated(cycles: u32) {
     println!("  Drift-hack ITERATED ({} cycles): cumulative extraction test", cycles);
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let attacker = engine.add_account(2).unwrap();
@@ -2662,7 +2653,7 @@ fn probe_drift_iterated(cycles: u32) {
 fn probe_multi_attacker_collusion() {
     println!("  Multi-attacker collusion: 3 attackers coordinating on cross-margin");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -2753,7 +2744,7 @@ fn fuzz_drift_attack(n_seeds: u64) {
         .into_par_iter()
         .map(|seed| {
             let mut rng = Rng::new(seed);
-            let mut engine = V14Engine::new(cfg).expect("init");
+            let mut engine = V16Engine::new(cfg).expect("init");
             let lp = engine.add_account(1).unwrap();
             engine.deposit(lp, usdc(10_000_000)).unwrap();
             let attacker_cap = usdc(rng.range_u64(500, 5_000) as u128);
@@ -2832,7 +2823,7 @@ fn run_probes_hard_extended() {
 fn probe_per_domain_attribution() {
     println!("  Per-domain bankruptcy attribution: SOL crash should NOT touch BTC domains");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -2851,7 +2842,7 @@ fn probe_per_domain_attribution() {
 
     // Set generous domain budgets so spending isn't capped — we only want
     // to verify ATTRIBUTION, not capping.
-    for d in 0..V14_MAX_PORTFOLIO_ASSETS_N * 2 {
+    for d in 0..V16_MAX_PORTFOLIO_ASSETS_N * 2 {
         engine.group.insurance_domain_budget[d] = usdc(1_000_000);
     }
 
@@ -2900,13 +2891,13 @@ fn probe_per_domain_attribution() {
         engine.accounts[sol_loser].pnl,
         engine.accounts[sol_loser].health_cert.certified_liq_deficit);
 
-    let mut liq_out: Option<LiquidationOutcomeV14> = None;
+    let mut liq_out: Option<LiquidationOutcomeV16> = None;
     if engine.accounts[sol_loser].health_cert.certified_liq_deficit > 0 {
         let leg = engine.accounts[sol_loser].legs[0];
         let mut acc = engine.accounts[sol_loser];
         if let Ok(out) = engine.group.liquidate_account_not_atomic(
             &mut acc,
-            LiquidationRequestV14 {
+            LiquidationRequestV16 {
                 asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
             }, &prices,
         ) {
@@ -2952,7 +2943,7 @@ fn probe_per_domain_attribution() {
 fn probe_per_domain_budget_cap() {
     println!("  Per-domain budget cap: SOL_long_opp budget=$0, force deficit");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -2970,7 +2961,7 @@ fn probe_per_domain_budget_cap() {
     engine.accrue_asset(1, 1, oracle, 0).unwrap();
 
     // Generous budgets EXCEPT for SOL long-opp domain
-    for d in 0..V14_MAX_PORTFOLIO_ASSETS_N * 2 {
+    for d in 0..V16_MAX_PORTFOLIO_ASSETS_N * 2 {
         engine.group.insurance_domain_budget[d] = usdc(1_000_000);
     }
     engine.group.insurance_domain_budget[1] = 0; // SOL long-opp (asset 0 short-side dom)
@@ -3005,7 +2996,7 @@ fn probe_per_domain_budget_cap() {
         let mut acc = engine.accounts[sol_loser];
         match engine.group.liquidate_account_not_atomic(
             &mut acc,
-            LiquidationRequestV14 {
+            LiquidationRequestV16 {
                 asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
             }, &prices,
         ) {
@@ -3045,7 +3036,7 @@ fn probe_xmargin_with_residual() {
     for user_cap_usd in [1_000u128, 5_000, 25_000, 100_000] {
         println!("  --- user cap = ${} ---", user_cap_usd);
         let cfg = make_bounty_config(2);
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -3112,7 +3103,7 @@ fn probe_settle_order_sensitivity() {
     println!("  Settlement order sensitivity: does leg index assignment matter?");
     for swap in [false, true] {
         let cfg = make_bounty_config(2);
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -3226,7 +3217,7 @@ fn probe_capital_efficiency_single_asset(seeds: u64) {
     for lev in leverages {
         let mut early_failures = 0u32;
         let results: Vec<(bool, i128, u128)> = (0..seeds).into_par_iter().map(|seed| {
-            let mut engine = V14Engine::new(cfg).expect("init");
+            let mut engine = V16Engine::new(cfg).expect("init");
             let lp = engine.add_account(1).unwrap();
             engine.deposit(lp, usdc(10_000_000)).unwrap();
             let user = engine.add_account(2).unwrap();
@@ -3275,7 +3266,7 @@ fn probe_capital_efficiency_single_asset(seeds: u64) {
                         let mut acc = engine.accounts[user];
                         let _ = engine.group.liquidate_account_not_atomic(
                             &mut acc,
-                            LiquidationRequestV14 {
+                            LiquidationRequestV16 {
                                 asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5,
                             }, &prices);
                         engine.accounts[user] = acc;
@@ -3310,7 +3301,7 @@ fn probe_capital_efficiency_single_asset(seeds: u64) {
     println!("    Note: 'pnl %' includes both market moves AND fees. Survival rate measures liquidation-free.");
     println!();
     println!("  Single-run trace at 5x leverage (seed 0):");
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -3370,7 +3361,7 @@ fn probe_diversification_benefit(seeds: u64) {
     for (n_assets, label) in cases {
         let cfg = make_bounty_config(n_assets as u8);
         let results: Vec<(bool, i128, u128)> = (0..seeds).into_par_iter().map(|seed| {
-            let mut engine = V14Engine::new(cfg).expect("init");
+            let mut engine = V16Engine::new(cfg).expect("init");
             let lp = engine.add_account(1).unwrap();
             engine.deposit(lp, usdc(10_000_000)).unwrap();
             let user = engine.add_account(2).unwrap();
@@ -3417,7 +3408,7 @@ fn probe_diversification_benefit(seeds: u64) {
                 if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
                     // Liquidate biggest leg
                     let mut best = (0usize, 0u128);
-                    for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                    for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                         let leg = engine.accounts[user].legs[li];
                         if leg.active {
                             let a = leg.basis_pos_q.unsigned_abs();
@@ -3428,7 +3419,7 @@ fn probe_diversification_benefit(seeds: u64) {
                         let mut acc = engine.accounts[user];
                         let _ = engine.group.liquidate_account_not_atomic(
                             &mut acc,
-                            LiquidationRequestV14 {
+                            LiquidationRequestV16 {
                                 asset_index: best.0, close_q: best.1, fee_bps: 5,
                             }, &prices);
                         engine.accounts[user] = acc;
@@ -3468,7 +3459,7 @@ fn probe_diversification_benefit(seeds: u64) {
 fn probe_mean_reversion_ratchet() {
     println!("  Mean-reversion ratchet test: oracle round-trips to its start");
     let cfg = make_bounty_config(1);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -3484,7 +3475,7 @@ fn probe_mean_reversion_ratchet() {
     let amplitudes = [200u64, 500, 1000]; // 2%, 5%, 10% amplitude
     for amp_bps in amplitudes {
         // Reset for each amplitude
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -3554,6 +3545,310 @@ fn run_probes_capital_efficiency() {
     probe_mean_reversion_ratchet();
 }
 
+/// v16 cross-margin probe: does the new per-source-domain credit_rate mechanism
+/// actually deliver HL-like capital efficiency for a long-SOL/short-ETH spread
+/// in a healthy market?
+///
+/// Test plan:
+///   1. Set up LP ($50M) + user ($1k cap), 2 assets.
+///   2. User opens long SOL ($5k) + short ETH ($5k) — the canonical spread.
+///   3. Move SOL down 10%, ETH down 10% (correlated drop — spread profits).
+///   4. Refresh LP (so engine reserves LP backing for source domains).
+///   5. Refresh user.
+///   6. Print:
+///      - source_credit[domain].credit_rate_num for the user's gain leg
+///      - certified_equity, IM/MM req
+///      - whether the gain leg's PnL flows into equity
+fn probe_v16_spread_credit_rate() {
+    println!("  v16 spread trade — does soft credit deliver in a healthy market?");
+    println!();
+    let cfg = make_bounty_config(2);
+    println!("  Config: 2 assets, MM=IM=5%, max_move=45bps/slot");
+    println!("  Config flags:");
+    println!("    margin_mode_realizable_full_shared = {}", cfg.margin_mode_realizable_full_shared_cross_margin);
+    println!("    source_credit_lien_required = {}", cfg.source_credit_lien_required);
+    println!("    credit_lien_revalidation_required = {}", cfg.credit_lien_revalidation_required);
+    println!();
+    let oracle = price_e6(200);
+
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    // user long SOL (asset 0), short ETH (asset 1)
+    engine.trade(user, lp, 0, size_q, oracle, 0).unwrap();
+    engine.trade(lp, user, 1, size_q, oracle, 0).unwrap();
+    println!("  Open: user long $5k SOL, short $5k ETH; LP is counterparty on both");
+    println!("    user cap=${}, IM req=${}, MM req=${}",
+        engine.accounts[user].capital / 1_000_000,
+        engine.accounts[user].health_cert.certified_initial_req / 1_000_000,
+        engine.accounts[user].health_cert.certified_maintenance_req / 1_000_000);
+    println!();
+
+    // Move SOL down 10%, ETH down 10% — spread profits.
+    let target_sol = (oracle as u128 * 90 / 100) as u64;
+    let target_eth = (oracle as u128 * 90 / 100) as u64;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 100u64;
+    loop {
+        let p0 = engine.group.assets[0].effective_price;
+        let p1 = engine.group.assets[1].effective_price;
+        if p0 <= target_sol && p1 <= target_eth { break; }
+        let n0 = clamp_oracle(target_sol, p0, max_move, 1);
+        let n1 = clamp_oracle(target_eth, p1, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, n0, 0);
+        let _ = engine.accrue_asset(1, slot, n1, 0);
+        slot += 1;
+        if slot > 5000 { break; }
+    }
+    println!("  Moved: SOL ${} -> ${}, ETH ${} -> ${}",
+        oracle / 1_000_000, engine.group.assets[0].effective_price / 1_000_000,
+        oracle / 1_000_000, engine.group.assets[1].effective_price / 1_000_000);
+    println!();
+
+    // Refresh LP FIRST: this is the keeper's job — it makes LP's losses durable
+    // and creates the BackingReservationPlan that funds (ETH, Long) source domain.
+    let prices = engine.effective_prices();
+    let mut lp_acc = engine.accounts[lp];
+    let lp_refresh = engine.group.full_account_refresh(&mut lp_acc, &prices);
+    println!("  LP refresh: {:?}", lp_refresh.is_ok());
+    engine.accounts[lp] = lp_acc;
+
+    // Print all source_credit state for relevant domains.
+    println!("  Source-credit state after LP refresh:");
+    for asset in 0..2usize {
+        for side_idx in 0..2usize {
+            let d = asset * 2 + side_idx;
+            let sc = &engine.group.source_credit[d];
+            let side = if side_idx == 0 { "Long" } else { "Short" };
+            let asset_name = if asset == 0 { "SOL" } else { "ETH" };
+            let rate_pct = sc.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0;
+            if sc.positive_claim_bound_num > 0 || sc.fresh_reserved_backing_num > 0 {
+                println!("    ({}, {}): claim_bound_num=${}, fresh_backing_num=${}, credit_rate={:.2}%",
+                    asset_name, side,
+                    sc.positive_claim_bound_num / BOUND_SCALE,
+                    sc.fresh_reserved_backing_num / BOUND_SCALE,
+                    rate_pct);
+            }
+        }
+    }
+    println!();
+
+    // Now refresh user.
+    let prices = engine.effective_prices();
+    let mut ua = engine.accounts[user];
+    let user_refresh = engine.group.full_account_refresh(&mut ua, &prices);
+    engine.accounts[user] = ua;
+    println!("  User refresh: {:?}", user_refresh.is_ok());
+    let acc = &engine.accounts[user];
+    println!("  User state after move:");
+    println!("    cap=${}, pnl=${}", acc.capital / 1_000_000, acc.pnl / 1_000_000);
+    println!("    certified_equity=${}, mm_req=${}, im_req=${}",
+        acc.health_cert.certified_equity / 1_000_000,
+        acc.health_cert.certified_maintenance_req / 1_000_000,
+        acc.health_cert.certified_initial_req / 1_000_000);
+    println!("    liq_deficit=${}", acc.health_cert.certified_liq_deficit / 1_000_000);
+    println!();
+    let total_eq = acc.capital as i128 + acc.pnl;
+    println!("  Naive sum (cap + pnl): ${}", total_eq / 1_000_000);
+    let delta = total_eq - usdc(1_000) as i128;
+    println!("  Net economic position: {:+}", delta / 1_000_000);
+}
+
+/// v16: inject backing BEFORE settlement to see if K-pair path consults source-credit.
+fn probe_v16_backing_before_settle() {
+    println!("  v16: pre-inject backing BEFORE settlement");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, 0, size_q, oracle, 0).unwrap();
+    engine.trade(lp, user, 1, size_q, oracle, 0).unwrap();
+
+    let target = (oracle as u128 * 90 / 100) as u64;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 100u64;
+    // Move prices to JUST BEFORE final state
+    loop {
+        let p0 = engine.group.assets[0].effective_price;
+        let p1 = engine.group.assets[1].effective_price;
+        if p0 <= target && p1 <= target { break; }
+        let n0 = clamp_oracle(target, p0, max_move, 1);
+        let n1 = clamp_oracle(target, p1, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, n0, 0);
+        let _ = engine.accrue_asset(1, slot, n1, 0);
+        slot += 1;
+        if slot > 5000 { break; }
+    }
+    println!("  Prices moved (no settle yet). User account state:");
+    println!("    cap=${}, pnl=${}", engine.accounts[user].capital / 1_000_000,
+        engine.accounts[user].pnl / 1_000_000);
+
+    // Inject backing/claim for both source domains user will have claims on.
+    // User has loss on SOL (long) and gain on ETH (short).
+    // (SOL, Short) = domain 0*2+1=1: user is long, so the (SOL, Short) side owes us if price RISES
+    //   We have a LOSS so we don't claim against it.
+    // (ETH, Long) = domain 1*2+0=2: user is short, so we claim against the long side. INJECT HERE.
+    let amt = usdc(500);
+    let amt_num = amt.checked_mul(BOUND_SCALE).unwrap();
+    let r1 = engine.group.add_source_positive_claim_bound_not_atomic(2, amt_num, amt_num);
+    let r2 = engine.group.add_fresh_counterparty_backing_not_atomic(2, amt_num, slot + 1000);
+    println!("  Pre-settle inject (domain 2 = ETH Long): claim={:?} backing={:?}", r1.is_ok(), r2.is_ok());
+    let sc = &engine.group.source_credit[2];
+    println!("    credit_rate = {:.2}%", sc.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0);
+    println!();
+
+    // Now settle.
+    let prices = engine.effective_prices();
+    let mut ua = engine.accounts[user];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut ua, &prices);
+    engine.accounts[user] = ua;
+
+    let acc = &engine.accounts[user];
+    println!("  After settle + refresh:");
+    println!("    cap=${}, pnl=${}, cert_eq=${}",
+        acc.capital / 1_000_000, acc.pnl / 1_000_000,
+        acc.health_cert.certified_equity / 1_000_000);
+    let total_eq = acc.capital as i128 + acc.pnl;
+    println!("    naive cap+pnl: ${}", total_eq / 1_000_000);
+    println!("    initial deposit: $1000");
+    if total_eq >= 1000 * 1_000_000 {
+        println!("    -> SPREAD FUNGIBILITY DELIVERED (HL-like)");
+    } else {
+        println!("    -> Capital LOST: ${} (backing was IGNORED by K-pair settle path)",
+            (1000_000_000i128 - total_eq) / 1_000_000);
+    }
+}
+
+/// v16 manual backing injection probe — does the source-credit machinery
+/// deliver soft credit if backing is explicitly populated? This bypasses the
+/// missing "BackingReservationPlan from refresh" orchestration and tests
+/// whether the rest of the v16 plumbing works.
+fn probe_v16_manual_backing() {
+    println!("  v16: manually inject backing and check soft-credit flow");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, 0, size_q, oracle, 0).unwrap();
+    engine.trade(lp, user, 1, size_q, oracle, 0).unwrap();
+
+    // Move SOL down 10%, ETH down 10%: spread profits
+    let target = (oracle as u128 * 90 / 100) as u64;
+    let max_move = cfg.max_price_move_bps_per_slot;
+    let mut slot = 100u64;
+    loop {
+        let p0 = engine.group.assets[0].effective_price;
+        let p1 = engine.group.assets[1].effective_price;
+        if p0 <= target && p1 <= target { break; }
+        let n0 = clamp_oracle(target, p0, max_move, 1);
+        let n1 = clamp_oracle(target, p1, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, n0, 0);
+        let _ = engine.accrue_asset(1, slot, n1, 0);
+        slot += 1;
+        if slot > 5000 { break; }
+    }
+
+    // User's gain leg is ETH short → source_domain = (ETH=1, Long)
+    // Domain index for (asset 1, Long) = 1*2 + 0 = 2 in V16
+    // Domain index for (asset 0, Long) = 0*2 + 0 = 0 in V16  (SOL Long, for user's SOL gain)
+    // Actually user has loss on SOL (long) and gain on ETH (short).
+    // Source domain for user's ETH-short gain = (ETH, Long) = 1*2 + 0 = 2.
+
+    // Settle user first so positive PnL is registered.
+    let prices = engine.effective_prices();
+    let mut ua = engine.accounts[user];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut ua, &prices);
+    engine.accounts[user] = ua;
+
+    println!("  Before backing injection:");
+    let acc = &engine.accounts[user];
+    println!("    user cap=${}, pnl=${}, cert_eq=${}",
+        acc.capital / 1_000_000, acc.pnl / 1_000_000,
+        acc.health_cert.certified_equity / 1_000_000);
+    println!("    residual=${}, jb=${}",
+        engine.group.vault.saturating_sub(engine.group.c_tot + engine.group.insurance) / 1_000_000,
+        engine.group.pnl_pos_bound_tot / 1_000_000);
+    println!();
+
+    // Manually inject:
+    // - Add positive claim bound for source domain (ETH=1, Long) = domain 2
+    // - Add fresh counterparty backing to that domain
+    let gain_domain = 1 * 2 + 0; // (ETH, Long) -- the source domain owing user the ETH-short gain
+    let claim_amt = usdc(500); // user's $500 profit on ETH short
+    let backing_amt = claim_amt; // fully back it
+
+    // Try to add the claim bound first
+    println!("  Manually injecting:");
+    println!("    domain {} = (ETH, Long): claim_bound +${}, backing +${}",
+        gain_domain, claim_amt / 1_000_000, backing_amt / 1_000_000);
+
+    let claim_num = claim_amt.checked_mul(BOUND_SCALE).unwrap();
+    let backing_num = backing_amt.checked_mul(BOUND_SCALE).unwrap();
+
+    let r1 = engine.group.add_source_positive_claim_bound_not_atomic(gain_domain, claim_num, claim_num);
+    println!("    add_source_positive_claim_bound: {:?}", r1.is_ok());
+    let r2 = engine.group.add_fresh_counterparty_backing_not_atomic(gain_domain, backing_num, slot + 1000);
+    println!("    add_fresh_counterparty_backing: {:?}", match &r2 { Ok(_) => "Ok".to_string(), Err(e) => format!("{:?}", e) });
+
+    // Print source credit state for that domain
+    let sc = &engine.group.source_credit[gain_domain];
+    let rate_pct = sc.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0;
+    println!();
+    println!("  Source credit state for (ETH, Long) [domain {}]:", gain_domain);
+    println!("    positive_claim_bound_num=${}", sc.positive_claim_bound_num / BOUND_SCALE);
+    println!("    fresh_reserved_backing_num=${}", sc.fresh_reserved_backing_num / BOUND_SCALE);
+    println!("    credit_rate_num={} ({:.2}%)", sc.credit_rate_num, rate_pct);
+    println!();
+
+    // Now refresh user again
+    let prices = engine.effective_prices();
+    let mut ua = engine.accounts[user];
+    let r = engine.group.full_account_refresh(&mut ua, &prices);
+    engine.accounts[user] = ua;
+    println!("  After refresh with backing in place: {:?}", r.is_ok());
+    let acc = &engine.accounts[user];
+    println!("    user cap=${}, pnl=${}, cert_eq=${}, mm_req=${}, im_req=${}",
+        acc.capital / 1_000_000, acc.pnl / 1_000_000,
+        acc.health_cert.certified_equity / 1_000_000,
+        acc.health_cert.certified_maintenance_req / 1_000_000,
+        acc.health_cert.certified_initial_req / 1_000_000);
+    println!();
+    let total_eq = acc.capital as i128 + acc.pnl;
+    println!("  Naive cap+pnl: ${}", total_eq / 1_000_000);
+    println!("  Certified equity reflects: {}",
+        if acc.health_cert.certified_equity >= total_eq {
+            "full netting (spec promise delivered)"
+        } else if acc.health_cert.certified_equity > acc.capital as i128 {
+            "partial netting (soft credit applied)"
+        } else {
+            "NO netting (gain leg discarded; residual-gated)"
+        });
+}
+
 /// Spread trade WITH residual injection — what if the LP has built up
 /// significant residual from prior fees / liquidations? Does cross-margin
 /// offset start working?
@@ -3565,8 +3860,8 @@ fn probe_spread_with_residual() {
 
     // Helper: build a market with N donors who each take a small loss to grow LP residual.
     // We use trading fees to inject residual without bankruptcy.
-    let build_market_with_residual = |target_residual_usd: u128| -> V14Engine {
-        let mut engine = V14Engine::new(cfg).expect("init");
+    let build_market_with_residual = |target_residual_usd: u128| -> V16Engine {
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(50_000_000)).unwrap();
         engine.accrue_asset(0, 1, oracle, 0).unwrap();
@@ -3613,7 +3908,7 @@ fn probe_spread_with_residual() {
     for target in [0u128, 1_000, 10_000, 100_000, 1_000_000] {
         println!("  --- Target residual: ${} ---", target);
         let mut engine = if target == 0 {
-            let mut e = V14Engine::new(cfg).expect("init");
+            let mut e = V16Engine::new(cfg).expect("init");
             let lp = e.add_account(1).unwrap();
             e.deposit(lp, usdc(50_000_000)).unwrap();
             e.accrue_asset(0, 1, oracle, 0).unwrap();
@@ -3704,7 +3999,7 @@ fn probe_spread_can_realize_gain() {
     let cfg = make_bounty_config(2);
     let oracle = price_e6(200);
 
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(50_000_000)).unwrap();
     engine.accrue_asset(0, 1, oracle, 0).unwrap();
@@ -3795,7 +4090,7 @@ fn probe_spread_one_way() {
     let oracle = price_e6(200);
 
     for div_pct in [2u64, 5, 10, 15, 20, 30] {
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(50_000_000)).unwrap();
         engine.accrue_asset(0, 1, oracle, 0).unwrap();
@@ -3855,7 +4150,7 @@ fn probe_spread_one_way() {
     println!("  ASYMMETRIC: spread that PROFITS the user (LP-side residual buildup)");
     println!();
     for div_pct in [2u64, 5, 10, 15, 20, 30] {
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(50_000_000)).unwrap();
         engine.accrue_asset(0, 1, oracle, 0).unwrap();
@@ -3920,7 +4215,7 @@ fn probe_spread_trade_efficiency() {
     ];
 
     for (i, label) in labels.iter().enumerate() {
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -3971,7 +4266,7 @@ fn probe_spread_trade_efficiency() {
     println!("  config                                | survival | avg P&L%");
     for (i, label) in labels.iter().enumerate() {
         let results: Vec<(bool, i128, u128)> = (0..500u64).into_par_iter().map(|seed| {
-            let mut engine = V14Engine::new(cfg).expect("init");
+            let mut engine = V16Engine::new(cfg).expect("init");
             let lp = engine.add_account(1).unwrap();
             engine.deposit(lp, usdc(10_000_000)).unwrap();
             let user = engine.add_account(2).unwrap();
@@ -4061,7 +4356,7 @@ fn probe_ratchet_with_hmin_zero() {
             continue;
         }
 
-        let mut engine = V14Engine::new(cfg_test).expect("init");
+        let mut engine = V16Engine::new(cfg_test).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -4111,7 +4406,7 @@ fn probe_xmargin_offset_within_account() {
     println!("  Case (a): user holds ONLY a losing leg (no offset)");
     {
         let cfg = make_bounty_config(2);
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -4162,7 +4457,7 @@ fn probe_xmargin_offset_within_account() {
     println!("  Case (b): SAME losing position, but user ALSO holds a profitable leg");
     {
         let cfg = make_bounty_config(2);
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -4223,7 +4518,7 @@ fn probe_xmargin_offset_within_account() {
     println!("  asset 0 drops 20% (long loses), asset 1 RISES 20% (short loses too)");
     {
         let cfg = make_bounty_config(2);
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -4280,7 +4575,7 @@ fn probe_xmargin_offset_within_account() {
     println!("  Case (d): SOL gain DIRECTLY offsets BTC loss (SOL leg profitable, BTC leg losing)");
     {
         let cfg = make_bounty_config(2);
-        let mut engine = V14Engine::new(cfg).expect("init");
+        let mut engine = V16Engine::new(cfg).expect("init");
         let lp = engine.add_account(1).unwrap();
         engine.deposit(lp, usdc(10_000_000)).unwrap();
         let user = engine.add_account(2).unwrap();
@@ -4351,7 +4646,7 @@ fn probe_xmargin_offset_within_account() {
 fn probe_concentrated_one_sided_oi() {
     println!("  Drift-style D: one-sided OI (all longs, no shorts to ADL against)");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -4402,7 +4697,7 @@ fn probe_concentrated_one_sided_oi() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: 1,
                             close_q: leg.basis_pos_q.unsigned_abs(),
                             fee_bps: 5,
@@ -4437,7 +4732,7 @@ fn probe_concentrated_one_sided_oi() {
 fn probe_pump_and_withdraw() {
     println!("  Drift-style E: pump-and-withdraw — close profitable leg, leave losing leg");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let attacker = engine.add_account(2).unwrap();
@@ -4518,7 +4813,7 @@ fn probe_pump_and_withdraw() {
                 let mut acc = engine.accounts[attacker];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: 1,
                         close_q: leg.basis_pos_q.unsigned_abs(),
                         fee_bps: 5,
@@ -4548,7 +4843,7 @@ fn probe_pump_and_withdraw() {
 fn probe_cross_asset_contagion() {
     println!("  Drift-style F: bankruptcy on asset 0 does NOT contaminate asset 1 holders");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -4592,7 +4887,7 @@ fn probe_cross_asset_contagion() {
             engine.accounts[u] = acc;
             if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
                 let mut best = (0usize, 0u128);
-                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                     let leg = engine.accounts[u].legs[li];
                     if leg.active {
                         let a = leg.basis_pos_q.unsigned_abs();
@@ -4603,7 +4898,7 @@ fn probe_cross_asset_contagion() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: best.0,
                             close_q: best.1,
                             fee_bps: 5,
@@ -4649,7 +4944,7 @@ fn run_probes_v12_corner_cases() {
 /// the wrapper is too slow.
 fn probe_slow_keeper() {
     println!("  Slow keeper: 50 longs at 10x, only 2 liqs per slot, observe ADL");
-    let cfg = V14Config {
+    let cfg = V16Config {
         max_portfolio_assets:               1,
         min_nonzero_mm_req:                20,
         min_nonzero_im_req:                30,
@@ -4673,9 +4968,9 @@ fn probe_slow_keeper() {
         full_refresh_required_for_favorable_actions: true,
         public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
-        max_bankrupt_close_lifetime_slots: 1000,
+        max_bankrupt_close_lifetime_slots: 1000, asset_activation_cooldown_slots: 1, max_recovery_fallback_deviation_bps: MAX_RECOVERY_FALLBACK_DEVIATION_BPS, backing_freshness_buckets: 1, margin_mode_realizable_full_shared_cross_margin: true, source_credit_lien_required: true, insurance_credit_reservation_required: true, recovery_fallback_envelope_enabled: true, credit_lien_revalidation_required: true,
     };
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let mut longs = Vec::new();
@@ -4737,7 +5032,7 @@ fn probe_slow_keeper() {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: 0,
                             close_q: leg.basis_pos_q.unsigned_abs(),
                             fee_bps: 5,
@@ -4755,13 +5050,13 @@ fn probe_slow_keeper() {
             }
         }
         match engine.group.assets[0].mode_long {
-            SideModeV14::DrainOnly => drain_only_seen = true,
-            SideModeV14::ResetPending => reset_pending_seen = true,
+            SideModeV16::DrainOnly => drain_only_seen = true,
+            SideModeV16::ResetPending => reset_pending_seen = true,
             _ => {}
         }
         match engine.group.assets[0].mode_short {
-            SideModeV14::DrainOnly => drain_only_seen = true,
-            SideModeV14::ResetPending => reset_pending_seen = true,
+            SideModeV16::DrainOnly => drain_only_seen = true,
+            SideModeV16::ResetPending => reset_pending_seen = true,
             _ => {}
         }
         min_a_long = min_a_long.min(engine.group.assets[0].a_long);
@@ -4790,7 +5085,7 @@ fn probe_slow_keeper() {
 fn probe_resolve_full_exit() {
     println!("  Resolve + apply_quantity_adl full flow: drive emergency exit end-to-end");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
@@ -4836,7 +5131,7 @@ fn probe_resolve_full_exit() {
     let mut clear_errors = 0;
     for &u in &users {
         let mut acc = engine.accounts[u];
-        for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+        for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
             if acc.legs[li].active {
                 match engine.group.clear_leg(&mut acc, li) {
                     Ok(()) => legs_cleared += 1,
@@ -4857,8 +5152,8 @@ fn probe_resolve_full_exit() {
         for _ in 0..20 {
             let r = engine.group.close_resolved_account_not_atomic(&mut acc, 0);
             match r {
-                Ok(ResolvedCloseOutcomeV14::ProgressOnly) => { progresses += 1; }
-                Ok(ResolvedCloseOutcomeV14::Closed { payout }) => {
+                Ok(ResolvedCloseOutcomeV16::ProgressOnly) => { progresses += 1; }
+                Ok(ResolvedCloseOutcomeV16::Closed { payout }) => {
                     closed += 1;
                     println!("    user {}: Closed payout=${}", u, payout / USDC_DECIMALS);
                     break;
@@ -4885,14 +5180,14 @@ fn probe_resolve_full_exit() {
 fn probe_recovery_declaration() {
     println!("  Recovery declaration: declare_permissionless_recovery transition");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
 
     for reason in &[
-        PermissionlessRecoveryReasonV14::BelowProgressFloor,
-        PermissionlessRecoveryReasonV14::BIndexHeadroomExhausted,
-        PermissionlessRecoveryReasonV14::CounterOrEpochOverflowDeclaredRecovery,
+        PermissionlessRecoveryReasonV16::BelowProgressFloor,
+        PermissionlessRecoveryReasonV16::BIndexHeadroomExhausted,
+        PermissionlessRecoveryReasonV16::CounterOrEpochOverflowDeclaredRecovery,
     ] {
         let r = engine.group.declare_permissionless_recovery(*reason);
         println!("    declare({:?}): {:?}", reason, r);
@@ -4917,7 +5212,7 @@ fn run_probes_advanced() {
 fn probe_pnl_materialization() {
     println!("  PnL materialization: trace which calls move K-pair into account.pnl");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -5004,7 +5299,7 @@ fn probe_pnl_materialization() {
         let mut acc = engine.accounts[user];
         let lr = engine.group.liquidate_account_not_atomic(
             &mut acc,
-            LiquidationRequestV14 {
+            LiquidationRequestV16 {
                 asset_index: 0,
                 close_q: leg.basis_pos_q.unsigned_abs(),
                 fee_bps: 5,
@@ -5024,7 +5319,7 @@ fn probe_pnl_materialization() {
 fn probe_hedge_no_mask() {
     println!("  Hedge probe: long A + short B, crash A — does hedge mask deficit?");
     let cfg = make_bounty_config(2);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -5070,7 +5365,7 @@ fn probe_hedge_no_mask() {
         if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
             // Pick largest leg
             let mut best = (0usize, 0u128);
-            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+            for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = engine.accounts[user].legs[li];
                 if leg.active {
                     let a = leg.basis_pos_q.unsigned_abs();
@@ -5081,7 +5376,7 @@ fn probe_hedge_no_mask() {
                 let mut acc = engine.accounts[user];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: best.0,
                         close_q: best.1,
                         fee_bps: 5,
@@ -5111,10 +5406,10 @@ fn probe_hedge_no_mask() {
 
 /// 16-leg saturation probe: open positions on every available asset.
 fn probe_max_legs() {
-    let n_assets = 8u8.min(V14_MAX_PORTFOLIO_ASSETS_N as u8); // 8 assets — stay below V14_MAX
+    let n_assets = 8u8.min(V16_MAX_PORTFOLIO_ASSETS_N as u8); // 8 assets — stay below V14_MAX
     println!("  Max-legs probe: open {} positions simultaneously on one account", n_assets);
     let cfg = make_bounty_config(n_assets);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -5160,7 +5455,7 @@ fn probe_max_legs() {
         engine.accounts[user] = acc;
         if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
             let mut best = (0usize, 0u128);
-            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+            for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = engine.accounts[user].legs[li];
                 if leg.active {
                     let a = leg.basis_pos_q.unsigned_abs();
@@ -5171,7 +5466,7 @@ fn probe_max_legs() {
                 let mut acc = engine.accounts[user];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: best.0,
                         close_q: best.1,
                         fee_bps: 5,
@@ -5223,7 +5518,7 @@ fn probe_multileg_fuzz(n_seeds: usize) {
 fn run_one_multileg(seed: u64) -> RunSummary {
     let n_assets = 4u8;
     let cfg = make_bounty_config(n_assets);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let mut rng = Rng::new(seed);
 
     let lp = engine.add_account(1).unwrap();
@@ -5285,7 +5580,7 @@ fn run_one_multileg(seed: u64) -> RunSummary {
             engine.accounts[u] = acc;
             if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
                 let mut best = (0usize, 0u128);
-                for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+                for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                     let leg = engine.accounts[u].legs[li];
                     if leg.active {
                         let a = leg.basis_pos_q.unsigned_abs();
@@ -5296,7 +5591,7 @@ fn run_one_multileg(seed: u64) -> RunSummary {
                     let mut acc = engine.accounts[u];
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 {
+                        LiquidationRequestV16 {
                             asset_index: best.0,
                             close_q: best.1,
                             fee_bps: 5,
@@ -5349,7 +5644,7 @@ fn run_probes_multileg() {
 fn probe_multileg_high_lev_crash() {
     println!("  High-lev multi-leg: 4 longs across 4 assets, total 15x, all crash");
     let cfg = make_bounty_config(4);
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user = engine.add_account(2).unwrap();
@@ -5394,7 +5689,7 @@ fn probe_multileg_high_lev_crash() {
         if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
             // close the LARGEST leg, then repeat next slot for smaller legs
             let mut best = (0usize, 0u128);
-            for li in 0..V14_MAX_PORTFOLIO_ASSETS_N {
+            for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = engine.accounts[user].legs[li];
                 if leg.active {
                     let a = leg.basis_pos_q.unsigned_abs();
@@ -5405,7 +5700,7 @@ fn probe_multileg_high_lev_crash() {
                 let mut acc = engine.accounts[user];
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 {
+                    LiquidationRequestV16 {
                         asset_index: best.0,
                         close_q: best.1,
                         fee_bps: 5,
@@ -5455,7 +5750,7 @@ fn probe_config_sweep() {
         let mut max_ok = 0u64;
         while lo <= hi {
             let mid = (lo + hi) / 2;
-            let cfg = V14Config {
+            let cfg = V16Config {
                 max_portfolio_assets: 1,
                 min_nonzero_mm_req: 20,
                 min_nonzero_im_req: 30,
@@ -5479,7 +5774,7 @@ fn probe_config_sweep() {
                 full_refresh_required_for_favorable_actions: true,
                 public_liveness_profile_crank_forward: true,
         recovery_fallback_price_enabled: true,
-        max_bankrupt_close_lifetime_slots: 1000,
+        max_bankrupt_close_lifetime_slots: 1000, asset_activation_cooldown_slots: 1, max_recovery_fallback_deviation_bps: MAX_RECOVERY_FALLBACK_DEVIATION_BPS, backing_freshness_buckets: 1, margin_mode_realizable_full_shared_cross_margin: true, source_credit_lien_required: true, insurance_credit_reservation_required: true, recovery_fallback_envelope_enabled: true, credit_lien_revalidation_required: true,
             };
             if cfg.validate_public_user_fund().is_ok() {
                 max_ok = mid;
@@ -5505,11 +5800,11 @@ fn probe_config_sweep() {
 /// to insurance, this should reveal it.
 fn probe_no_lp_no_insurance() {
     println!("  P2: zero insurance, zero LP — does anything leak?");
-    let cfg = V14Config {
+    let cfg = V16Config {
         max_abs_funding_e9_per_slot: 10_000,
         ..make_bounty_sol_20x_max_config()
     };
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(1_000_000)).unwrap(); // small LP
 
@@ -5543,13 +5838,13 @@ fn probe_no_lp_no_insurance() {
                 let _ = engine.group.full_account_refresh(&mut acc, &prices);
                 engine.accounts[u] = acc;
                 if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
-                    if let Some(li) = (0..V14_MAX_PORTFOLIO_ASSETS_N)
+                    if let Some(li) = (0..V16_MAX_PORTFOLIO_ASSETS_N)
                         .find(|&i| engine.accounts[u].legs[i].active) {
                         let mut acc = engine.accounts[u];
                         let qty = acc.legs[li].basis_pos_q.unsigned_abs();
                         if let Ok(out) = engine.group.liquidate_account_not_atomic(
                             &mut acc,
-                            LiquidationRequestV14 { asset_index: li, close_q: qty, fee_bps: 5 },
+                            LiquidationRequestV16 { asset_index: li, close_q: qty, fee_bps: 5 },
                             &prices,
                         ) {
                             total_liquidations += 1;
@@ -5573,7 +5868,7 @@ fn probe_no_lp_no_insurance() {
 fn probe_zero_insurance_concentrated_long() {
     println!("  P3: concentrated long crash — can ADL cascade leak?");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(2_000_000)).unwrap();
 
@@ -5613,13 +5908,13 @@ fn probe_zero_insurance_concentrated_long() {
             let _ = engine.group.full_account_refresh(&mut acc, &prices);
             engine.accounts[u] = acc;
             if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
-                if let Some(li) = (0..V14_MAX_PORTFOLIO_ASSETS_N)
+                if let Some(li) = (0..V16_MAX_PORTFOLIO_ASSETS_N)
                     .find(|&i| engine.accounts[u].legs[i].active) {
                     let mut acc = engine.accounts[u];
                     let qty = acc.legs[li].basis_pos_q.unsigned_abs();
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 { asset_index: li, close_q: qty, fee_bps: 5 },
+                        LiquidationRequestV16 { asset_index: li, close_q: qty, fee_bps: 5 },
                         &prices,
                     ) {
                         total_liquidations += 1;
@@ -5645,7 +5940,7 @@ fn probe_zero_insurance_concentrated_long() {
 fn probe_whale_crash() {
     println!("  P4: whale ($20M @ 10x) + 36% crash");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(500_000_000)).unwrap(); // $500M LP
 
@@ -5684,13 +5979,13 @@ fn probe_whale_crash() {
         let _ = engine.group.full_account_refresh(&mut acc, &prices);
         engine.accounts[whale] = acc;
         if engine.accounts[whale].health_cert.certified_liq_deficit > 0 {
-            if let Some(li) = (0..V14_MAX_PORTFOLIO_ASSETS_N)
+            if let Some(li) = (0..V16_MAX_PORTFOLIO_ASSETS_N)
                 .find(|&i| engine.accounts[whale].legs[i].active) {
                 let mut acc = engine.accounts[whale];
                 let qty = acc.legs[li].basis_pos_q.unsigned_abs();
                 if let Ok(out) = engine.group.liquidate_account_not_atomic(
                     &mut acc,
-                    LiquidationRequestV14 { asset_index: li, close_q: qty, fee_bps: 5 },
+                    LiquidationRequestV16 { asset_index: li, close_q: qty, fee_bps: 5 },
                     &prices,
                 ) {
                     total_liquidations += 1;
@@ -5713,7 +6008,7 @@ fn probe_whale_crash() {
 fn probe_long_funding_drain() {
     println!("  P5: 2000-slot funding drain at max rate");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg).expect("init");
+    let mut engine = V16Engine::new(cfg).expect("init");
     let lp = engine.add_account(1).unwrap();
     engine.deposit(lp, usdc(10_000_000)).unwrap();
     let user_long = engine.add_account(2).unwrap();
@@ -5741,13 +6036,13 @@ fn probe_long_funding_drain() {
             let _ = engine.group.full_account_refresh(&mut acc, &prices);
             engine.accounts[u] = acc;
             if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
-                if let Some(li) = (0..V14_MAX_PORTFOLIO_ASSETS_N)
+                if let Some(li) = (0..V16_MAX_PORTFOLIO_ASSETS_N)
                     .find(|&i| engine.accounts[u].legs[i].active) {
                     let mut acc = engine.accounts[u];
                     let qty = acc.legs[li].basis_pos_q.unsigned_abs();
                     if let Ok(out) = engine.group.liquidate_account_not_atomic(
                         &mut acc,
-                        LiquidationRequestV14 { asset_index: li, close_q: qty, fee_bps: 5 },
+                        LiquidationRequestV16 { asset_index: li, close_q: qty, fee_bps: 5 },
                         &prices,
                     ) {
                         total_liquidations += 1;
@@ -5780,10 +6075,10 @@ fn probe_long_funding_drain() {
 ///  - With threshold_stress_active=true (manually set): h_lock_lane→HMax,
 ///    favorable actions (withdraw, convert) return LockActive
 ///  - Clear the flag → behavior returns to normal
-fn test_f6_v14() -> V14Result<()> {
+fn test_f6_v14() -> V16Result<()> {
     println!("=== v14 F6: conservative stress-pause policy ===");
     let cfg = make_bounty_sol_20x_max_config();
-    let mut engine = V14Engine::new(cfg)?;
+    let mut engine = V16Engine::new(cfg)?;
     let lp = engine.add_account(1)?;
     let user = engine.add_account(2)?;
     engine.deposit(lp, usdc(10_000_000))?;
@@ -5968,6 +6263,18 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=spread_realize") {
         probe_spread_can_realize_gain();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_credit") {
+        probe_v16_spread_credit_rate();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_manual_backing") {
+        probe_v16_manual_backing();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_pre_settle") {
+        probe_v16_backing_before_settle();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
