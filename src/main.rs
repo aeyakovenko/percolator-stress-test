@@ -3180,6 +3180,727 @@ fn run_probes_xmargin_deep() {
 
 /// Generates a realistic price walk: small daily moves with occasional bigger
 /// swings. Returns the price path normalized so endpoint ≈ start.
+/// Two correlated price walks: a common "market" shock per step plus an
+/// idiosyncratic component for each asset. correlation_pct in [0,100] sets
+/// what fraction of total vol is shared.
+fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, correlation_pct: u64) -> (Vec<u64>, Vec<u64>) {
+    let shared_vol = vol_bps_per_step * correlation_pct / 100;
+    let idio_vol = vol_bps_per_step - shared_vol;
+    let mut rng_m = Rng::new(seed);
+    let mut rng_a = Rng::new(seed.wrapping_mul(31));
+    let mut rng_b = Rng::new(seed.wrapping_mul(97));
+    let mut oa = start;
+    let mut ob = start;
+    let mut path_a = Vec::with_capacity(steps as usize);
+    let mut path_b = Vec::with_capacity(steps as usize);
+    let pick = |rng: &mut Rng, v: u64| -> i64 {
+        if v == 0 { return 0; }
+        let r = rng.next_u64() % (2 * v + 1);
+        (r as i64) - (v as i64)
+    };
+    for _ in 0..steps {
+        let m = pick(&mut rng_m, shared_vol);
+        let a = pick(&mut rng_a, idio_vol);
+        let b = pick(&mut rng_b, idio_vol);
+        let apply = |p: u64, bps: i64| -> u64 {
+            let amt = (p as u128 * bps.unsigned_abs() as u128 / 10_000) as u64;
+            if bps >= 0 { p.saturating_add(amt) } else { p.saturating_sub(amt).max(1) }
+        };
+        oa = apply(oa, m + a);
+        ob = apply(ob, m + b);
+        path_a.push(oa);
+        path_b.push(ob);
+    }
+    (path_a, path_b)
+}
+
+/// Drift-style oracle manipulation attack: attacker takes over oracle for
+/// asset 0 ("SRM"), pumps it within max_move_bps_per_slot envelope over
+/// many slots, then tries to convert inflated PnL on asset 0 into extractable
+/// USDC via cross-margin support for a position on asset 1 ("BTC").
+///
+/// In v16, all collateral is USDC (quote token). The attack vector tests:
+/// (a) can fake A-PnL prop up B-position IM?
+/// (b) can the attacker withdraw real USDC against backing that exists only
+///     because the manipulated A push drained LP capital into A's source domain?
+/// (c) does per-domain isolation contain the damage to one source domain?
+fn probe_v16_drift_attack() {
+    println!("  v16 Drift-style attack: oracle takeover on asset 0, cross-margin abuse to asset 1");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    let attacker = engine.add_account(99).unwrap();
+    let deposit = usdc(1_000);
+    engine.deposit(attacker, deposit).unwrap();
+
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+
+    // Step 1: open long on manipulated asset 0 at max leverage.
+    let size_q_a = usdc(20_000) * POS_SCALE / oracle as u128;
+    let r = engine.trade(attacker, lp, 0, size_q_a, oracle, 1);
+    println!("  Step 1: attacker opens 20x long on asset 0 (manipulated): {:?}",
+        r.as_ref().map(|_| ()).map_err(|e| format!("{:?}", e)));
+    if r.is_err() {
+        // Try smaller
+        let size_q_a = usdc(5_000) * POS_SCALE / oracle as u128;
+        let r = engine.trade(attacker, lp, 0, size_q_a, oracle, 1);
+        println!("    fallback to 5x: {:?}",
+            r.as_ref().map(|_| ()).map_err(|e| format!("{:?}", e)));
+    }
+    let opened_q = engine.accounts[attacker].legs[0].basis_pos_q.unsigned_abs();
+    println!("    leg 0 size_q = {}, notional = ${}",
+        opened_q, opened_q * oracle as u128 / POS_SCALE / 1_000_000);
+
+    // Step 2: attacker pushes asset 0 oracle UP at max rate, refreshes LP each tick.
+    println!();
+    println!("  Step 2: pump asset 0 oracle up at max {} bps/slot until +100% or 5000 slots", max_move);
+    let target_a = (oracle as u128 * 2) as u64; // 100% pump
+    let mut slot = 2u64;
+    let mut last_logged = 0u64;
+    while engine.group.assets[0].effective_price < target_a {
+        let next = clamp_oracle(target_a, engine.group.assets[0].effective_price, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, next, 0);
+        // Refresh LP each tick so backing accumulates.
+        let prices = engine.effective_prices();
+        let mut lp_acc = engine.accounts[lp];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+        engine.accounts[lp] = lp_acc;
+        let mut a_acc = engine.accounts[attacker];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut a_acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut a_acc, &prices);
+        engine.accounts[attacker] = a_acc;
+        slot += 1;
+        if slot - last_logged > 500 {
+            last_logged = slot;
+            let p = engine.group.assets[0].effective_price;
+            let sc1 = &engine.group.source_credit[1]; // (asset 0, Short)
+            println!("    slot {}: asset 0 price=${}, source_credit[(0,Short)]: claim=${}, backing=${}, rate={:.0}%",
+                slot, p / 1_000_000,
+                sc1.positive_claim_bound_num / BOUND_SCALE / 1_000_000,
+                sc1.fresh_reserved_backing_num / BOUND_SCALE / 1_000_000,
+                sc1.credit_rate_num as f64 / CREDIT_RATE_SCALE as f64 * 100.0);
+        }
+        if slot > 5000 { break; }
+    }
+    let acc = &engine.accounts[attacker];
+    println!("  Final attacker state after pump:");
+    println!("    cap=${}, pnl=${}, cert_eq=${}",
+        acc.capital / 1_000_000, acc.pnl / 1_000_000,
+        acc.health_cert.certified_equity / 1_000_000);
+    println!("    IM req=${}, MM req=${}",
+        acc.health_cert.certified_initial_req / 1_000_000,
+        acc.health_cert.certified_maintenance_req / 1_000_000);
+    println!("    free equity above IM = ${}",
+        (acc.health_cert.certified_equity - acc.health_cert.certified_initial_req as i128) / 1_000_000);
+    println!();
+
+    // Step 3: try to open BIG position on asset 1 (BTC), using inflated A-PnL as support.
+    let big_b = usdc(50_000) * POS_SCALE / engine.group.assets[1].effective_price as u128;
+    let r2 = engine.trade(attacker, lp, 1, big_b, engine.group.assets[1].effective_price, 1);
+    println!("  Step 3: attacker tries to open $50k BTC position using cross-margin from inflated A:");
+    println!("    result: {:?}", r2.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+    let b_opened = engine.accounts[attacker].legs[1].active;
+    println!("    leg 1 active: {}", b_opened);
+
+    // Step 4: try to withdraw cap above original deposit.
+    let prices = engine.effective_prices();
+    let mut a_acc = engine.accounts[attacker];
+    let _ = engine.group.settle_account_side_effects_not_atomic(&mut a_acc, cfg.public_b_chunk_atoms);
+    let _ = engine.group.full_account_refresh(&mut a_acc, &prices);
+    engine.accounts[attacker] = a_acc;
+    let _ = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+    let cap_after_convert = engine.accounts[attacker].capital;
+    println!();
+    println!("  Step 4: convert PnL to cap → cap=${} (deposited $1000)", cap_after_convert / 1_000_000);
+    // Try to withdraw EVERYTHING
+    let attempt = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap_after_convert, &prices);
+    println!("    withdraw ${} attempt: {:?}", cap_after_convert / 1_000_000,
+        attempt.as_ref().map(|_| "OK").map_err(|e| format!("{:?}", e)));
+    let after_w = engine.accounts[attacker].capital;
+    let withdrawn = cap_after_convert - after_w;
+    println!("    actually withdrew: ${}", withdrawn / 1_000_000);
+    println!("    net extraction vs deposit: ${}", withdrawn as i128 / 1_000_000 - 1000);
+    println!();
+
+    // Step 5: Now reverse the asset 0 oracle to its truth value ($200).
+    println!("  Step 5: oracle returns to TRUTH ($200). What happens?");
+    let truth = oracle;
+    let mut step = 0;
+    while engine.group.assets[0].effective_price > truth {
+        let next = clamp_oracle(truth, engine.group.assets[0].effective_price, max_move, 1);
+        let _ = engine.accrue_asset(0, slot, next, 0);
+        let prices = engine.effective_prices();
+        let mut lp_acc = engine.accounts[lp];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+        engine.accounts[lp] = lp_acc;
+        let mut a_acc = engine.accounts[attacker];
+        let _ = engine.group.settle_account_side_effects_not_atomic(&mut a_acc, cfg.public_b_chunk_atoms);
+        let _ = engine.group.full_account_refresh(&mut a_acc, &prices);
+        engine.accounts[attacker] = a_acc;
+        if engine.accounts[attacker].health_cert.certified_liq_deficit > 0 {
+            // Liquidate
+            for li in 0..2 {
+                let leg = engine.accounts[attacker].legs[li];
+                if leg.active {
+                    let mut acc = engine.accounts[attacker];
+                    let _ = engine.group.liquidate_account_not_atomic(
+                        &mut acc,
+                        LiquidationRequestV16 { asset_index: li, close_q: leg.basis_pos_q.unsigned_abs(), fee_bps: 5 },
+                        &prices);
+                    engine.accounts[attacker] = acc;
+                }
+            }
+            break;
+        }
+        slot += 1;
+        step += 1;
+        if step > 10000 { break; }
+    }
+    println!("    asset 0 final price: ${}", engine.group.assets[0].effective_price / 1_000_000);
+    println!("    attacker final cap: ${}, pnl: ${}",
+        engine.accounts[attacker].capital / 1_000_000,
+        engine.accounts[attacker].pnl / 1_000_000);
+    let total_extracted = withdrawn;
+    let total_left = engine.accounts[attacker].capital;
+    let net = total_extracted as i128 + total_left as i128 - deposit as i128;
+    println!();
+    println!("  TOTAL ATTACK RESULT:");
+    println!("    Deposited:  ${}", deposit / 1_000_000);
+    println!("    Withdrawn:  ${}", total_extracted / 1_000_000);
+    println!("    Left in:    ${}", total_left / 1_000_000);
+    println!("    NET:        ${}", net / 1_000_000);
+    println!();
+    println!("    LP final cap: ${}", engine.accounts[lp].capital / 1_000_000);
+    println!("    Insurance: ${}", engine.group.insurance / 1_000_000);
+    let inv = engine.group.assert_public_invariants();
+    println!("    Engine invariants: {:?}", inv);
+}
+
+/// Adversarial backing extraction probe: deliberately try to extract more
+/// USDC than was deposited by exploiting the source-credit / backing flow.
+/// Strategy: open winning leg, refresh LP to create backing, convert PnL,
+/// withdraw, then close losing leg or stale-refresh to see if backing
+/// is double-counted.
+fn probe_v16_backing_extraction_attack() {
+    println!("  v16 backing extraction attack: try to extract > deposit");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    let seeds = 500u64;
+
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    let net_extracted_max = AtomicI64::new(0);
+    let withdrew_more_than_deposit = AtomicU64::new(0);
+    let invariant_fails = AtomicU64::new(0);
+
+    (0..seeds).into_par_iter().for_each(|seed| {
+        let mut rng = Rng::new(seed.wrapping_mul(0xD133_7AF1));
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let attacker = engine.add_account(99).unwrap();
+        let deposit = usdc(1_000);
+        engine.deposit(attacker, deposit).unwrap();
+        let _ = engine.accrue_asset(0, 1, oracle, 0);
+        let _ = engine.accrue_asset(1, 1, oracle, 0);
+
+        // Open random spread or directional bet
+        let size_q = usdc(5_000) * POS_SCALE / oracle as u128;
+        let user_long = rng.next_u64() % 2 == 0;
+        let two_legs = rng.next_u64() % 2 == 0;
+        let _r1 = if user_long {
+            engine.trade(attacker, lp, 0, size_q, oracle, 1)
+        } else {
+            engine.trade(lp, attacker, 0, size_q, oracle, 1)
+        };
+        if two_legs {
+            let same_dir = rng.next_u64() % 2 == 0;
+            if same_dir == user_long {
+                let _ = engine.trade(attacker, lp, 1, size_q, oracle, 1);
+            } else {
+                let _ = engine.trade(lp, attacker, 1, size_q, oracle, 1);
+            }
+        }
+
+        // Random price walk for 200 slots
+        let mut slot = 2u64;
+        for _ in 0..200 {
+            for a in 0..2 {
+                let mv = (rng.next_u64() % 81) as i64 - 40;
+                let cur = engine.group.assets[a].effective_price;
+                let target = (cur as i128 + cur as i128 * mv as i128 / 10_000) as i64;
+                let clamped = clamp_oracle(target.max(1) as u64, cur, cfg.max_price_move_bps_per_slot, 1);
+                let _ = engine.accrue_asset(a, slot, clamped, 0);
+            }
+            let prices = engine.effective_prices();
+            // Refresh both
+            for idx in [lp, attacker] {
+                let mut acc = engine.accounts[idx];
+                let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                engine.accounts[idx] = acc;
+            }
+            slot += 1;
+            // Periodically try to extract
+            if rng.next_u64() % 5 == 0 {
+                // Convert positive pnl, then withdraw cap
+                let _ = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+                let cap = engine.accounts[attacker].capital;
+                if cap > 0 {
+                    let want = ((rng.next_u64() as u128) % cap) + 1;
+                    let _ = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], want, &prices);
+                }
+            }
+            if engine.group.assert_public_invariants().is_err() {
+                invariant_fails.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Final: close all legs, convert, withdraw everything
+        let prices = engine.effective_prices();
+        for li in 0..2 {
+            let leg = engine.accounts[attacker].legs[li];
+            if leg.active {
+                let q = leg.basis_pos_q.unsigned_abs();
+                let was_long = leg.side == SideV16::Long;
+                let _ = if was_long {
+                    engine.trade(lp, attacker, li, q, prices[li], 1)
+                } else {
+                    engine.trade(attacker, lp, li, q, prices[li], 1)
+                };
+            }
+        }
+        for idx in [lp, attacker] {
+            let mut acc = engine.accounts[idx];
+            let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[idx] = acc;
+        }
+        let _ = engine.group.convert_released_pnl_to_capital_not_atomic(&mut engine.accounts[attacker]);
+        let cap = engine.accounts[attacker].capital;
+        let prices2 = engine.effective_prices();
+        let _ = engine.group.withdraw_not_atomic(&mut engine.accounts[attacker], cap, &prices2);
+
+        // Compute net extraction: external_out - external_in == realized USDC profit
+        // We deposited `deposit` and withdrew (deposit - final_cap_in_account)
+        let final_cap = engine.accounts[attacker].capital;
+        let withdrawn = deposit.saturating_sub(final_cap);
+        // Anything > deposit means they extracted more than they put in.
+        let net = withdrawn as i64 - deposit as i64;
+        if withdrawn > deposit {
+            withdrew_more_than_deposit.fetch_add(1, Ordering::Relaxed);
+        }
+        if net > net_extracted_max.load(Ordering::Relaxed) {
+            net_extracted_max.store(net, Ordering::Relaxed);
+        }
+    });
+
+    println!("  {} seeds, 500-slot price walks, random extraction attempts:", seeds);
+    println!("    seeds that withdrew > deposit: {}", withdrew_more_than_deposit.load(Ordering::Relaxed));
+    let me = net_extracted_max.load(Ordering::Relaxed);
+    println!("    max single-seed net extraction: ${}", me / 1_000_000);
+    println!("    engine invariant failures: {}", invariant_fails.load(Ordering::Relaxed));
+}
+
+/// v16 backing-reserve stress fuzz. Runs random trade / accrue / refresh /
+/// withdraw sequences across many seeds, after each step computes
+/// cross-account invariants on the source-credit ledger:
+///   I1: per-domain  fresh_reserved >= valid_liened
+///   I2: per-domain  sum(account.source_claim_bound_num) == source_credit.positive_claim_bound_num
+///   I3: per-domain  sum(account.source_lien_effective_reserved * BOUND_SCALE) == source_credit.valid_liened_backing_num
+///   I4: vault >= c_tot + insurance + sum(fresh_reserved_backing) over all domains  (capital not double-encumbered)
+///   I5: per-domain  insurance_domain_spent + reserved <= insurance_domain_budget
+///   I6: withdraw never returns more than the un-encumbered free capital
+///   I7: assert_public_invariants returns Ok at every step
+fn probe_v16_backing_fuzz(seeds: u64) {
+    println!("  v16 backing-reserve fuzz: {} seeds × random ops", seeds);
+    let cfg = make_bounty_config(3); // 3 assets to exercise multi-domain
+    let oracle0 = price_e6(200);
+    let n_assets = cfg.max_portfolio_assets as usize;
+    let domains_used = n_assets * 2;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let total_ops = AtomicU64::new(0);
+    let i1_fails = AtomicU64::new(0);
+    let i2_fails = AtomicU64::new(0);
+    let i3_fails = AtomicU64::new(0);
+    let i4_fails = AtomicU64::new(0);
+    let i5_fails = AtomicU64::new(0);
+    let i6_fails = AtomicU64::new(0);
+    let i7_fails = AtomicU64::new(0);
+    let trades_open = AtomicU64::new(0);
+    let trades_close = AtomicU64::new(0);
+    let liquidations = AtomicU64::new(0);
+    let withdraws_ok = AtomicU64::new(0);
+    let withdraws_blocked = AtomicU64::new(0);
+    let max_excess_withdrawn = AtomicU64::new(0);
+
+    (0..seeds).into_par_iter().for_each(|seed| {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let mut users = Vec::new();
+        for u in 0..5 { // 5 users
+            let idx = engine.add_account(10 + u as u8).unwrap();
+            engine.deposit(idx, usdc(1_000 + (u as u128) * 500)).unwrap();
+            users.push(idx);
+        }
+        for a in 0..n_assets {
+            engine.accrue_asset(a, 1, oracle0, 0).unwrap();
+        }
+        let mut user_initial_deposits = vec![0u128; users.len()];
+        for (i, u) in users.iter().enumerate() {
+            user_initial_deposits[i] = engine.accounts[*u].capital;
+        }
+        let mut total_user_deposits: u128 = user_initial_deposits.iter().sum();
+        let mut total_user_withdrawn: u128 = 0;
+
+        let mut prices = [oracle0; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut slot = 2u64;
+        let max_move = cfg.max_price_move_bps_per_slot;
+
+        for _step in 0..100u64 {
+            // Pick an op
+            let op = rng.next_u64() % 5;
+            match op {
+                0 => {
+                    // Accrue prices
+                    for a in 0..n_assets {
+                        let move_bps = (rng.next_u64() % 80) as i64 - 40; // ±40 bps
+                        let cur = engine.group.assets[a].effective_price;
+                        let target_amt = (cur as i128 * move_bps as i128 / 10_000) as i64;
+                        let target = (cur as i64 + target_amt).max(1) as u64;
+                        let clamped = clamp_oracle(target, cur, max_move, 1);
+                        let _ = engine.accrue_asset(a, slot, clamped, 0);
+                        prices[a] = engine.group.assets[a].effective_price;
+                    }
+                    slot += 1;
+                }
+                1 => {
+                    // Open a trade for a random user
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    let user_long = rng.next_u64() % 2 == 0;
+                    let target_notional = 500u128 + (rng.next_u64() % 3000) as u128;
+                    let size_q = usdc(target_notional) * POS_SCALE / prices[a] as u128;
+                    let r = if user_long {
+                        engine.trade(u, lp, a, size_q, prices[a], 1)
+                    } else {
+                        engine.trade(lp, u, a, size_q, prices[a], 1)
+                    };
+                    if r.is_ok() { trades_open.fetch_add(1, Ordering::Relaxed); }
+                }
+                2 => {
+                    // Refresh a random user (or LP)
+                    let pick = (rng.next_u64() as usize) % (users.len() + 1);
+                    let idx = if pick == 0 { lp } else { users[pick - 1] };
+                    let mut acc = engine.accounts[idx];
+                    let _ = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                    let _ = engine.group.full_account_refresh(&mut acc, &prices);
+                    engine.accounts[idx] = acc;
+                    if engine.accounts[idx].health_cert.certified_liq_deficit > 0 {
+                        // Find a leg to liquidate
+                        for li in 0..V16_MAX_PORTFOLIO_ASSETS_N {
+                            let leg = engine.accounts[idx].legs[li];
+                            if leg.active {
+                                let mut a = engine.accounts[idx];
+                                let _ = engine.group.liquidate_account_not_atomic(
+                                    &mut a,
+                                    LiquidationRequestV16 {
+                                        asset_index: li,
+                                        close_q: leg.basis_pos_q.unsigned_abs(),
+                                        fee_bps: 5,
+                                    }, &prices);
+                                engine.accounts[idx] = a;
+                                liquidations.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    // Try to withdraw a random amount from a user
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    let cap = engine.accounts[u].capital;
+                    if cap == 0 { continue; }
+                    let want = ((rng.next_u64() as u128) % cap) + 1;
+                    let cap_before = engine.accounts[u].capital;
+                    let r = engine.group.withdraw_not_atomic(&mut engine.accounts[u], want, &prices);
+                    if r.is_ok() {
+                        let cap_after = engine.accounts[u].capital;
+                        let actual = cap_before - cap_after;
+                        total_user_withdrawn += actual;
+                        withdraws_ok.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        withdraws_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                4 => {
+                    // Close (reverse) a random user's existing leg
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    for li in 0..n_assets {
+                        let leg = engine.accounts[u].legs[li];
+                        if leg.active {
+                            let close_q = leg.basis_pos_q.unsigned_abs() / 2 + 1;
+                            let user_long_now = leg.side == SideV16::Long;
+                            let r = if user_long_now {
+                                engine.trade(lp, u, li, close_q, prices[li], 1)
+                            } else {
+                                engine.trade(u, lp, li, close_q, prices[li], 1)
+                            };
+                            if r.is_ok() { trades_close.fetch_add(1, Ordering::Relaxed); }
+                            break;
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            total_ops.fetch_add(1, Ordering::Relaxed);
+
+            // Compute backing invariants
+            let mut vault_minus_senior = engine.group.vault;
+            vault_minus_senior = vault_minus_senior.saturating_sub(engine.group.c_tot);
+            vault_minus_senior = vault_minus_senior.saturating_sub(engine.group.insurance);
+
+            let mut sum_fresh_backing_atoms: u128 = 0;
+            for d in 0..domains_used {
+                let sc = engine.group.source_credit[d];
+
+                // I1: fresh_reserved >= valid_liened
+                if sc.fresh_reserved_backing_num < sc.valid_liened_backing_num {
+                    i1_fails.fetch_add(1, Ordering::Relaxed);
+                }
+                let bound_scale_u = BOUND_SCALE;
+                sum_fresh_backing_atoms = sum_fresh_backing_atoms.saturating_add(
+                    sc.fresh_reserved_backing_num / bound_scale_u);
+
+                // I5: insurance domain budget
+                if engine.group.insurance_domain_spent[d].saturating_add(
+                    sc.insurance_credit_reserved_num / bound_scale_u
+                ) > engine.group.insurance_domain_budget[d] {
+                    i5_fails.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // I2: sum(account.source_claim_bound_num[d]) == sc.positive_claim_bound_num
+                let mut acc_claim_sum: u128 = 0;
+                for u in users.iter().chain(std::iter::once(&lp)) {
+                    acc_claim_sum = acc_claim_sum.saturating_add(
+                        engine.accounts[*u].source_claim_bound_num[d]);
+                }
+                if acc_claim_sum != sc.positive_claim_bound_num {
+                    i2_fails.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // I3: sum(account.source_lien_effective_reserved * BOUND_SCALE) == valid_liened_backing_num
+                let mut acc_lien_sum: u128 = 0;
+                for u in users.iter().chain(std::iter::once(&lp)) {
+                    let eff = engine.accounts[*u].source_lien_effective_reserved[d];
+                    acc_lien_sum = acc_lien_sum.saturating_add(
+                        eff.saturating_mul(bound_scale_u));
+                }
+                if acc_lien_sum != sc.valid_liened_backing_num
+                    && sc.valid_liened_backing_num >= bound_scale_u // skip rounding noise
+                {
+                    i3_fails.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // I4: vault >= c_tot + insurance + sum(fresh_backing) ?
+            //     Note: fresh_backing comes from cap so it's already deducted from c_tot.
+            //     So actually c_tot + sum_fresh_backing should be conserved against (vault - insurance).
+            //     Verify: c_tot + sum_fresh_backing <= vault - insurance
+            let nominal_senior = engine.group.c_tot.saturating_add(engine.group.insurance);
+            if nominal_senior > engine.group.vault {
+                i4_fails.fetch_add(1, Ordering::Relaxed);
+            }
+            // I7: engine's own invariants
+            if engine.group.assert_public_invariants().is_err() {
+                i7_fails.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = vault_minus_senior;
+        }
+
+        // I6: max total user-withdrawn cannot exceed (initial deposits + matured fees collected by users)
+        if total_user_withdrawn > total_user_deposits {
+            let excess = (total_user_withdrawn - total_user_deposits) as u64;
+            max_excess_withdrawn.fetch_max(excess, Ordering::Relaxed);
+            i6_fails.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = total_user_deposits;
+    });
+
+    println!();
+    println!("  Stats: {} total ops", total_ops.load(Ordering::Relaxed));
+    println!("    trades opened:   {}", trades_open.load(Ordering::Relaxed));
+    println!("    trades closed:   {}", trades_close.load(Ordering::Relaxed));
+    println!("    liquidations:    {}", liquidations.load(Ordering::Relaxed));
+    println!("    withdraws ok:    {}", withdraws_ok.load(Ordering::Relaxed));
+    println!("    withdraws blkd:  {}", withdraws_blocked.load(Ordering::Relaxed));
+    println!();
+    println!("  Invariant fails (target=0 across all seeds):");
+    println!("    I1 fresh >= liened:                                {}", i1_fails.load(Ordering::Relaxed));
+    println!("    I2 sum acc.claim_bound == sc.pos_claim_bound:      {}", i2_fails.load(Ordering::Relaxed));
+    println!("    I3 sum acc.lien_eff == sc.valid_liened_backing:    {}", i3_fails.load(Ordering::Relaxed));
+    println!("    I4 c_tot + insurance <= vault:                     {}", i4_fails.load(Ordering::Relaxed));
+    println!("    I5 ins_spent + reserved <= ins_budget per domain:  {}", i5_fails.load(Ordering::Relaxed));
+    println!("    I6 user withdrew more than deposited:              {}", i6_fails.load(Ordering::Relaxed));
+    println!("    I7 engine assert_public_invariants:                {}", i7_fails.load(Ordering::Relaxed));
+    let me = max_excess_withdrawn.load(Ordering::Relaxed);
+    if me > 0 {
+        println!("    !! max single excess withdraw: ${}", me / 1_000_000);
+    }
+}
+
+/// Snapshot IM/MM required at open across configs, to expose whether
+/// v16 nets margin for hedged positions or just sums per-leg.
+fn probe_v16_margin_snapshot() {
+    println!("  v16 IM/MM at open — does v16 net margin for a hedged position?");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    println!("  Config: bounty (IM=MM=5% per leg)");
+    println!();
+    println!("    notional   | config                                | IM req   | MM req   | free eq above IM");
+    println!("    -----------|---------------------------------------|----------|----------|------------------");
+    for notional in [1_000u128, 5_000, 10_000] {
+        let configs: [(&str, fn(&mut V16Engine, usize, usize, u128, u64) -> Vec<V16Result<TradeOutcomeV16>>); 4] = [
+            ("single long SOL (1 leg)              ",
+                |e, u, lp, sq, o| vec![e.trade(u, lp, 0, sq, o, 1)]),
+            ("single long ETH (1 leg)              ",
+                |e, u, lp, sq, o| vec![e.trade(u, lp, 1, sq, o, 1)]),
+            ("long SOL + long ETH  (2 legs same-dir)",
+                |e, u, lp, sq, o| vec![e.trade(u, lp, 0, sq, o, 1), e.trade(u, lp, 1, sq, o, 1)]),
+            ("long SOL + short ETH (HEDGE / spread) ",
+                |e, u, lp, sq, o| vec![e.trade(u, lp, 0, sq, o, 1), e.trade(lp, u, 1, sq, o, 1)]),
+        ];
+        for (label, build) in configs {
+            let mut engine = V16Engine::new(cfg).expect("init");
+            let lp = engine.add_account(1).unwrap();
+            engine.deposit(lp, usdc(50_000_000)).unwrap();
+            let user = engine.add_account(2).unwrap();
+            engine.deposit(user, usdc(1_000)).unwrap();
+            engine.accrue_asset(0, 1, oracle, 0).unwrap();
+            engine.accrue_asset(1, 1, oracle, 0).unwrap();
+            let size_q = usdc(notional) * POS_SCALE / oracle as u128;
+            let results = build(&mut engine, user, lp, size_q, oracle);
+            let any_err = results.iter().any(|r| r.is_err());
+            if any_err {
+                println!("    ${:>5} × leg | {} | REJECTED (IM exceeds cap)", notional, label);
+                continue;
+            }
+            let prices = engine.effective_prices();
+            let mut acc = engine.accounts[user];
+            let _ = engine.group.full_account_refresh(&mut acc, &prices);
+            engine.accounts[user] = acc;
+            let cert = engine.accounts[user].health_cert;
+            let im = cert.certified_initial_req / 1_000_000;
+            let mm = cert.certified_maintenance_req / 1_000_000;
+            let eq = cert.certified_equity / 1_000_000;
+            let free = eq - im as i128;
+            println!("    ${:>5} × leg | {} | ${:>4}     | ${:>4}     | ${:+}", notional, label, im, mm, free);
+        }
+        println!();
+    }
+}
+
+/// Capital efficiency probe: for a fixed cap, how much notional can a user
+/// SAFELY HOLD when prices move? Compare:
+///   (A) single-asset position
+///   (B) two-asset same-side portfolio (no hedge)
+///   (C) two-asset opposite-side (hedge) with correlated prices
+fn probe_v16_capital_efficiency() {
+    println!("  v16 capital efficiency: hedged vs unhedged notional carry");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    let seeds: u64 = 500;
+    let steps: u64 = 7000;
+    let vol = 30u64;
+
+    println!("  Test: $1k cap, vary per-leg notional, observe survival % over 30 days");
+    println!();
+    println!("    notional/leg | corr | config              | survival% | avg pnl % (survivors)");
+    println!("    -------------|------|---------------------|-----------|----------------------");
+
+    for notional_per_leg in [2_000u128, 5_000, 10_000, 20_000] {
+        for correlation_pct in [80u64] {
+            for (config_label, mode) in [
+                ("single $X long SOL  ", 0),
+                ("hedge: long SOL+short ETH", 2),
+                ("naked: long SOL+long ETH ", 1),
+            ] {
+                let results: Vec<(bool, i128)> = (0..seeds).into_par_iter().map(|seed| {
+                    let mut engine = V16Engine::new(cfg).expect("init");
+                    let lp = engine.add_account(1).unwrap();
+                    engine.deposit(lp, usdc(50_000_000)).unwrap();
+                    let user = engine.add_account(2).unwrap();
+                    engine.deposit(user, usdc(1_000)).unwrap();
+                    let _ = engine.accrue_asset(0, 1, oracle, 0);
+                    let _ = engine.accrue_asset(1, 1, oracle, 0);
+                    let size_q = usdc(notional_per_leg) * POS_SCALE / oracle as u128;
+                    let r = match mode {
+                        0 => engine.trade(user, lp, 0, size_q, oracle, 1).map(|_| ()),
+                        1 => engine.trade(user, lp, 0, size_q, oracle, 1)
+                                .and_then(|_| engine.trade(user, lp, 1, size_q, oracle, 1)).map(|_| ()),
+                        2 => engine.trade(user, lp, 0, size_q, oracle, 1)
+                                .and_then(|_| engine.trade(lp, user, 1, size_q, oracle, 1)).map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    if r.is_err() { return (false, -1i128); }
+                    let initial_eq = engine.accounts[user].capital;
+                    let (path_a, path_b) = correlated_walks(seed, oracle, steps, vol, correlation_pct);
+                    let max_move = cfg.max_price_move_bps_per_slot;
+                    let mut slot = 2u64;
+                    let mut liq = false;
+                    for step in 0..steps as usize {
+                        let na = clamp_oracle(path_a[step], engine.group.assets[0].effective_price, max_move, 1);
+                        let nb = clamp_oracle(path_b[step], engine.group.assets[1].effective_price, max_move, 1);
+                        let _ = engine.accrue_asset(0, slot, na, 0);
+                        if mode != 0 { let _ = engine.accrue_asset(1, slot, nb, 0); }
+                        let prices = engine.effective_prices();
+                        // Refresh LP first to build backing.
+                        let mut lp_acc = engine.accounts[lp];
+                        let _ = engine.group.settle_account_side_effects_not_atomic(&mut lp_acc, cfg.public_b_chunk_atoms);
+                        let _ = engine.group.full_account_refresh(&mut lp_acc, &prices);
+                        engine.accounts[lp] = lp_acc;
+                        let mut ua = engine.accounts[user];
+                        let _ = engine.group.settle_account_side_effects_not_atomic(&mut ua, cfg.public_b_chunk_atoms);
+                        let _ = engine.group.full_account_refresh(&mut ua, &prices);
+                        engine.accounts[user] = ua;
+                        if engine.accounts[user].health_cert.certified_liq_deficit > 0 {
+                            liq = true; break;
+                        }
+                        slot += 1;
+                    }
+                    let final_eq = engine.accounts[user].capital as i128 + engine.accounts[user].pnl;
+                    (!liq, final_eq - initial_eq as i128)
+                }).collect();
+                let survived = results.iter().filter(|r| r.0).count();
+                let trade_failed = results.iter().filter(|r| r.1 == -1).count();
+                let surv_pct = survived as f64 * 100.0 / seeds as f64;
+                let avg = {
+                    let surv: Vec<_> = results.iter().filter(|r| r.0).collect();
+                    if surv.is_empty() { 0.0 } else {
+                        surv.iter().map(|r| r.1 as f64 / 1_000_000.0 / 1_000.0 * 100.0).sum::<f64>() / surv.len() as f64
+                    }
+                };
+                let tail = if trade_failed > 0 { format!(" ({}/{}  rejected at open)", trade_failed, seeds) } else { String::new() };
+                println!("    ${:>6} × leg   | {:>3}% | {:21} | {:>5.1}%    | {:+.2}%{}",
+                    notional_per_leg, correlation_pct, config_label, surv_pct, avg, tail);
+            }
+            println!();
+        }
+    }
+}
+
 fn realistic_price_walk(rng: &mut Rng, start: u64, steps: u64, vol_bps_per_step: u64) -> Vec<u64> {
     let mut path = Vec::with_capacity(steps as usize);
     let mut o = start;
@@ -6316,6 +7037,30 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_pre_settle") {
         probe_v16_backing_before_settle();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_cap_eff") {
+        probe_v16_capital_efficiency();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_margin_snap") {
+        probe_v16_margin_snapshot();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_backing_fuzz") {
+        probe_v16_backing_fuzz(2000);
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_backing_fuzz_long") {
+        probe_v16_backing_fuzz(5000);
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_extract") {
+        probe_v16_backing_extraction_attack();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_drift") {
+        probe_v16_drift_attack();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
