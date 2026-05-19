@@ -192,7 +192,7 @@ fn make_bounty_sol_20x_max_config() -> V16Config {
     make_bounty_config(1)
 }
 
-fn make_instant_bounty_config(n_assets: u8) -> V16Config {
+fn make_instant_bounty_config(n_assets: u16) -> V16Config {
     let mut c = V16Config::public_user_fund(n_assets, 0, 1);
     c.min_nonzero_mm_req = 20;
     c.min_nonzero_im_req = 30;
@@ -211,7 +211,7 @@ fn make_instant_bounty_config(n_assets: u8) -> V16Config {
     c
 }
 
-fn make_bounty_config(n_assets: u8) -> V16Config {
+fn make_bounty_config(n_assets: u16) -> V16Config {
     let mut c = V16Config::public_user_fund(n_assets, 0, 30);
     c.min_nonzero_mm_req = 20;
     c.min_nonzero_im_req = 30;
@@ -502,7 +502,7 @@ fn scenario_oracle(scen: Scenario, rng: &mut Rng, oracle: u64, step: u64, max_mo
 /// keeper that checks each user's certified_liq_deficit and liquidates the
 /// largest leg if positive.
 fn run_one_scenario(scen: Scenario, seed: u64) -> RunSummary {
-    let n_assets = if matches!(scen, Scenario::Mega) { 3 } else { 1 };
+    let n_assets: u16 = if matches!(scen, Scenario::Mega) { 3 } else { 1 };
     let cfg = make_bounty_config(n_assets);
     let mut engine = V16Engine::new(cfg).expect("init");
     let mut rng = Rng::new(seed);
@@ -1726,7 +1726,7 @@ fn probe_xmargin_asymmetric() {
     println!("    user final: cap=${} pnl={} legs_active={}",
         engine.accounts[user].capital / USDC_DECIMALS,
         engine.accounts[user].pnl,
-        engine.accounts[user].active_bitmap.count_ones());
+        engine.accounts[user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     println!("    invariants: {:?} | battery fails: {}",
         engine.assert_invariants().err(), run_invariant_battery(&engine));
 }
@@ -1826,7 +1826,7 @@ fn run_probes_xmargin() {
 /// Make a config with N assets where asset 0 is "good" and asset N-1 is
 /// "loose" (low MM, fast moves allowed). Tests whether v14 keeps the bad
 /// asset's bankruptcy contained per-leg.
-fn make_mixed_quality_config(n_assets: u8) -> V16Config {
+fn make_mixed_quality_config(n_assets: u16) -> V16Config {
     // Use the most conservative (good) config — engine applies same params
     // across all assets. The "badness" comes from oracle behavior, OI
     // concentration, or wrapper misconfiguration, not config heterogeneity
@@ -1964,7 +1964,7 @@ fn probe_thin_market_xmargin() {
     println!("    attacker final cap=${} pnl={} legs={}",
         engine.accounts[attacker].capital / USDC_DECIMALS,
         engine.accounts[attacker].pnl,
-        engine.accounts[attacker].active_bitmap.count_ones());
+        engine.accounts[attacker].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     println!("    invariants: {:?} | battery fails: {}",
         engine.assert_invariants().err(), run_invariant_battery(&engine));
 }
@@ -2440,7 +2440,7 @@ fn probe_ten10_cross_margin() {
     let sum_cap: u128 = users.iter().map(|&u| engine.accounts[u].capital).sum();
     println!("    sum user cap: ${} (initial $60k)", sum_cap / USDC_DECIMALS);
     // Most-active users should still have legs on assets 1, 2 (untouched)
-    let avg_active_legs: u32 = users.iter().map(|&u| engine.accounts[u].active_bitmap.count_ones()).sum::<u32>() / users.len() as u32;
+    let avg_active_legs: u32 = users.iter().map(|&u| engine.accounts[u].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>()).sum::<u32>() / users.len() as u32;
     println!("    avg active legs per user: {}", avg_active_legs);
     println!("    invariants: {:?} | battery fails: {}",
         engine.assert_invariants().err(), run_invariant_battery(&engine));
@@ -6244,7 +6244,7 @@ fn probe_diversification_benefit(seeds: u64) {
     println!("    config              | survival% | avg net pnl %");
     println!("    --------------------|-----------|--------------");
     for (n_assets, label) in cases {
-        let cfg = make_bounty_config(n_assets as u8);
+        let cfg = make_bounty_config(n_assets as u16);
         let results: Vec<(bool, i128, u128)> = (0..seeds).into_par_iter().map(|seed| {
             let mut engine = V16Engine::new(cfg).expect("init");
             let lp = engine.add_account(1).unwrap();
@@ -7428,7 +7428,7 @@ fn probe_xmargin_offset_within_account() {
         } else {
             println!("    ⇒ healthy — cross-margin offset is supporting the losing leg ★");
         }
-        println!("    legs active: {}", engine.accounts[user].active_bitmap.count_ones());
+        println!("    legs active: {}", engine.accounts[user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     }
 
     println!();
@@ -7552,7 +7552,7 @@ fn probe_xmargin_offset_within_account() {
         } else {
             println!("    ⇒ healthy — BTC gain is propping up the SOL loss inside one account ★");
         }
-        println!("    legs active: {}", engine.accounts[user].active_bitmap.count_ones());
+        println!("    legs active: {}", engine.accounts[user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     }
     println!();
     println!("  invariants: 0 fails across all 4 cases");
@@ -7703,7 +7703,7 @@ fn probe_pump_and_withdraw() {
     println!("    after closing leg 0: cap=${} pnl={} legs_active={}",
         engine.accounts[attacker].capital / USDC_DECIMALS,
         engine.accounts[attacker].pnl,
-        engine.accounts[attacker].active_bitmap.count_ones());
+        engine.accounts[attacker].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
 
     let mut acc = engine.accounts[attacker];
     let r_w = engine.group.withdraw_not_atomic(&mut acc, usdc(400), &prices);
@@ -7843,7 +7843,7 @@ fn probe_cross_asset_contagion() {
         engine.accounts[asset1_user].pnl,
         engine.accounts[asset1_user].health_cert.certified_equity - asset1_user_initial_cert);
     println!("    asset 1 still functional: legs={}",
-        engine.accounts[asset1_user].active_bitmap.count_ones());
+        engine.accounts[asset1_user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     println!("    invariants: {:?} | battery fails: {}",
         engine.assert_invariants().err(), run_invariant_battery(&engine));
 }
@@ -8324,7 +8324,7 @@ fn probe_hedge_no_mask() {
 
 /// 16-leg saturation probe: open positions on every available asset.
 fn probe_max_legs() {
-    let n_assets = 8u8.min(V16_MAX_PORTFOLIO_ASSETS_N as u8); // 8 assets — stay below V14_MAX
+    let n_assets = 8u16.min(V16_MAX_PORTFOLIO_ASSETS_N as u16); // 8 assets — stay below V14_MAX
     println!("  Max-legs probe: open {} positions simultaneously on one account", n_assets);
     let cfg = make_bounty_config(n_assets);
     let mut engine = V16Engine::new(cfg).expect("init");
@@ -8352,8 +8352,8 @@ fn probe_max_legs() {
         }
     }
     println!("    opened {} legs", opened);
-    println!("    active_bitmap: 0b{:b}", engine.accounts[user].active_bitmap);
-    println!("    legs.count_ones(): {}", engine.accounts[user].active_bitmap.count_ones());
+    println!("    active_bitmap: {:?}", engine.accounts[user].active_bitmap);
+    println!("    legs.count_ones(): {}", engine.accounts[user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
 
     // Crash all assets in parallel
     let max_move = cfg.max_price_move_bps_per_slot;
@@ -8401,7 +8401,7 @@ fn probe_max_legs() {
     }
     println!("    total liquidations: {}", total_liquidations);
     println!("    insurance used: {}", total_insurance_used);
-    println!("    final legs active: {}", engine.accounts[user].active_bitmap.count_ones());
+    println!("    final legs active: {}", engine.accounts[user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     println!("    final cap=${} pnl={}",
         engine.accounts[user].capital / USDC_DECIMALS,
         engine.accounts[user].pnl);
@@ -8434,7 +8434,7 @@ fn probe_multileg_fuzz(n_seeds: usize) {
 }
 
 fn run_one_multileg(seed: u64) -> RunSummary {
-    let n_assets = 4u8;
+    let n_assets = 4u16;
     let cfg = make_bounty_config(n_assets);
     let mut engine = V16Engine::new(cfg).expect("init");
     let mut rng = Rng::new(seed);
@@ -8644,7 +8644,7 @@ fn probe_multileg_high_lev_crash() {
     println!("    user final: cap=${} pnl={} legs_active={}",
         engine.accounts[user].capital / USDC_DECIMALS,
         engine.accounts[user].pnl,
-        engine.accounts[user].active_bitmap.count_ones());
+        engine.accounts[user].active_bitmap.iter().map(|w| w.count_ones()).sum::<u32>());
     println!("    invariants: {:?} | battery fails: {}",
         engine.assert_invariants().err(), run_invariant_battery(&engine));
 }
