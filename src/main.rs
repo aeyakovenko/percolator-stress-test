@@ -2175,7 +2175,7 @@ fn probe_ten10_single_asset() {
     println!("  Hard 10/10: 50 users × 10x lev, 10% crash, single asset");
     // mm=1000 (10%) for 10x leverage envelope
     let cfg = V16Config {
-        max_portfolio_assets:               1,
+        max_portfolio_assets: 1, max_market_slots: 1,
         min_nonzero_mm_req:                20,
         min_nonzero_im_req:                30,
         h_min:                              0,
@@ -2331,7 +2331,7 @@ fn probe_ten10_single_asset() {
 fn probe_ten10_cross_margin() {
     println!("  Hard 10/10 cross-margin: 30 users × 3 legs each, one asset crashes 10%");
     let cfg = V16Config {
-        max_portfolio_assets:               3,
+        max_portfolio_assets: 3, max_market_slots: 3,
         min_nonzero_mm_req:                20,
         min_nonzero_im_req:                30,
         h_min:                              0,
@@ -7863,7 +7863,7 @@ fn run_probes_v12_corner_cases() {
 fn probe_slow_keeper() {
     println!("  Slow keeper: 50 longs at 10x, only 2 liqs per slot, observe ADL");
     let cfg = V16Config {
-        max_portfolio_assets:               1,
+        max_portfolio_assets: 1, max_market_slots: 1,
         min_nonzero_mm_req:                20,
         min_nonzero_im_req:                30,
         h_min:                              0,
@@ -8669,7 +8669,7 @@ fn probe_config_sweep() {
         while lo <= hi {
             let mid = (lo + hi) / 2;
             let cfg = V16Config {
-                max_portfolio_assets: 1,
+                max_portfolio_assets: 1, max_market_slots: 1,
                 min_nonzero_mm_req: 20,
                 min_nonzero_im_req: 30,
                 h_min: 0,
