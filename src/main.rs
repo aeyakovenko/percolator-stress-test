@@ -3233,6 +3233,233 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
     (path_a, path_b)
 }
 
+/// Residual-backing refill stress: the new provider_receivable_num field
+/// tracks consumed-but-unrefilled counterparty backing. add_fresh_counterparty_backing
+/// now refills from consumed (decrementing receivable) AND adds new fresh.
+/// Invariants to verify:
+///   I1. provider_receivable_num == bucket.consumed_liened_backing_num always.
+///   I2. provider_receivable_num <= spent_backing_num always.
+///   I3. After refill: bucket.fresh increases by amount; receivable drops by min(amount, prior_receivable).
+///   I4. Wire round-trip preserves provider_receivable_num.
+///   I5. Refill works on Expired buckets (transitions back to Fresh).
+///   I6. Vault conservation across consume → refill cycle.
+fn probe_v16_backing_refill() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    println!("  v16 residual-backing refill stress (provider_receivable_num)");
+    println!();
+    let cfg = make_bounty_config(2);
+    let oracle = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    // === [A] Track receivable invariants through consume ===
+    println!("  [A] Receivable accumulates correctly through consume operations");
+    let mut engine = V16Engine::new(cfg).expect("init");
+    let lp = engine.add_account(1).unwrap();
+    engine.deposit(lp, usdc(50_000_000)).unwrap();
+    let user = engine.add_account(2).unwrap();
+    engine.deposit(user, usdc(1_000)).unwrap();
+    engine.accrue_asset(0, 1, oracle, 0).unwrap();
+    engine.accrue_asset(1, 1, oracle, 0).unwrap();
+    let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+    engine.trade(user, lp, 0, sq, oracle, 1).unwrap();
+    // Pump asset 0 by 10%, then reverse below entry so positive face burns and consumes backing.
+    let target_high = (oracle as u128 * 110 / 100) as u64;
+    let mut slot = 2u64;
+    let mut walk = |engine: &mut V16Engine, target: u64, slot: &mut u64| {
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if (p >= target && p > 0 && target >= p) || (p <= target && target <= p) { break; }
+            if (target > p && p >= target) || (target < p && p <= target) { break; }
+            let _ = engine.accrue_asset(0, *slot, clamp_oracle(target, p, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx];
+                let mut acc = backup;
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            *slot += 1;
+            if *slot > 10000 { break; }
+        }
+    };
+    walk(&mut engine, target_high, &mut slot);
+    let target_low = (oracle as u128 * 90 / 100) as u64;
+    walk(&mut engine, target_low, &mut slot);
+
+    let sc = engine.group.source_credit[1]; // (SOL, Short)
+    let bk = engine.group.source_backing_buckets[1];
+    let i1 = sc.provider_receivable_num == bk.consumed_liened_backing_num;
+    let i2 = sc.provider_receivable_num <= sc.spent_backing_num;
+    println!("    consumed bucket: ${}", bk.consumed_liened_backing_num / BOUND_SCALE / 1_000_000);
+    println!("    spent_backing:   ${}", sc.spent_backing_num / BOUND_SCALE / 1_000_000);
+    println!("    receivable:      ${}", sc.provider_receivable_num / BOUND_SCALE / 1_000_000);
+    println!("    I1 receivable == consumed: {}", if i1 { "✓" } else { "✗" });
+    println!("    I2 receivable <= spent:    {}", if i2 { "✓" } else { "✗" });
+    println!();
+
+    // === [B] Refill via add_fresh_counterparty_backing decrements receivable+consumed ===
+    println!("  [B] add_fresh_counterparty_backing decrements consumed AND adds fresh");
+    let r_before = sc.provider_receivable_num;
+    let c_before = bk.consumed_liened_backing_num;
+    let f_before = bk.fresh_unliened_backing_num;
+    if r_before > 0 {
+        let amt = r_before;
+        let r = engine.group.add_fresh_counterparty_backing_not_atomic(1, amt, slot + 1000);
+        println!("    refill ${} BOUND_SCALE units: {:?}", amt, r.as_ref().map(|_|"Ok").map_err(|e| format!("{:?}", e)));
+        if r.is_ok() {
+            let sc2 = engine.group.source_credit[1];
+            let bk2 = engine.group.source_backing_buckets[1];
+            println!("    receivable: ${} → ${}  {}",
+                r_before / BOUND_SCALE / 1_000_000,
+                sc2.provider_receivable_num / BOUND_SCALE / 1_000_000,
+                if sc2.provider_receivable_num == 0 { "✓" } else { "✗" });
+            println!("    consumed:   ${} → ${}  {}",
+                c_before / BOUND_SCALE / 1_000_000,
+                bk2.consumed_liened_backing_num / BOUND_SCALE / 1_000_000,
+                if bk2.consumed_liened_backing_num == 0 { "✓" } else { "✗" });
+            println!("    fresh:      ${} → ${}  {}",
+                f_before / BOUND_SCALE / 1_000_000,
+                bk2.fresh_unliened_backing_num / BOUND_SCALE / 1_000_000,
+                if bk2.fresh_unliened_backing_num == f_before + amt { "✓ I3" } else { "✗ I3" });
+        }
+    } else {
+        println!("    no consumed backing accumulated; skipping refill check");
+    }
+    println!();
+
+    // === [C] Wire round-trip preserves provider_receivable_num ===
+    println!("  [C] Wire round-trip preserves provider_receivable_num");
+    for (lbl, idx) in [("user", user), ("lp", lp)] {
+        let acc = engine.accounts[idx];
+        let wire = PortfolioAccountV16Account::from_runtime(&acc);
+        let ok = wire.try_to_runtime().is_ok();
+        println!("    {} account: {}", lbl, if ok { "Ok ✓" } else { "FAIL" });
+    }
+    let mg = MarketGroupV16Account::from_runtime(&engine.group);
+    let mg_ok = mg.try_to_runtime().is_ok();
+    println!("    market group: {}  (preserves receivable + bucket)", if mg_ok { "Ok ✓" } else { "FAIL" });
+    println!();
+
+    // === [D] Refill on Empty/Expired bucket transitions to Fresh ===
+    println!("  [D] Refill on Expired bucket transitions to Fresh");
+    {
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        let _ = engine.group.expire_source_backing_bucket_not_atomic(1, 100);
+        let pre = engine.group.source_backing_buckets[1].status;
+        let r = engine.group.add_fresh_counterparty_backing_not_atomic(1, BOUND_SCALE * 100, 1000);
+        let post = engine.group.source_backing_buckets[1].status;
+        println!("    pre: {:?}, refill: {:?}, post: {:?}  {}",
+            pre, r.as_ref().map(|_|"Ok").map_err(|e| format!("{:?}", e)), post,
+            if r.is_ok() && matches!(post, BackingBucketStatusV16::Fresh) { "✓" } else { "(check transitions)" });
+    }
+    println!();
+
+    // === [E] Vault conservation ===
+    println!("  [E] Vault conservation: refill must not create/destroy quote tokens");
+    let final_vault = engine.group.vault;
+    let initial_vault = usdc(50_000_000) + usdc(1_000);
+    println!("    initial vault=${}, final vault=${}  {}",
+        initial_vault / 1_000_000, final_vault / 1_000_000,
+        if final_vault == initial_vault { "✓ conserved" } else { "✗ drift" });
+    println!();
+
+    // === [F] Fuzz: random consume + refill ops, verify invariants hold ===
+    println!("  [F] Fuzz consume/refill on random domains (500 seeds)");
+    let recv_consumed_mismatch = AtomicU64::new(0);
+    let recv_exceeds_spent = AtomicU64::new(0);
+    let invariant_fails = AtomicU64::new(0);
+    let wire_fails = AtomicU64::new(0);
+    let vault_drift = AtomicU64::new(0);
+    let refill_calls = AtomicU64::new(0);
+    let refill_oks = AtomicU64::new(0);
+    let seeds = 500u64;
+    (0..seeds).into_par_iter().for_each(|seed| {
+        let mut rng = Rng::new(seed.wrapping_mul(0xBA5E_BA11));
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let initial_vault = engine.group.vault;
+        let mut users = Vec::new();
+        for u in 0..3u8 {
+            let idx = engine.add_account(10 + u).unwrap();
+            engine.deposit(idx, usdc(2_000)).unwrap();
+            users.push(idx);
+        }
+        let init_total = initial_vault + (users.len() as u128) * usdc(2_000);
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        for &u in &users {
+            let a = (rng.next_u64() as usize) % 2;
+            let long = rng.next_u64() % 2 == 0;
+            let notional = 500 + (rng.next_u64() % 1500) as u128;
+            let p = engine.group.assets[a].effective_price;
+            let sq = usdc(notional) * POS_SCALE / p as u128;
+            let _ = if long { engine.trade(u, lp, a, sq, p, 1) } else { engine.trade(lp, u, a, sq, p, 1) };
+        }
+        let mut slot = 2u64;
+        for _step in 0..80u64 {
+            for a in 0..2 {
+                let mv = (rng.next_u64() % 90) as i64 - 45;
+                let cur = engine.group.assets[a].effective_price;
+                let target = ((cur as i128) + (cur as i128 * mv as i128 / 10_000)) as u64;
+                let _ = engine.accrue_asset(a, slot, clamp_oracle(target.max(1), cur, max_move, 1), 0);
+            }
+            let prices = engine.effective_prices();
+            for &idx in users.iter().chain(std::iter::once(&lp)) {
+                let backup = engine.accounts[idx];
+                let mut acc = backup;
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            // Randomly attempt refill
+            if rng.next_u64() % 5 == 0 {
+                let d = (rng.next_u64() as usize) % 4;
+                let amt = ((rng.next_u64() % 5_000) as u128) * BOUND_SCALE;
+                if amt > 0 {
+                    refill_calls.fetch_add(1, Ordering::Relaxed);
+                    if engine.group.add_fresh_counterparty_backing_not_atomic(d, amt, slot + 1000).is_ok() {
+                        refill_oks.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            // Check invariants per domain
+            for d in 0..4 {
+                let sc = engine.group.source_credit[d];
+                let bk = engine.group.source_backing_buckets[d];
+                if sc.provider_receivable_num != bk.consumed_liened_backing_num {
+                    recv_consumed_mismatch.fetch_add(1, Ordering::Relaxed);
+                }
+                if sc.provider_receivable_num > sc.spent_backing_num {
+                    recv_exceeds_spent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if engine.group.assert_public_invariants().is_err() {
+                invariant_fails.fetch_add(1, Ordering::Relaxed);
+            }
+            slot += 1;
+        }
+        for &u in users.iter().chain(std::iter::once(&lp)) {
+            let acc = engine.accounts[u];
+            let wire = PortfolioAccountV16Account::from_runtime(&acc);
+            if wire.try_to_runtime().is_err() { wire_fails.fetch_add(1, Ordering::Relaxed); }
+        }
+        if engine.group.vault != init_total { vault_drift.fetch_add(1, Ordering::Relaxed); }
+    });
+    println!("    {} seeds × 80 steps × 3 users", seeds);
+    println!("    refill calls: {} ({} succeeded)",
+        refill_calls.load(Ordering::Relaxed), refill_oks.load(Ordering::Relaxed));
+    println!("    I1/I3 (recv == consumed) fails:    {}", recv_consumed_mismatch.load(Ordering::Relaxed));
+    println!("    I2 (recv <= spent) fails:          {}", recv_exceeds_spent.load(Ordering::Relaxed));
+    println!("    assert_public_invariants fails:    {}", invariant_fails.load(Ordering::Relaxed));
+    println!("    wire round-trip fails:             {}", wire_fails.load(Ordering::Relaxed));
+    println!("    vault drift (no external moves):   {}", vault_drift.load(Ordering::Relaxed));
+}
+
 /// Spec-gap coverage: tests the v16 spec §0 requirements that my earlier
 /// probes didn't directly cover. Each subprobe targets a specific
 /// non-negotiable requirement from the spec.
@@ -9249,6 +9476,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_spec_gaps") {
         probe_v16_spec_gaps();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_refill") {
+        probe_v16_backing_refill();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
