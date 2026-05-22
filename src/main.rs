@@ -3239,7 +3239,263 @@ fn correlated_walks(seed: u64, start: u64, steps: u64, vol_bps_per_step: u64, co
 ///   I4. Wire round-trip preserves provider_receivable_num.
 ///   I5. Refill works on Expired buckets (transitions back to Fresh).
 ///   I6. Vault conservation across consume → refill cycle.
-/// Make a bounty config with NON-ZERO backing utilization fees enabled,
+/// Make a bounty config with AGGRESSIVE fee rates so the fee path is
+/// clearly observable in stress. base_rate≈100% APY at low util, scaling
+/// to near MAX above the kink. Used for [E]/[G] tests that need fee
+/// drain to be macroscopic.
+fn make_bounty_config_with_high_fees(n_assets: u16) -> V16Config {
+    let mut c = make_bounty_config(n_assets);
+    // SLOTS_PER_YEAR ≈ 78.84M at 400ms slots. To get ~1000% APY base rate:
+    //   1000% * 1e9 / 78.84M ≈ 126_817
+    // To get near-MAX (1e9 = ~7.9B% APY) above kink, slope = 5e8.
+    c.backing_fee_base_rate_e9_per_slot = 126_817;
+    c.backing_fee_kink_util_bps = 8000;
+    c.backing_fee_slope_at_kink_e9_per_slot = 500_000;
+    c.backing_fee_slope_above_kink_e9_per_slot = 500_000_000;
+    c
+}
+
+/// Probe non-default fee configurations: verify the rate curve actually
+/// drives observable fee charges, and that all §0 invariants hold under
+/// extreme fee pressure.
+fn probe_v16_fee_configs() {
+    println!("  v16 backing-fee configs: non-default rate sweeps");
+    println!();
+
+    let oracle = price_e6(200);
+
+    // Helper to set up a persistent IM-bridge lien (the only path that
+    // creates a long-lived lien for fees to charge against).
+    let setup_persistent_lien = |cfg: V16Config| -> Result<(V16Engine, usize, usize, u64), String> {
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let mut engine = V16Engine::new(cfg).map_err(|e| format!("init: {:?}", e))?;
+        let lp = engine.add_account(1).map_err(|e| format!("add lp: {:?}", e))?;
+        engine.deposit(lp, usdc(50_000_000)).map_err(|e| format!("dep lp: {:?}", e))?;
+        let user = engine.add_account(2).map_err(|e| format!("add user: {:?}", e))?;
+        engine.deposit(user, usdc(1_000)).map_err(|e| format!("dep user: {:?}", e))?;
+        engine.accrue_asset(0, 1, oracle, 0).map_err(|e| format!("accrue 0: {:?}", e))?;
+        engine.accrue_asset(1, 1, oracle, 0).map_err(|e| format!("accrue 1: {:?}", e))?;
+        let sq_sol = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq_sol, oracle, 1).map_err(|e| format!("open SOL: {:?}", e))?;
+        let target = (oracle as u128 * 140 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if p >= target { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(target, p, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+            if slot > 3000 { return Err("SOL pump timed out".into()); }
+        }
+        let p_eth = engine.group.assets[1].effective_price;
+        let sq_eth = usdc(20_000) * POS_SCALE / p_eth as u128;
+        engine.trade(user, lp, 1, sq_eth, p_eth, 1).map_err(|e| format!("open ETH: {:?}", e))?;
+        // Verify lien exists
+        let mut total_lien = 0u128;
+        for d in 0..engine.group.source_backing_buckets.len() {
+            total_lien += engine.group.source_backing_buckets[d].valid_liened_backing_num;
+        }
+        if total_lien == 0 {
+            return Err(format!("no lien created (multi-leg IM bridge didn't fire)"));
+        }
+        Ok((engine, lp, user, slot))
+    };
+
+    // === [1] Rate curve: at varying util, fee rate matches the kinked formula ===
+    println!("  [1] Fee rate scales with utilization (kinked curve)");
+    {
+        // Use HIGH rate so charges are observable in just 1000 slots
+        let cfg = make_bounty_config_with_high_fees(2);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let (mut engine, lp, user, mut slot) = match setup_persistent_lien(cfg) {
+            Ok(s) => s, Err(e) => { println!("    setup failed: {}", e); return; }
+        };
+        // Find the domain with the largest lien
+        let mut max_d = 0;
+        let mut max_lien = 0u128;
+        for d in 0..engine.group.source_backing_buckets.len() {
+            let l = engine.group.source_backing_buckets[d].valid_liened_backing_num;
+            if l > max_lien { max_lien = l; max_d = d; }
+        }
+        let bucket = engine.group.source_backing_buckets[max_d];
+        let util = if bucket.fresh_unliened_backing_num + bucket.valid_liened_backing_num > 0 {
+            bucket.valid_liened_backing_num * 10_000
+                / (bucket.fresh_unliened_backing_num + bucket.valid_liened_backing_num)
+        } else { 0 };
+        println!("    domain {}: liened ${}  fresh ${}  util {} bps",
+            max_d,
+            max_lien / BOUND_SCALE / 1_000_000,
+            bucket.fresh_unliened_backing_num / BOUND_SCALE / 1_000_000,
+            util);
+
+        // Advance 1000 slots, observe earnings growth
+        let earnings_pre = engine.group.source_backing_buckets[max_d].utilization_fee_earnings;
+        let user_cap_pre = engine.accounts[user].capital;
+        for _ in 0..1000 {
+            let _ = engine.accrue_asset(0, slot, engine.group.assets[0].effective_price, 0);
+            let _ = engine.accrue_asset(1, slot, engine.group.assets[1].effective_price, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+        }
+        let earnings_post = engine.group.source_backing_buckets[max_d].utilization_fee_earnings;
+        let user_cap_post = engine.accounts[user].capital;
+        let fee_in_1000_slots = earnings_post - earnings_pre;
+        let user_drained = user_cap_pre - user_cap_post;
+        println!("    1000 slots: earnings Δ {} BOUND_SCALE atoms; user cap drained ${}",
+            fee_in_1000_slots,
+            user_drained as f64 / 1_000_000.0);
+        let pass = fee_in_1000_slots > 0 && user_drained > 0;
+        println!("    Fee charges observable: {}  {}", pass,
+            if pass { "✓" } else { "✗" });
+    }
+    println!();
+
+    // === [2] Earnings withdrawal end-to-end with macroscopic fees ===
+    println!("  [2] Provider withdraws ALL accumulated earnings");
+    {
+        let cfg = make_bounty_config_with_high_fees(2);
+        let (mut engine, lp, user, mut slot) = match setup_persistent_lien(cfg) {
+            Ok(s) => s, Err(e) => { println!("    setup failed: {}", e); return; }
+        };
+        // Accrue fees for 5000 slots
+        for _ in 0..5000 {
+            let _ = engine.accrue_asset(0, slot, engine.group.assets[0].effective_price, 0);
+            let _ = engine.accrue_asset(1, slot, engine.group.assets[1].effective_price, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+        }
+        // Find domain with earnings
+        let mut target_d = None;
+        let mut max_earn = 0u128;
+        for d in 0..engine.group.source_backing_buckets.len() {
+            let e = engine.group.source_backing_buckets[d].utilization_fee_earnings;
+            if e > max_earn { max_earn = e; target_d = Some(d); }
+        }
+        if let Some(d) = target_d {
+            let earnings = engine.group.source_backing_buckets[d].utilization_fee_earnings;
+            let vault_pre = engine.group.vault;
+            // Try withdraw 50% then 100%
+            let half = earnings / 2;
+            let r1 = engine.group.withdraw_backing_provider_earnings_not_atomic(d, half);
+            let after_half = engine.group.source_backing_buckets[d].utilization_fee_earnings;
+            let r2 = engine.group.withdraw_backing_provider_earnings_not_atomic(d, after_half);
+            let after_all = engine.group.source_backing_buckets[d].utilization_fee_earnings;
+            let vault_post = engine.group.vault;
+            let vault_decrease = vault_pre - vault_post;
+            println!("    domain {} earnings: {} atoms (~${} micro)", d, earnings, earnings);
+            println!("    withdraw half: {:?}, after: {}",
+                r1.as_ref().map(|_|"Ok").map_err(|e| format!("{:?}", e)), after_half);
+            println!("    withdraw rest: {:?}, after: {}",
+                r2.as_ref().map(|_|"Ok").map_err(|e| format!("{:?}", e)), after_all);
+            println!("    vault decreased by {} atoms (paid out externally)", vault_decrease);
+            let pass = r1.is_ok() && r2.is_ok() && after_all == 0 && vault_decrease == earnings;
+            println!("    Earnings fully withdrawable: {}  {}", pass,
+                if pass { "✓" } else { "✗" });
+        } else {
+            println!("    no domain has earnings after 5000 slots — rate may be too low");
+        }
+    }
+    println!();
+
+    // === [3] Fee forgiveness at full cap exhaustion (§0.26) ===
+    println!("  [3] Fee FORGIVENESS when user cap is exhausted (§0.26)");
+    {
+        let cfg = make_bounty_config_with_high_fees(2);
+        let (mut engine, lp, user, mut slot) = match setup_persistent_lien(cfg) {
+            Ok(s) => s, Err(e) => { println!("    setup failed: {}", e); return; }
+        };
+        let insurance_pre = engine.group.insurance;
+        // Advance many slots so cap is fully drained
+        let mut drained_at = None;
+        for i in 0..100_000 {
+            let _ = engine.accrue_asset(0, slot, engine.group.assets[0].effective_price, 0);
+            let _ = engine.accrue_asset(1, slot, engine.group.assets[1].effective_price, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+            if engine.accounts[user].capital == 0 && drained_at.is_none() {
+                drained_at = Some(i);
+            }
+        }
+        let insurance_post = engine.group.insurance;
+        let user_cap = engine.accounts[user].capital;
+        let user_pnl = engine.accounts[user].pnl;
+        let ins_delta = insurance_post as i128 - insurance_pre as i128;
+        println!("    drained at slot offset: {:?}", drained_at);
+        println!("    user final: cap=${} pnl=${}", user_cap / 1_000_000, user_pnl / 1_000_000);
+        println!("    insurance Δ:    ${}  (must be ≥ 0; §0.26)", ins_delta / 1_000_000);
+        let inv = engine.group.assert_public_invariants();
+        println!("    engine invariants: {:?}", inv);
+        let pass = ins_delta >= 0 && inv.is_ok();
+        println!("    L9 fee forgiveness OK: {}  {}", pass,
+            if pass { "✓" } else { "✗ — fees subsidized by insurance" });
+    }
+    println!();
+
+    // === [4] Conservation: earnings + (capital decreases) = 0 ===
+    println!("  [4] Conservation: cap drained from lien-holder = earnings credited to bucket");
+    {
+        let cfg = make_bounty_config_with_high_fees(2);
+        let (mut engine, lp, user, mut slot) = match setup_persistent_lien(cfg) {
+            Ok(s) => s, Err(e) => { println!("    setup failed: {}", e); return; }
+        };
+        let user_cap_pre = engine.accounts[user].capital;
+        let earnings_pre: u128 = engine.group.source_backing_buckets.iter()
+            .map(|b| b.utilization_fee_earnings).sum();
+        for _ in 0..2000 {
+            let _ = engine.accrue_asset(0, slot, engine.group.assets[0].effective_price, 0);
+            let _ = engine.accrue_asset(1, slot, engine.group.assets[1].effective_price, 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+        }
+        let user_cap_post = engine.accounts[user].capital;
+        let earnings_post: u128 = engine.group.source_backing_buckets.iter()
+            .map(|b| b.utilization_fee_earnings).sum();
+        let user_drain = user_cap_pre - user_cap_post;
+        let earnings_grew = earnings_post - earnings_pre;
+        // Earnings stored in atoms (verified by [2] above where withdraw decreased vault 1:1)
+        let conserved = user_drain == earnings_grew;
+        println!("    user cap drained:   {} atoms", user_drain);
+        println!("    earnings increased: {} atoms", earnings_grew);
+        println!("    Conservation (drain == earnings): {}  {}", conserved,
+            if conserved { "✓" } else { "✗" });
+    }
+}
+
 /// so the fee accrual / debit / earnings paths actually execute under stress.
 fn make_bounty_config_with_fees(n_assets: u16) -> V16Config {
     let mut c = make_bounty_config(n_assets);
@@ -10142,6 +10398,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_backing_losses") {
         probe_v16_backing_losses();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_fee_configs") {
+        probe_v16_fee_configs();
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
