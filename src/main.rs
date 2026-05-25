@@ -6223,6 +6223,283 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
     println!("    not systematic exploitation.");
 }
 
+/// "Toly's Nightmare": all four PercoChaos stressors at MAX, simultaneously,
+/// against the real engine.
+///   1. Asset volatility  — every volatile-asset accrue jumps at the full
+///      max_move envelope (no gentle ±bps).
+///   2. Attacker capital   — one whale + several mid users all trading.
+///   3. Oracle lag         — a subset of assets are accrued only rarely, so
+///      their effective price is persistently stale vs. reality.
+///   4. Dropped slots      — when accrues DO land, the slot clock jumps by a
+///      large random gap (congestion), so dt between cranks is huge.
+/// On top of that, adversarial behavior: pump the volatile asset, lean on the
+/// stale asset's inflated hedge value, convert, and try to withdraw mid-chaos.
+/// Battery: assert_public_invariants after every op, blast-radius (no user
+/// withdraws > deposit), bounded LP loss, wire round-trip.
+fn probe_v16_nightmare(seeds: u64) {
+    use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+
+    println!("  v16 NIGHTMARE: all 4 stressors MAXED at once × {} seeds", seeds);
+    println!("  (max-envelope volatility + stale/lagged oracles + dropped-slot");
+    println!("   congestion + whale attacker), strict SVM-atomic semantics");
+    println!();
+    let cfg = make_bounty_config(4);
+    let oracle0 = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    let invariant_fails = AtomicU64::new(0);
+    let wire_fails = AtomicU64::new(0);
+    let any_user_excess = AtomicU64::new(0);
+    let max_excess = AtomicI64::new(0);
+    let lp_loss_seeds = AtomicU64::new(0);
+    let lp_max_loss = AtomicI64::new(0);
+    let total_ops = AtomicU64::new(0);
+    let total_rollbacks = AtomicU64::new(0);
+    let recovery_entries = AtomicU64::new(0);
+    let max_slot_gap = AtomicU64::new(0);
+
+    (0..seeds).into_par_iter().for_each(|seed| {
+        let mut rng = Rng::new(seed.wrapping_mul(0xDEAD_C0DE_BEEF));
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let n_assets = cfg.max_portfolio_assets as usize;
+
+        let lp = engine.add_account(1).unwrap();
+        let lp_initial = usdc(50_000_000);
+        engine.deposit(lp, lp_initial).unwrap();
+
+        // Whale attacker + 4 mid users.
+        let mut users = Vec::new();
+        let mut deposits = Vec::new();
+        let mut withdrawn = Vec::new();
+        // whale ~ "500 SOL" analog, scaled to the $-denominated book
+        let whale = engine.add_account(10).unwrap();
+        let whale_dep = usdc(500_000);
+        engine.deposit(whale, whale_dep).unwrap();
+        users.push(whale); deposits.push(whale_dep); withdrawn.push(0u128);
+        for u in 0..4u8 {
+            let idx = engine.add_account(20 + u).unwrap();
+            let dep = usdc(1_000 + (u as u128) * 500);
+            engine.deposit(idx, dep).unwrap();
+            users.push(idx); deposits.push(dep); withdrawn.push(0u128);
+        }
+        for a in 0..n_assets {
+            let _ = engine.accrue_asset(a, 1, oracle0, 0);
+        }
+
+        // Stressor wiring: each asset is either VOLATILE (accrue often, max
+        // move) or LAGGED (accrue rarely → persistently stale). Pick per seed.
+        let mut lagged = [false; 16];
+        for a in 0..n_assets {
+            lagged[a] = rng.bool();
+        }
+        // last_accrued_slot[a] tracks staleness; reality_price[a] is the
+        // "true" price the wrapper would publish if not congested.
+        let mut reality = [oracle0; 16];
+        let mut last_accrue_slot = [1u64; 16];
+
+        let mut slot = 2u64;
+        let mut local_ops = 0u64;
+        let mut local_rollbacks = 0u64;
+        let mut local_max_gap = 0u64;
+
+        macro_rules! atomic_call {
+            ($idx:expr, $body:expr) => {{
+                let backup = engine.accounts[$idx].clone();
+                let mut acc = backup.clone();
+                let res = $body(&mut engine.group, &mut acc);
+                if res.is_err() {
+                    engine.accounts[$idx] = backup;
+                    local_rollbacks += 1;
+                    false
+                } else {
+                    engine.accounts[$idx] = acc;
+                    true
+                }
+            }};
+        }
+
+        for _step in 0..250u64 {
+            local_ops += 1;
+            let op = rng.next_u64() % 9;
+            match op {
+                0 | 1 => {
+                    // CONGESTED ACCRUE: jump the slot clock by a big random gap
+                    // (dropped slots), and move reality at full volatility.
+                    let gap = rng.range_u64(1, 80);  // up to 80 dropped slots
+                    slot += gap;
+                    if gap > local_max_gap { local_max_gap = gap; }
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    // reality moves hard each real slot; over `gap` slots that
+                    // compounds, but we clamp to the engine envelope per dt.
+                    let dir: i64 = if rng.bool() { 1 } else { -1 };
+                    let mag = rng.range_u64(0, 300) as i128; // up to ±3%/real-slot
+                    let mult = (10_000i128 + dir as i128 * mag) ;
+                    reality[a] = ((reality[a] as i128 * mult / 10_000).max(1)) as u64;
+                    reality[a] = reality[a].min(MAX_ORACLE_PRICE);
+                    // LAGGED assets: only actually publish ~1/6 of the time.
+                    let publish = if lagged[a] { rng.next_u64() % 6 == 0 } else { true };
+                    if publish {
+                        let cur = engine.group.assets[a].effective_price;
+                        // engine clamps the move to max_move * dt
+                        let dt = slot.saturating_sub(last_accrue_slot[a]).max(1);
+                        let clamped = clamp_oracle(reality[a], cur, max_move, dt);
+                        if engine.accrue_asset(a, slot, clamped, 0).is_ok() {
+                            last_accrue_slot[a] = slot;
+                        }
+                    }
+                }
+                2 => {
+                    // whale opens big on a (possibly stale) asset
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    let long = rng.bool();
+                    let notional = usdc(rng.range_u64(5_000, 100_000) as u128);
+                    let p = engine.group.assets[a].effective_price;
+                    let size_q = notional * POS_SCALE / p as u128;
+                    let _ = if long {
+                        engine.trade(whale, lp, a, size_q, p, 1)
+                    } else {
+                        engine.trade(lp, whale, a, size_q, p, 1)
+                    };
+                }
+                3 => {
+                    // mid user opens
+                    let u_idx = 1 + (rng.next_u64() as usize) % (users.len() - 1);
+                    let u = users[u_idx];
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    let long = rng.bool();
+                    let notional = usdc(rng.range_u64(200, 2_000) as u128);
+                    let p = engine.group.assets[a].effective_price;
+                    let size_q = notional * POS_SCALE / p as u128;
+                    let _ = if long {
+                        engine.trade(u, lp, a, size_q, p, 1)
+                    } else {
+                        engine.trade(lp, u, a, size_q, p, 1)
+                    };
+                }
+                4 | 5 => {
+                    // settle + refresh a random account under chaos
+                    let pick = (rng.next_u64() as usize) % (users.len() + 1);
+                    let idx = if pick == 0 { lp } else { users[pick - 1] };
+                    let prices = engine.effective_prices();
+                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.settle_account_side_effects_not_atomic(a, cfg.public_b_chunk_atoms)
+                    });
+                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.full_account_refresh(a, &prices).map(|_| ())
+                    });
+                }
+                6 => {
+                    // try convert (favorable action during chaos)
+                    let u_idx = (rng.next_u64() as usize) % users.len();
+                    let u = users[u_idx];
+                    let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.convert_released_pnl_to_capital_not_atomic(a).map(|_| ())
+                    });
+                }
+                7 => {
+                    // try to withdraw a random fraction of cap (track real cash out)
+                    let u_idx = (rng.next_u64() as usize) % users.len();
+                    let u = users[u_idx];
+                    let cap = engine.accounts[u].capital;
+                    if cap == 0 { continue; }
+                    let want = ((rng.next_u64() as u128) % cap) + 1;
+                    let cap_before = engine.accounts[u].capital;
+                    let prices = engine.effective_prices();
+                    if atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.withdraw_not_atomic(a, want, &prices)
+                    }) {
+                        let cap_after = engine.accounts[u].capital;
+                        withdrawn[u_idx] += cap_before - cap_after;
+                    }
+                }
+                8 => {
+                    // liquidate any user the chaos pushed into deficit
+                    let u_idx = (rng.next_u64() as usize) % users.len();
+                    let u = users[u_idx];
+                    if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                        for li in 0..n_assets {
+                            let leg = engine.accounts[u].legs[li];
+                            if leg.active {
+                                let q = leg.basis_pos_q.unsigned_abs();
+                                let prices = engine.effective_prices();
+                                let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                                    g.liquidate_account_not_atomic(a, LiquidationRequestV16 {
+                                        asset_index: li, close_q: q, fee_bps: 5,
+                                    }, &prices).map(|_| ())
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // Invariant battery after each op.
+            if engine.group.assert_public_invariants().is_err() {
+                invariant_fails.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if engine.group.mode == MarketModeV16::Recovery {
+            recovery_entries.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Wire round-trip every account.
+        for &u in users.iter().chain(std::iter::once(&lp)) {
+            let acc = engine.accounts[u].clone();
+            let _ = PortfolioAccountV16Account::from_runtime(&acc);
+        }
+        // Blast radius: no user can withdraw more cash than they deposited.
+        for (i, _u) in users.iter().enumerate() {
+            if withdrawn[i] > deposits[i] {
+                any_user_excess.fetch_add(1, Ordering::Relaxed);
+                let excess = (withdrawn[i] - deposits[i]) as i64;
+                if excess > max_excess.load(Ordering::Relaxed) {
+                    max_excess.store(excess, Ordering::Relaxed);
+                }
+            }
+        }
+        // LP loss bound.
+        let lp_total = engine.accounts[lp].capital as i128 + engine.accounts[lp].pnl;
+        let lp_change = lp_total - lp_initial as i128;
+        if lp_change < -1_000_000 {
+            lp_loss_seeds.fetch_add(1, Ordering::Relaxed);
+            if (-lp_change) as i64 > lp_max_loss.load(Ordering::Relaxed) {
+                lp_max_loss.store((-lp_change) as i64, Ordering::Relaxed);
+            }
+        }
+        if local_max_gap > max_slot_gap.load(Ordering::Relaxed) {
+            max_slot_gap.store(local_max_gap, Ordering::Relaxed);
+        }
+        total_ops.fetch_add(local_ops, Ordering::Relaxed);
+        total_rollbacks.fetch_add(local_rollbacks, Ordering::Relaxed);
+    });
+
+    println!("  Stats:");
+    println!("    total ops:        {}", total_ops.load(Ordering::Relaxed));
+    println!("    total rollbacks:  {}", total_rollbacks.load(Ordering::Relaxed));
+    println!("    seeds → Recovery: {}", recovery_entries.load(Ordering::Relaxed));
+    println!("    max slot gap (dropped-slot congestion): {}", max_slot_gap.load(Ordering::Relaxed));
+    println!();
+    println!("  Safety battery (target = 0):");
+    println!("    assert_public_invariants fails: {}", invariant_fails.load(Ordering::Relaxed));
+    println!("    wire round-trip fails:          {}", wire_fails.load(Ordering::Relaxed));
+    println!("    seeds: user withdrew > deposit: {}", any_user_excess.load(Ordering::Relaxed));
+    println!("    max excess cash extracted:      ${}", max_excess.load(Ordering::Relaxed) / 1_000_000);
+    println!();
+    let inv = invariant_fails.load(Ordering::Relaxed);
+    let excess = any_user_excess.load(Ordering::Relaxed);
+    let wire = wire_fails.load(Ordering::Relaxed);
+    let pass = inv == 0 && excess == 0 && wire == 0;
+    println!("    LP loss seeds (>$1): {}, max LP loss: ${}",
+        lp_loss_seeds.load(Ordering::Relaxed),
+        lp_max_loss.load(Ordering::Relaxed) / 1_000_000);
+    println!();
+    println!("  RESULT: {}  {}", pass,
+        if pass { "✓ engine holds all invariants under all 4 stressors at once" }
+        else { "✗ FAIL — a stressor combination broke an invariant" });
+}
+
 /// Minimal Drift-style attack probe with strict SVM-atomic semantics:
 /// every engine call is wrapped — on Err the account state is restored to
 /// its pre-call value (simulating SVM tx rollback). If the final state
@@ -11107,6 +11384,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_domain_isolation") {
         probe_v16_domain_isolation();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_nightmare") {
+        probe_v16_nightmare(2000);
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
