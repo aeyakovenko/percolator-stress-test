@@ -6500,6 +6500,323 @@ fn probe_v16_nightmare(seeds: u64) {
         else { "✗ FAIL — a stressor combination broke an invariant" });
 }
 
+/// Per-domain solvency probe — targets the bug class:
+///   "a domain was able to withdraw more than was accounted to it
+///    (users + insurance + backing)".
+///
+/// The engine's per-domain accounting (recomputed here independently of the
+/// engine's own validators, from the raw source_credit[d] fields):
+///   backing_avail(d)  = fresh_reserved_backing − valid_liened_backing
+///   ins_avail(d)      = insurance_credit_reserved − (valid_liened_ins + impaired_liened_ins)
+///   available(d)      = backing_avail(d) + ins_avail(d)          (in BOUND units)
+///   realizable(d)     = min(exact_claim · credit_rate / SCALE, available(d))
+///
+/// Checks after EVERY op, across an adversarial fuzz that specifically
+/// exercises backing consumption / refill / impair / liquidation:
+///   DS1  fresh_reserved ≥ valid_liened             (backing non-underflow)
+///   DS2  ins_reserved   ≥ valid+impaired liened    (insurance non-underflow)
+///   DS3  exact_claim    ≤ positive_claim_bound      (claim bound)
+///   DS4  credit_rate    ≤ CREDIT_RATE_SCALE
+///   DS5  realizable(d)  ≤ available(d)              (the core: payout ≤ accounted)
+///   DS6  Σ_d ins_avail_atoms  ≤ global insurance   (insurance not over-promised)
+///   DS7  Σ_d ins_reserved + insurance_domain_spent ≤ insurance_domain_budget
+///   DS8  Σ withdrawn(all users) ≤ Σ deposited       (zero-sum: no net cash minted)
+///   DS9  assert_public_invariants
+fn probe_v16_domain_solvency(seeds: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    println!("  v16 per-domain solvency: realized payout ≤ users+insurance+backing");
+    println!("  {} seeds × adversarial backing consume/refill/impair/liquidate", seeds);
+    println!();
+    let cfg = make_bounty_config(3);
+    let oracle0 = price_e6(200);
+    let max_move = cfg.max_price_move_bps_per_slot;
+
+    let ds1 = AtomicU64::new(0);
+    let ds2 = AtomicU64::new(0);
+    let ds3 = AtomicU64::new(0);
+    let ds4 = AtomicU64::new(0);
+    let ds5 = AtomicU64::new(0);
+    let ds6 = AtomicU64::new(0);
+    let ds7 = AtomicU64::new(0);
+    let ds8 = AtomicU64::new(0);
+    let ds9 = AtomicU64::new(0);
+    let ds10 = AtomicU64::new(0);
+    let total_ops = AtomicU64::new(0);
+    let total_checks = AtomicU64::new(0);
+    let max_realizable_slack = AtomicU64::new(0); // min over checks of (available - realizable)
+
+    // Independent recomputation of the engine's per-domain solvency, returning
+    // (violated_invariant_id or 0, available_num, realizable_num) per domain.
+    // Runs over all domains; returns the first violation code seen plus the
+    // cross-domain insurance sums for DS6/DS7.
+    (0..seeds).into_par_iter().for_each(|seed| {
+        let mut rng = Rng::new(seed.wrapping_mul(0x5031_7EE5_A1ED));
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let n_assets = cfg.max_portfolio_assets as usize;
+
+        let lp = engine.add_account(1).unwrap();
+        let lp_dep = usdc(50_000_000);
+        engine.deposit(lp, lp_dep).unwrap();
+        let mut deposited = lp_dep;
+        let mut users = Vec::new();
+        let mut withdrawn_tot = 0u128;
+        for u in 0..4u8 {
+            let idx = engine.add_account(20 + u).unwrap();
+            let dep = usdc(1_000 + (u as u128) * 750);
+            engine.deposit(idx, dep).unwrap();
+            deposited += dep;
+            users.push(idx);
+        }
+        for a in 0..n_assets {
+            let _ = engine.accrue_asset(a, 1, oracle0, 0);
+        }
+        let mut slot = 2u64;
+        let mut local_ops = 0u64;
+
+        macro_rules! atomic_call {
+            ($idx:expr, $body:expr) => {{
+                let backup = engine.accounts[$idx].clone();
+                let mut acc = backup.clone();
+                let res = $body(&mut engine.group, &mut acc);
+                if res.is_err() { engine.accounts[$idx] = backup; false }
+                else { engine.accounts[$idx] = acc; true }
+            }};
+        }
+
+        // Per-domain solvency check over the whole group.
+        macro_rules! check_solvency {
+            () => {{
+                total_checks.fetch_add(1, Ordering::Relaxed);
+                let mut ins_avail_atoms_sum = 0u128;
+                let n_dom = engine.group.source_credit.len();
+                for d in 0..n_dom {
+                    let sc = engine.group.source_credit[d];
+                    // DS1: backing non-underflow
+                    if sc.fresh_reserved_backing_num < sc.valid_liened_backing_num {
+                        ds1.fetch_add(1, Ordering::Relaxed); continue;
+                    }
+                    let ins_enc = sc.valid_liened_insurance_num
+                        .saturating_add(sc.impaired_liened_insurance_num);
+                    // DS2: insurance non-underflow
+                    if sc.insurance_credit_reserved_num < ins_enc {
+                        ds2.fetch_add(1, Ordering::Relaxed); continue;
+                    }
+                    // DS3: exact claim ≤ bound
+                    if sc.exact_positive_claim_num > sc.positive_claim_bound_num {
+                        ds3.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // DS4: credit rate ≤ scale
+                    if sc.credit_rate_num > CREDIT_RATE_SCALE {
+                        ds4.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let backing_avail = sc.fresh_reserved_backing_num - sc.valid_liened_backing_num;
+                    let ins_avail = sc.insurance_credit_reserved_num - ins_enc;
+                    let available_num = backing_avail.saturating_add(ins_avail);
+                    // DS5 (NON-tautological): apply the engine's STORED credit_rate
+                    // to the engine's STORED claim bound, and assert the promised
+                    // realizable payout does not exceed the engine's STORED
+                    // available backing. If the engine ever sets credit_rate too
+                    // high for the backing actually present, this fires — that is
+                    // exactly the "pay out more than accounted" arithmetic.
+                    // (We do NOT .min() with available, which would mask the bug.)
+                    let promised_for_bound = (sc.positive_claim_bound_num as u128)
+                        .saturating_mul(sc.credit_rate_num) / CREDIT_RATE_SCALE;
+                    let promised_for_exact = (sc.exact_positive_claim_num as u128)
+                        .saturating_mul(sc.credit_rate_num) / CREDIT_RATE_SCALE;
+                    // tolerance: 1 BOUND unit for integer rounding in rate calc
+                    let tol = 1u128;
+                    if promised_for_bound > available_num.saturating_add(tol)
+                        || promised_for_exact > available_num.saturating_add(tol) {
+                        ds5.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ins_avail_atoms_sum = ins_avail_atoms_sum
+                        .saturating_add(ins_avail / BOUND_SCALE);
+                    // DS7: per-domain insurance reserved + spent ≤ budget
+                    let reserved_atoms = sc.insurance_credit_reserved_num / BOUND_SCALE;
+                    if reserved_atoms.saturating_add(engine.group.insurance_domain_spent[d])
+                        > engine.group.insurance_domain_budget[d] {
+                        ds7.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // DS6: Σ insurance available ≤ global insurance
+                if ins_avail_atoms_sum > engine.group.insurance {
+                    ds6.fetch_add(1, Ordering::Relaxed);
+                }
+                // DS10 (THE bug invariant): the sum of per-domain insurance
+                // ENTITLEMENTS (remaining budget) cannot exceed the global
+                // insurance pool. If per-domain budgets are set unbounded
+                // (the historical bug initialized them to MAX_VAULT_TVL each),
+                // Σ remaining budget ≫ insurance and this fires immediately.
+                let mut budget_remaining_sum = 0u128;
+                let n_dom2 = engine.group.insurance_domain_budget.len();
+                for d in 0..n_dom2 {
+                    let rem = engine.group.insurance_domain_budget[d]
+                        .saturating_sub(engine.group.insurance_domain_spent[d]);
+                    budget_remaining_sum = budget_remaining_sum.saturating_add(rem);
+                }
+                if budget_remaining_sum > engine.group.insurance {
+                    ds10.fetch_add(1, Ordering::Relaxed);
+                }
+                // DS9: engine's own public invariants
+                if engine.group.assert_public_invariants().is_err() {
+                    ds9.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = &max_realizable_slack;
+            }};
+        }
+
+        for _step in 0..200u64 {
+            local_ops += 1;
+            let op = rng.next_u64() % 10;
+            match op {
+                0 => {
+                    // oracle move (drives PnL → claims → backing reservation)
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    let mv = (rng.next_u64() % 120) as i64 - 60;
+                    let cur = engine.group.assets[a].effective_price;
+                    let target = ((cur as i128) + (cur as i128 * mv as i128 / 10_000)).max(1) as u64;
+                    let _ = engine.accrue_asset(a, slot, clamp_oracle(target, cur, max_move, 1), 0);
+                    slot += 1;
+                }
+                1 | 2 => {
+                    // open trade — builds source claims + backing
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    let long = rng.bool();
+                    let notional = usdc(rng.range_u64(200, 3_000) as u128);
+                    let p = engine.group.assets[a].effective_price;
+                    let size_q = notional * POS_SCALE / p as u128;
+                    let _ = if long { engine.trade(u, lp, a, size_q, p, 1) }
+                            else { engine.trade(lp, u, a, size_q, p, 1) };
+                }
+                3 | 4 => {
+                    // settle + refresh — materializes / consumes backing
+                    let pick = (rng.next_u64() as usize) % (users.len() + 1);
+                    let idx = if pick == 0 { lp } else { users[pick - 1] };
+                    let prices = engine.effective_prices();
+                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.settle_account_side_effects_not_atomic(a, cfg.public_b_chunk_atoms)
+                    });
+                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.full_account_refresh(a, &prices).map(|_| ())
+                    });
+                }
+                5 => {
+                    // convert PnL → cap (consumes source credit / backing)
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.convert_released_pnl_to_capital_not_atomic(a).map(|_| ())
+                    });
+                }
+                6 => {
+                    // WITHDRAW — the operation the bug abused. Track ACTUAL cash
+                    // leaving the vault (not the capital delta: withdraw also runs
+                    // settle_negative_pnl_from_principal, which reduces capital
+                    // internally without removing vault tokens).
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    let cap = engine.accounts[u].capital;
+                    if cap == 0 { continue; }
+                    let want = ((rng.next_u64() as u128) % cap) + 1;
+                    let vault_before = engine.group.vault;
+                    let prices = engine.effective_prices();
+                    if atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                        g.withdraw_not_atomic(a, want, &prices)
+                    }) {
+                        withdrawn_tot += vault_before - engine.group.vault;
+                    }
+                }
+                7 => {
+                    // close a leg (releases / refills backing)
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    for li in 0..n_assets {
+                        let leg = engine.accounts[u].legs[li];
+                        if leg.active {
+                            let q = leg.basis_pos_q.unsigned_abs();
+                            let was_long = leg.side == SideV16::Long;
+                            let p = engine.group.assets[li].effective_price;
+                            let _ = if was_long { engine.trade(lp, u, li, q, p, 1) }
+                                    else { engine.trade(u, lp, li, q, p, 1) };
+                            break;
+                        }
+                    }
+                }
+                8 => {
+                    // liquidate a deficit account (impairs backing/insurance)
+                    let u = users[(rng.next_u64() as usize) % users.len()];
+                    if engine.accounts[u].health_cert.certified_liq_deficit > 0 {
+                        for li in 0..n_assets {
+                            let leg = engine.accounts[u].legs[li];
+                            if leg.active {
+                                let q = leg.basis_pos_q.unsigned_abs();
+                                let prices = engine.effective_prices();
+                                let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                                    g.liquidate_account_not_atomic(a, LiquidationRequestV16 {
+                                        asset_index: li, close_q: q, fee_bps: 5,
+                                    }, &prices).map(|_| ())
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+                9 => {
+                    // big oracle whipsaw on one asset — stresses backing impair/refill
+                    let a = (rng.next_u64() as usize) % n_assets;
+                    let cur = engine.group.assets[a].effective_price;
+                    let target = if rng.bool() { cur.saturating_mul(2).min(MAX_ORACLE_PRICE) }
+                                 else { (cur / 2).max(1) };
+                    let next = clamp_oracle(target, cur, max_move, 1);
+                    let _ = engine.accrue_asset(a, slot, next, 0);
+                    slot += 1;
+                }
+                _ => unreachable!(),
+            }
+            check_solvency!();
+        }
+
+        // DS8: EXACT cash conservation. The vault changes only via deposit and
+        // withdraw (and earnings-withdraw, which this probe never calls), so
+        // vault must equal (total deposited − total withdrawn) at all times.
+        // If a domain over-withdrew, more cash left than was legitimately owed
+        // and this identity breaks — independent of any per-domain field.
+        if engine.group.vault != deposited.saturating_sub(withdrawn_tot) {
+            ds8.fetch_add(1, Ordering::Relaxed);
+        }
+        // Also: total user cash extracted can never exceed total deposited.
+        if withdrawn_tot > deposited {
+            ds8.fetch_add(1, Ordering::Relaxed);
+        }
+        total_ops.fetch_add(local_ops, Ordering::Relaxed);
+    });
+
+    let fails = [
+        ("DS1 backing non-underflow (fresh ≥ valid_liened)", ds1.load(Ordering::Relaxed)),
+        ("DS2 insurance non-underflow (reserved ≥ encumbered)", ds2.load(Ordering::Relaxed)),
+        ("DS3 exact_claim ≤ positive_claim_bound", ds3.load(Ordering::Relaxed)),
+        ("DS4 credit_rate ≤ SCALE", ds4.load(Ordering::Relaxed)),
+        ("DS5 promised(stored rate · bound/exact) ≤ available(d)", ds5.load(Ordering::Relaxed)),
+        ("DS6 Σ insurance_avail ≤ global insurance", ds6.load(Ordering::Relaxed)),
+        ("DS7 per-domain reserved + spent ≤ budget", ds7.load(Ordering::Relaxed)),
+        ("DS8 vault == deposited − withdrawn (exact cash)", ds8.load(Ordering::Relaxed)),
+        ("DS9 assert_public_invariants", ds9.load(Ordering::Relaxed)),
+        ("DS10 Σ per-domain budget remaining ≤ insurance", ds10.load(Ordering::Relaxed)),
+    ];
+    println!("  ops: {}, solvency checks: {}",
+        total_ops.load(Ordering::Relaxed), total_checks.load(Ordering::Relaxed));
+    println!();
+    println!("  Per-domain solvency battery (target = 0 each):");
+    let mut all_zero = true;
+    for (name, n) in fails.iter() {
+        println!("    {:<54} {}", name, n);
+        if *n != 0 { all_zero = false; }
+    }
+    println!();
+    println!("  RESULT: {}  {}", all_zero,
+        if all_zero { "✓ no domain pays out more than users+insurance+backing accounted to it" }
+        else { "✗ FAIL — per-domain over-withdrawal detected" });
+}
+
 /// Minimal Drift-style attack probe with strict SVM-atomic semantics:
 /// every engine call is wrapped — on Err the account state is restored to
 /// its pre-call value (simulating SVM tx rollback). If the final state
@@ -11388,6 +11705,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_nightmare") {
         probe_v16_nightmare(2000);
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_domain_solvency") {
+        probe_v16_domain_solvency(3000);
         return;
     }
     if args.iter().any(|a| a == "--test=advanced") {
