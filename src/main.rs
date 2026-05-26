@@ -53,7 +53,13 @@ impl V16Engine {
         self.next_account_seq += 1;
         let owner = [owner_byte; 32];
         let header = ProvenanceHeaderV16::new(self.market_group_id, id, owner);
-        let account = PortfolioAccountV16::empty(header);
+        let mut account = PortfolioAccountV16::empty(header);
+        // The engine now requires accounts to be pre-sized to the configured
+        // per-domain capacity (configured_domains = max_market_slots * 2),
+        // mirroring how the on-chain wrapper allocates the account buffer.
+        // Without this the new account-shape validation fails closed (HiddenLeg).
+        let domain_count = v16_domain_count_for_market_slots(self.group.config.max_market_slots)?;
+        account.ensure_source_domain_capacity(domain_count);
         self.group.create_portfolio_account(&account)?;
         let idx = self.accounts.len();
         self.accounts.push(account);
@@ -2855,11 +2861,11 @@ fn probe_per_domain_attribution() {
     engine.accrue_asset(0, 1, oracle, 0).unwrap();
     engine.accrue_asset(1, 1, oracle, 0).unwrap();
 
-    // Set generous domain budgets so spending isn't capped — we only want
-    // to verify ATTRIBUTION, not capping.
-    for d in 0..engine.group.insurance_domain_budget.len() {
-        engine.group.insurance_domain_budget[d] = usdc(1_000_000);
-    }
+    // NOTE: the engine now isolates per-domain insurance budgets and enforces
+    // Σ_d (budget − spent) ≤ global insurance (commit 8e0e3f8). The original
+    // probe set EVERY domain's budget to $1M, which is now InvalidConfig. We
+    // instead allocate the budget for ONLY the domain under test, bounded by
+    // the global insurance pool — done below, after insurance is generated.
 
     // Generate insurance via fees on BTC (asset 1) — these should NOT be
     // spent for SOL bankruptcies.
@@ -2881,6 +2887,12 @@ fn probe_per_domain_attribution() {
     let dom_sol_long_opp = 1;
     let dom_btc_long_opp = 3;
     let dom_btc_short_opp = 2;
+
+    // Allocate the SOL-long-opp domain its insurance budget WITHIN the global
+    // pool. Setting only this domain (others stay 0) keeps Σ budget ≤ insurance,
+    // satisfying the per-domain isolation invariant while still letting the SOL
+    // bankruptcy spend insurance — so we can observe WHICH domain it charges.
+    engine.group.insurance_domain_budget[dom_sol_long_opp] = engine.group.insurance;
 
     // Slow-keeper SOL crash
     let max_move = cfg.max_price_move_bps_per_slot;
@@ -2975,10 +2987,11 @@ fn probe_per_domain_budget_cap() {
     engine.accrue_asset(0, 1, oracle, 0).unwrap();
     engine.accrue_asset(1, 1, oracle, 0).unwrap();
 
-    // Generous budgets EXCEPT for SOL long-opp domain
-    for d in 0..engine.group.insurance_domain_budget.len() {
-        engine.group.insurance_domain_budget[d] = usdc(1_000_000);
-    }
+    // SOL long-opp domain (index 1) gets budget=0 — this is the cap under test.
+    // Post per-domain-isolation fix the engine defaults all budgets to 0 and
+    // enforces Σ budget ≤ insurance, so the old "set every domain to $1M" poke
+    // is now InvalidConfig. Leaving domain 1 at 0 is exactly the capped case we
+    // want; other domains stay at their (0) default.
     engine.group.insurance_domain_budget[1] = 0; // SOL long-opp (asset 0 short-side dom)
 
     for &u in &btc_users {
@@ -7116,7 +7129,14 @@ fn probe_v16_instant_h_lock_attacks() {
         let lp_final = engine.accounts[lp].capital;
         let lp_pnl_final = engine.accounts[lp].pnl;
         let lp_total = lp_final as i128 + lp_pnl_final;
-        let net_change = total_withdrawn as i128 + final_cap as i128 + final_pnl - deposit as i128;
+        // EXTRACTION = real cash out vs deposit. Cash the attacker can take is
+        // (already-withdrawn) + (remaining capital, which is withdrawable). The
+        // account's `pnl` is PAPER PnL — convert returns LockActive, so it is
+        // NOT extractable cash and must NOT be counted here (doing so was the
+        // historical "★★ EXTRACTION ★★" artifact: it labeled a −$1 real outcome
+        // as +$502 by adding $503 of frozen, inaccessible pnl).
+        let net_change = total_withdrawn as i128 + final_cap as i128 - deposit as i128;
+        let frozen_paper_pnl = final_pnl;
         let lp_change = lp_total - 50_000_000 * USDC_DECIMALS as i128;
         println!("    after revert (before close): cap=${} pnl=${}",
             cap_after_revert / 1_000_000, pnl_after_revert / 1_000_000);
@@ -7126,11 +7146,13 @@ fn probe_v16_instant_h_lock_attacks() {
             final_withdrawn2 / 1_000_000);
         println!("    LP: cap=${}, pnl=${}, total=${}",
             lp_final / 1_000_000, lp_pnl_final / 1_000_000, lp_total / 1_000_000);
-        println!("    total extracted from engine: ${} | LP_total_Δ=${} | NET to attacker: ${} {}",
+        println!("    cash withdrawn: ${} | LP_total_Δ=${} | NET cash vs deposit: ${} {}",
             total_withdrawn / 1_000_000,
             lp_change / 1_000_000,
             net_change / 1_000_000,
-            if net_change > 0 { "★★ EXTRACTION ★★" } else { "no extraction" });
+            if net_change > 0 { "★★ EXTRACTION ★★" } else { "no cash extraction" });
+        println!("    frozen paper pnl (convert blocked, NOT cash): ${}",
+            frozen_paper_pnl / 1_000_000);
         // Also show insurance and residual
         let vault = engine.group.vault;
         let c_tot = engine.group.c_tot;
@@ -7181,11 +7203,13 @@ fn probe_v16_instant_h_lock_attacks() {
             w3.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
             withdrew3 / 1_000_000);
         let final_grand_total = total_withdrawn + withdrew3;
-        let grand_net = final_grand_total as i128 + engine.accounts[attacker].capital as i128 + engine.accounts[attacker].pnl - deposit as i128;
-        println!("    GRAND TOTAL extracted = ${}, NET = ${} {}",
+        // Real cash extraction only: withdrawn + remaining (withdrawable) cap −
+        // deposit. Paper pnl excluded (unconvertible → not cash).
+        let grand_net = final_grand_total as i128 + engine.accounts[attacker].capital as i128 - deposit as i128;
+        println!("    GRAND TOTAL cash withdrawn = ${}, NET cash = ${} {}",
             final_grand_total / 1_000_000,
             grand_net / 1_000_000,
-            if grand_net > 0 { "★★ EXTRACTION ★★" } else { "no extraction" });
+            if grand_net > 0 { "★★ EXTRACTION ★★" } else { "no cash extraction" });
         println!();
     };
     run_partial_withdraw_attack("A2-instant", make_instant_bounty_config(2));
@@ -7273,17 +7297,19 @@ fn probe_v16_instant_h_lock_attacks() {
         let final_pnl = engine.accounts[attacker].pnl;
         let lp_final = engine.accounts[lp].capital;
         let total_extracted = withdrawn1;
-        let net_in_account = final_cap as i128 + final_pnl;
+        // Cash = withdrawn + withdrawable capital. Paper pnl is NOT cash.
+        let cash_in_account = final_cap as i128;
         println!("    after oracle revert:");
-        println!("      attacker cap=${}, pnl=${}", final_cap / 1_000_000, final_pnl / 1_000_000);
+        println!("      attacker cap=${}, pnl=${} (pnl is paper — convert blocked)",
+            final_cap / 1_000_000, final_pnl / 1_000_000);
         println!("      LP cap=${} (was $50000000)", lp_final / 1_000_000);
-        println!("      total extracted: ${}", total_extracted / 1_000_000);
-        println!("      attacker total economic position: ${} (deposit was $1000)",
-            (total_extracted as i128 + net_in_account) / 1_000_000);
-        let net_change = total_extracted as i128 + net_in_account - deposit as i128;
-        println!("      NET to attacker vs deposit: ${} {}",
+        println!("      total cash withdrawn: ${}", total_extracted / 1_000_000);
+        println!("      attacker total economic position (incl. frozen pnl): ${} (deposit was $1000)",
+            (total_extracted as i128 + final_cap as i128 + final_pnl) / 1_000_000);
+        let net_change = total_extracted as i128 + cash_in_account - deposit as i128;
+        println!("      NET cash to attacker vs deposit: ${} {}",
             net_change / 1_000_000,
-            if net_change > 0 { "★ EXTRACTION" } else { "no extraction" });
+            if net_change > 0 { "★ EXTRACTION" } else { "no cash extraction" });
         let lp_change = lp_final as i128 - 50_000_000 * USDC_DECIMALS as i128;
         println!("      LP capital change: ${}", lp_change / 1_000_000);
         let inv = engine.group.assert_public_invariants();
