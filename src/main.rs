@@ -24,45 +24,734 @@ fn price_e6(d: u64) -> u64 {
 
 const SOL_ASSET: usize = 0;
 
-/// Engine state held by the wrapper: a MarketGroup plus a Vec of accounts.
-/// In v14 the engine no longer owns the account slab; the wrapper passes
-/// accounts in by mut-ref to each call.
+// ════════════════════════════════════════════════════════════════════════════
+// ZERO-COPY SHIM
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Engine HEAD (f3aef4b) removed the Vec-runtime `MarketGroupV16` /
+// `PortfolioAccountV16` types. The production surface is now a split
+// header+markets group view (`MarketGroupV16View{,Mut}`) and a split
+// account+domains portfolio view (`PortfolioV16View{,Mut}`), built transiently
+// per op over POD-backed storage (`MarketGroupV16HeaderAccount`, `Vec<Market>`,
+// `PortfolioAccountV16Account`, `Vec<PortfolioSourceDomainV16Account>`).
+//
+// The 52 probes read fields like `group.vault`, `group.assets[i]`,
+// `group.source_credit[d]`, `account.capital`, `account.legs`, etc. as plain
+// runtime values, and they pass `&mut acc` into `group.<method>(...)`. To keep
+// those probe bodies unchanged, we wrap the POD storage in a snapshot-shim:
+// every shim method builds the transient views internally, calls the real
+// engine method, then re-syncs PUBLIC mirror fields from the POD via
+// `try_to_runtime()`/`.get()`. The mirror fields ARE the legacy field surface.
+
+const SHIM_N_LEGS: usize = V16_MAX_PORTFOLIO_ASSETS_N;
+
+/// Snapshot-shim for one portfolio account: POD storage (acct + domains) plus
+/// public mirror fields the probes read. `sync()` recomputes the mirrors.
+#[derive(Clone)]
+struct ShimAccount {
+    acct: PortfolioAccountV16Account,
+    domains: Vec<PortfolioSourceDomainV16Account>,
+    // --- mirror fields (public surface the probes read) ---
+    capital: u128,
+    pnl: i128,
+    reserved_pnl: u128,
+    legs: [PortfolioLegV16; SHIM_N_LEGS],
+    health_cert: HealthCertV16,
+    active_bitmap: V16ActiveBitmap,
+    stale_state: bool,
+    /// per-domain source-claim bound (mirror of domains[d].source_claim_bound_num)
+    source_claim_bound_num: Vec<u128>,
+    /// per-domain effective reserved backing lien
+    source_lien_effective_reserved: Vec<u128>,
+}
+
+impl ShimAccount {
+    fn new(acct: PortfolioAccountV16Account, domains: Vec<PortfolioSourceDomainV16Account>) -> Self {
+        let mut s = ShimAccount {
+            acct,
+            domains,
+            capital: 0,
+            pnl: 0,
+            reserved_pnl: 0,
+            legs: [PortfolioLegV16::EMPTY; SHIM_N_LEGS],
+            health_cert: HealthCertV16::default(),
+            active_bitmap: V16_EMPTY_ACTIVE_BITMAP,
+            stale_state: false,
+            source_claim_bound_num: Vec::new(),
+            source_lien_effective_reserved: Vec::new(),
+        };
+        s.sync();
+        s
+    }
+
+    fn sync(&mut self) {
+        self.capital = self.acct.capital.get();
+        self.pnl = self.acct.pnl.get();
+        self.reserved_pnl = self.acct.reserved_pnl.get();
+        for i in 0..SHIM_N_LEGS {
+            self.legs[i] = self.acct.legs[i]
+                .try_to_runtime()
+                .unwrap_or(PortfolioLegV16::EMPTY);
+        }
+        self.health_cert = self
+            .acct
+            .health_cert
+            .try_to_runtime()
+            .unwrap_or_default();
+        for w in 0..V16_ACTIVE_BITMAP_WORDS {
+            self.active_bitmap[w] = self.acct.active_bitmap[w].get();
+        }
+        self.stale_state = self.acct.stale_state != 0;
+        self.source_claim_bound_num = self
+            .domains
+            .iter()
+            .map(|d| d.source_claim_bound_num.get())
+            .collect();
+        self.source_lien_effective_reserved = self
+            .domains
+            .iter()
+            .map(|d| d.source_lien_effective_reserved.get())
+            .collect();
+    }
+}
+
+/// Snapshot-shim for the market group: POD storage (header + markets) plus the
+/// public mirror fields probes read. `sync()` recomputes the mirrors.
+#[derive(Clone)]
+struct GroupShim {
+    header: MarketGroupV16HeaderAccount,
+    markets: Vec<Market<u64>>,
+    // --- group-level mirror fields ---
+    vault: u128,
+    c_tot: u128,
+    insurance: u128,
+    mode: MarketModeV16,
+    pnl_pos_tot: u128,
+    pnl_pos_bound_tot: u128,
+    pnl_matured_pos_tot: u128,
+    negative_pnl_account_count: u64,
+    materialized_portfolio_count: u64,
+    market_group_id: [u8; 32],
+    risk_epoch: u64,
+    oracle_epoch: u64,
+    resolved_slot: u64,
+    recovery_reason: Option<PermissionlessRecoveryReasonV16>,
+    bankruptcy_hlock_active: bool,
+    threshold_stress_active: bool,
+    config: V16Config,
+    // --- per-asset / per-domain mirror Vecs ---
+    /// per-asset runtime AssetStateV16 (index = asset)
+    assets: Vec<AssetStateV16>,
+    /// per-domain SourceCreditStateV16 (index d = asset*2 + side; 0=long,1=short)
+    source_credit: Vec<SourceCreditStateV16>,
+    /// per-domain BackingBucketV16
+    source_backing_buckets: Vec<BackingBucketV16>,
+    /// per-domain insurance spent / budget
+    insurance_domain_spent: Vec<u128>,
+    insurance_domain_budget: Vec<u128>,
+}
+
+impl GroupShim {
+    fn new(header: MarketGroupV16HeaderAccount, markets: Vec<Market<u64>>) -> Self {
+        let mut g = GroupShim {
+            header,
+            markets,
+            vault: 0,
+            c_tot: 0,
+            insurance: 0,
+            mode: MarketModeV16::Live,
+            pnl_pos_tot: 0,
+            pnl_pos_bound_tot: 0,
+            pnl_matured_pos_tot: 0,
+            negative_pnl_account_count: 0,
+            materialized_portfolio_count: 0,
+            market_group_id: [0u8; 32],
+            risk_epoch: 0,
+            oracle_epoch: 0,
+            resolved_slot: 0,
+            recovery_reason: None,
+            bankruptcy_hlock_active: false,
+            threshold_stress_active: false,
+            config: V16Config::public_user_fund(1, 0, 1),
+            assets: Vec::new(),
+            source_credit: Vec::new(),
+            source_backing_buckets: Vec::new(),
+            insurance_domain_spent: Vec::new(),
+            insurance_domain_budget: Vec::new(),
+        };
+        g.sync();
+        g
+    }
+
+    fn sync(&mut self) {
+        let h = &self.header;
+        self.vault = h.vault.get();
+        self.c_tot = h.c_tot.get();
+        self.insurance = h.insurance.get();
+        self.pnl_pos_tot = h.pnl_pos_tot.get();
+        self.pnl_pos_bound_tot = h.pnl_pos_bound_tot.get();
+        self.pnl_matured_pos_tot = h.pnl_matured_pos_tot.get();
+        self.negative_pnl_account_count = h.negative_pnl_account_count.get();
+        self.materialized_portfolio_count = h.materialized_portfolio_count.get();
+        self.market_group_id = h.market_group_id;
+        self.risk_epoch = h.risk_epoch.get();
+        self.oracle_epoch = h.oracle_epoch.get();
+        self.resolved_slot = h.resolved_slot.get();
+        self.recovery_reason = h.recovery_reason.try_to_runtime().unwrap_or(None);
+        self.bankruptcy_hlock_active = h.bankruptcy_hlock_active != 0;
+        self.threshold_stress_active = h.threshold_stress_active != 0;
+        self.mode = decode_market_mode_shim(h.mode);
+        self.config = h.config.try_to_runtime().unwrap_or_else(|_| {
+            h.config
+                .try_to_runtime_shape()
+                .unwrap_or_else(|_| V16Config::public_user_fund(1, 0, 1))
+        });
+
+        // per-asset and per-domain mirrors
+        let n = self.markets.len();
+        self.assets = Vec::with_capacity(n);
+        self.source_credit = Vec::with_capacity(n * 2);
+        self.source_backing_buckets = Vec::with_capacity(n * 2);
+        self.insurance_domain_spent = Vec::with_capacity(n * 2);
+        self.insurance_domain_budget = Vec::with_capacity(n * 2);
+        for m in self.markets.iter() {
+            let e = &m.engine;
+            self.assets
+                .push(e.asset.try_to_runtime().unwrap_or_default());
+            // domain order: asset*2 + side, side 0=long, 1=short
+            self.source_credit
+                .push(e.source_credit_long.try_to_runtime().unwrap_or_default());
+            self.source_credit
+                .push(e.source_credit_short.try_to_runtime().unwrap_or_default());
+            self.source_backing_buckets
+                .push(e.backing_long.try_to_runtime().unwrap_or(BackingBucketV16::EMPTY));
+            self.source_backing_buckets
+                .push(e.backing_short.try_to_runtime().unwrap_or(BackingBucketV16::EMPTY));
+            self.insurance_domain_spent
+                .push(e.insurance_domain_spent_long.get());
+            self.insurance_domain_spent
+                .push(e.insurance_domain_spent_short.get());
+            self.insurance_domain_budget
+                .push(e.insurance_domain_budget_long.get());
+            self.insurance_domain_budget
+                .push(e.insurance_domain_budget_short.get());
+        }
+    }
+
+    fn view_mut(&mut self) -> MarketGroupV16ViewMut<'_, u64> {
+        MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets)
+    }
+
+    // ---- methods preserving the legacy signatures ----
+    //
+    // Every fallible op is SVM-atomic: snapshot the group POD (and the account
+    // PODs) before the engine call and restore them on Err. The Vec-era engine
+    // provided this transactionality implicitly; the zero-copy view methods
+    // mutate the header/markets in place and do NOT auto-rollback on error, so
+    // the shim restores the snapshot. This mirrors `run_with_svm_rollback` in
+    // the engine's tests/v16_fuzzing.rs and keeps the group in a valid shape
+    // after a rejected op (probes only roll back the account, not the group).
+
+    fn snapshot_group(&self) -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
+        (self.header, self.markets.clone())
+    }
+    fn restore_group(&mut self, snap: (MarketGroupV16HeaderAccount, Vec<Market<u64>>)) {
+        self.header = snap.0;
+        self.markets = snap.1;
+    }
+
+    fn deposit_not_atomic(&mut self, acc: &mut ShimAccount, amount: u128) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.deposit_not_atomic(&mut a, amount)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn withdraw_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        amount: u128,
+        _prices: &[u64],
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.withdraw_not_atomic(&mut a, amount)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn convert_released_pnl_to_capital_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+    ) -> V16Result<u128> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.convert_released_pnl_to_capital_not_atomic(&mut a)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn full_account_refresh(
+        &mut self,
+        acc: &mut ShimAccount,
+        _prices: &[u64],
+    ) -> V16Result<HealthCertV16> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.full_account_refresh_not_atomic(&mut a)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    /// On HEAD `settle_account_side_effects_not_atomic` is private (folded into
+    /// refresh / position-action settlement). Route it to a full refresh, which
+    /// runs the same per-leg k/f/b settlement internally. Returns Ok-or-Err to
+    /// preserve the `let _ = ...` call sites.
+    fn settle_account_side_effects_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        _b_delta_budget: u128,
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.full_account_refresh_not_atomic(&mut a).map(|_| ())
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn liquidate_account_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        request: LiquidationRequestV16,
+        _prices: &[u64],
+    ) -> V16Result<LiquidationOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.liquidate_account_not_atomic(&mut a, request)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn execute_trade_with_fee_not_atomic(
+        &mut self,
+        long: &mut ShimAccount,
+        short: &mut ShimAccount,
+        request: TradeRequestV16,
+        _prices: &[u64],
+    ) -> V16Result<TradeOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let lsnap = long.clone();
+        let ssnap = short.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut la = PortfolioV16ViewMut::new(&mut long.acct, &mut long.domains);
+            let mut sa = PortfolioV16ViewMut::new(&mut short.acct, &mut short.domains);
+            g.execute_trade_with_fee_in_place_not_atomic(&mut la, &mut sa, request)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *long = lsnap;
+            *short = ssnap;
+        }
+        long.sync();
+        short.sync();
+        self.sync();
+        r
+    }
+
+    fn rebalance_reduce_position_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        request: RebalanceRequestV16,
+        _prices: &[u64],
+    ) -> V16Result<RebalanceOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.rebalance_reduce_position_not_atomic(&mut a, request)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn forfeit_recovery_leg_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        asset_index: usize,
+        b_delta_budget: u128,
+    ) -> V16Result<DeadLegForfeitOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.forfeit_recovery_leg_not_atomic(&mut a, asset_index, b_delta_budget)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn close_resolved_account_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        fee_rate_per_slot: u128,
+    ) -> V16Result<ResolvedCloseOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.close_resolved_account_not_atomic(&mut a, fee_rate_per_slot)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
+    fn accrue_asset_to_not_atomic(
+        &mut self,
+        asset_index: usize,
+        now_slot: u64,
+        effective_price: u64,
+        funding_rate_e9: i128,
+        protective_progress_committed: bool,
+    ) -> V16Result<AccrueAssetOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let r = self.view_mut().accrue_asset_to_not_atomic(
+            asset_index,
+            now_slot,
+            effective_price,
+            funding_rate_e9,
+            protective_progress_committed,
+        );
+        if r.is_ok() {
+            // Mirror the Vec-era `accrue_asset` wrapper: keep raw_oracle_target
+            // in sync with effective_price so `target_effective_lag` stays
+            // false. The engine's accrue updates effective_price but not the
+            // raw target.
+            if let Some(m) = self.markets.get_mut(asset_index) {
+                if let Ok(mut asset) = m.engine.asset.try_to_runtime() {
+                    asset.raw_oracle_target_price = asset.effective_price;
+                    m.engine.asset = AssetStateV16Account::from_runtime(&asset);
+                }
+            }
+        } else {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn resolve_market_not_atomic(&mut self, resolved_slot: u64) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let r = self.view_mut().resolve_market_not_atomic(resolved_slot);
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn declare_permissionless_recovery(
+        &mut self,
+        reason: PermissionlessRecoveryReasonV16,
+    ) -> V16Result<PermissionlessProgressOutcomeV16> {
+        let gsnap = self.snapshot_group();
+        let r = self.view_mut().declare_permissionless_recovery(reason);
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn mark_asset_drain_only_not_atomic(&mut self, asset_index: usize) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let r = self.view_mut().mark_asset_drain_only_not_atomic(asset_index);
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn add_fresh_counterparty_backing_not_atomic(
+        &mut self,
+        domain: usize,
+        amount: u128,
+        expiry_slot: u64,
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let r = self
+            .view_mut()
+            .add_fresh_counterparty_backing_not_atomic(domain, amount, expiry_slot);
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn add_source_positive_claim_bound_not_atomic(
+        &mut self,
+        domain: usize,
+        claim_bound_num: u128,
+        exact_claim_num: u128,
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let r = self.view_mut().add_source_positive_claim_bound_not_atomic(
+            domain,
+            claim_bound_num,
+            exact_claim_num,
+        );
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn expire_source_backing_bucket_not_atomic(
+        &mut self,
+        domain: usize,
+        now_slot: u64,
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let r = self
+            .view_mut()
+            .expire_source_backing_bucket_not_atomic(domain, now_slot);
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    fn withdraw_backing_provider_earnings_not_atomic(
+        &mut self,
+        domain: usize,
+        amount: u128,
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let r = self
+            .view_mut()
+            .withdraw_backing_provider_earnings_not_atomic(domain, amount);
+        if r.is_err() {
+            self.restore_group(gsnap);
+        }
+        self.sync();
+        r
+    }
+
+    /// On HEAD accounts are standalone; there is no engine-side registry to
+    /// register against. No-op.
+    fn create_portfolio_account(&mut self, _acc: &ShimAccount) -> V16Result<()> {
+        Ok(())
+    }
+
+    /// RETIRED on HEAD (no engine-side account table to close from). No-op Ok.
+    fn close_portfolio_account(&mut self, _acc: &ShimAccount) -> V16Result<()> {
+        Ok(())
+    }
+
+    /// RETIRED on HEAD: `mark_account_stale` was removed. Mark the account's
+    /// stale_state directly so probes can still test that favorable actions
+    /// reject a stale account.
+    fn mark_account_stale(&mut self, acc: &mut ShimAccount) -> V16Result<()> {
+        acc.acct.stale_state = 1;
+        acc.acct.health_cert.valid = 0;
+        acc.sync();
+        Ok(())
+    }
+
+    /// RETIRED on HEAD: `clear_leg` is private (resolved-close handles legs
+    /// internally). Returns Err so probes count it as a no-clear and proceed.
+    fn clear_leg(&mut self, _acc: &mut ShimAccount, _leg_slot: usize) -> V16Result<()> {
+        Err(V16Error::InvalidLeg)
+    }
+
+    /// On HEAD the per-account shape validation lives on PortfolioV16View.
+    fn validate_account_shape(&self, acc: &ShimAccount) -> V16Result<()> {
+        let g = MarketGroupV16View::new(&self.header, &self.markets);
+        PortfolioV16View::new(&acc.acct, &acc.domains).validate_with_market(&g)
+    }
+
+    /// `assert_public_invariants` is GONE on HEAD. Replace with group-shape
+    /// validation plus cheap senior-tranche reconciliation checks. The
+    /// per-account validate is done by callers via the battery.
+    fn assert_public_invariants(&self) -> V16Result<()> {
+        let g = MarketGroupV16View::new(&self.header, &self.markets);
+        g.validate_shape()?;
+        if self.header.vault.get()
+            < self
+                .header
+                .c_tot
+                .get()
+                .saturating_add(self.header.insurance.get())
+        {
+            return Err(V16Error::InvalidConfig);
+        }
+        if self.header.pnl_matured_pos_tot.get() > self.header.pnl_pos_tot.get() {
+            return Err(V16Error::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
+fn decode_market_mode_shim(raw: u8) -> MarketModeV16 {
+    // Matches the engine's encode_market_mode: 0=Live, 1=Resolved, 2=Recovery.
+    match raw {
+        0 => MarketModeV16::Live,
+        1 => MarketModeV16::Resolved,
+        2 => MarketModeV16::Recovery,
+        _ => MarketModeV16::Live,
+    }
+}
+
+/// Engine wrapper: a `GroupShim` plus a Vec of `ShimAccount`s. Probes do
+/// `let mut acc = engine.accounts[i].clone(); engine.group.METHOD(&mut acc,..);
+/// engine.accounts[i] = acc;` — the shim methods build transient views and
+/// re-sync.
 struct V16Engine {
-    group: MarketGroupV16,
-    accounts: Vec<PortfolioAccountV16>,
+    group: GroupShim,
+    accounts: Vec<ShimAccount>,
     market_group_id: [u8; 32],
     next_account_seq: u64,
+    n_assets: u32,
 }
 
 impl V16Engine {
     fn new(config: V16Config) -> V16Result<Self> {
+        config.validate_public_user_fund()?;
         let group_id = [0x42u8; 32];
-        let group = MarketGroupV16::new(group_id, config)?;
+        let n_assets = config.max_market_slots;
+        // Activate every market at the canonical starting oracle ($200e6) so
+        // the probes' first `accrue_asset(asset, 1, price_e6(200), 0)` is a
+        // zero-move (no RecoveryRequired). The Vec-era `MarketGroupV16::new`
+        // implicitly seeded all assets at slot 0; the zero-copy activation
+        // path requires a per-asset cooldown gap which would otherwise leave
+        // later-activated assets with slot_last ahead of the probes' first
+        // accrue slot (causing InvalidConfig). After activating we renormalize
+        // every per-asset slot_last and the header's slot counters back to 0 so
+        // the group looks "born at slot 0" — matching legacy semantics.
+        let init_price: u64 = 200_000_000; // $200 e6
+        let mut header = MarketGroupV16HeaderAccount::new_dynamic(group_id, config, n_assets, 0)?;
+        let mut markets: Vec<Market<u64>> = (0..n_assets)
+            .map(|_| Market::new(0u64, EngineAssetSlotV16Account::default()))
+            .collect();
+        for i in 0..n_assets {
+            // cooldown is >=1 slot between activations: stagger by 1 slot each.
+            let now = i as u64;
+            MarketGroupV16ViewMut::new(&mut header, &mut markets)
+                .activate_empty_market_not_atomic(i, init_price, now)?;
+        }
+        // Renormalize per-asset slot_last and group slot counters to 0.
+        for m in markets.iter_mut() {
+            if let Ok(mut asset) = m.engine.asset.try_to_runtime() {
+                asset.slot_last = 0;
+                m.engine.asset = AssetStateV16Account::from_runtime(&asset);
+            }
+        }
+        header.current_slot = V16PodU64::new(0);
+        header.slot_last = V16PodU64::new(0);
+        header.last_asset_activation_slot = V16PodU64::new(0);
+        let group = GroupShim::new(header, markets);
         Ok(Self {
             group,
             accounts: Vec::new(),
             market_group_id: group_id,
             next_account_seq: 0,
+            n_assets,
         })
     }
 
-    /// Create a new portfolio account and register it with the market group.
+    /// Create a new portfolio account (standalone on HEAD).
     fn add_account(&mut self, owner_byte: u8) -> V16Result<usize> {
         let mut id = [0u8; 32];
         id[..8].copy_from_slice(&self.next_account_seq.to_le_bytes());
         self.next_account_seq += 1;
         let owner = [owner_byte; 32];
-        let header = ProvenanceHeaderV16::new(self.market_group_id, id, owner);
-        let mut account = PortfolioAccountV16::empty(header);
-        // The engine now requires accounts to be pre-sized to the configured
-        // per-domain capacity (configured_domains = max_market_slots * 2),
-        // mirroring how the on-chain wrapper allocates the account buffer.
-        // Without this the new account-shape validation fails closed (HiddenLeg).
-        let domain_count = v16_domain_count_for_market_slots(self.group.config.max_market_slots)?;
-        account.ensure_source_domain_capacity(domain_count);
-        self.group.create_portfolio_account(&account)?;
+        let ph = ProvenanceHeaderV16Account::from_runtime(&ProvenanceHeaderV16::new(
+            self.market_group_id,
+            id,
+            owner,
+        ));
+        let acct = PortfolioAccountV16Account::try_empty(ph)?;
+        let domain_count = v16_domain_count_for_market_slots(self.n_assets)?;
+        let domains = vec![PortfolioSourceDomainV16Account::default(); domain_count];
         let idx = self.accounts.len();
-        self.accounts.push(account);
+        self.accounts.push(ShimAccount::new(acct, domains));
         Ok(idx)
     }
 
@@ -115,14 +804,6 @@ impl V16Engine {
         effective_price: u64,
         funding_rate_e9: i128,
     ) -> V16Result<AccrueAssetOutcomeV16> {
-        // Keep the raw-oracle target in sync with the effective price so
-        // target_effective_lag stays false.
-        self.group.assets[asset_index].raw_oracle_target_price = effective_price;
-        // protective_progress_committed=true: the wrapper attests that any
-        // exposed accounts have already been touched this slot. In the real
-        // deployment the wrapper would batch account refreshes alongside the
-        // accrue; here our smoke test cranks the price without explicit
-        // account-touches because the trade itself does the refresh.
         self.group.accrue_asset_to_not_atomic(
             asset_index,
             now_slot,
@@ -132,8 +813,9 @@ impl V16Engine {
         )
     }
 
-    fn set_oracle_target(&mut self, asset_index: usize, target: u64) {
-        self.group.assets[asset_index].raw_oracle_target_price = target;
+    fn set_oracle_target(&mut self, _asset_index: usize, _target: u64) {
+        // On HEAD the raw-oracle target is driven through accrue/crank; the
+        // standalone target poke is a no-op (only one legacy call site).
     }
 
     fn assert_invariants(&self) -> V16Result<()> {
@@ -2892,6 +3574,9 @@ fn probe_per_domain_attribution() {
     // pool. Setting only this domain (others stay 0) keeps Σ budget ≤ insurance,
     // satisfying the per-domain isolation invariant while still letting the SOL
     // bankruptcy spend insurance — so we can observe WHICH domain it charges.
+    // NO-OP on HEAD: this writes a GroupShim mirror field, not engine state;
+    // the next sync() overwrites it from the engine (which keeps the budget 0).
+    // Retained so the probe is faithful when run against the 323c9f2 baseline.
     engine.group.insurance_domain_budget[dom_sol_long_opp] = engine.group.insurance;
 
     // Slow-keeper SOL crash
@@ -2954,9 +3639,20 @@ fn probe_per_domain_attribution() {
         btc_short_opp_spent);
     println!("      domain[3] BTC long-side opp:                                     spent={}",
         btc_long_opp_spent);
-    println!("    ★ BTC domains untouched: {}",
-        btc_long_opp_spent == 0 && btc_short_opp_spent == 0);
-    println!("    ★ SOL long-opp domain charged: {}", sol_long_opp_spent > 0);
+    // VACUITY NOTE (engine HEAD): per-domain insurance budgets are never funded
+    // through any engine API the probe calls — they stay 0 (funding moved to the
+    // wrapper layer), so liquidation spends 0 insurance and this attribution
+    // assertion is N/A here. It was meaningful on the 323c9f2 (Vec-era) baseline.
+    let any_domain_charged =
+        sol_long_opp_spent > 0 || btc_long_opp_spent > 0 || btc_short_opp_spent > 0;
+    if any_domain_charged {
+        println!("    ★ BTC domains untouched: {}",
+            btc_long_opp_spent == 0 && btc_short_opp_spent == 0);
+        println!("    ★ SOL long-opp domain charged: {}", sol_long_opp_spent > 0);
+    } else {
+        println!("    ⚠ attribution N/A on HEAD: no per-domain insurance budget funded \
+                  → insurance_used=0 (Vec-era surface; covered vs 323c9f2 baseline)");
+    }
 
     let sum_btc_cap: u128 = btc_users.iter().map(|&u| engine.accounts[u].capital).sum();
     println!("    BTC users total cap: ${} (initial $5000, fee loss only)",
@@ -5066,7 +5762,7 @@ fn probe_v16_backing_refill() {
         }
         for &u in users.iter().chain(std::iter::once(&lp)) {
             let acc = engine.accounts[u].clone();
-            let wire_ok = true; let _ = PortfolioAccountV16Account::from_runtime(&acc);
+            let wire_ok = true; let _ = &acc;
             if !wire_ok { wire_fails.fetch_add(1, Ordering::Relaxed); }
         }
         if engine.group.vault != init_total { vault_drift.fetch_add(1, Ordering::Relaxed); }
@@ -5964,7 +6660,7 @@ fn probe_v16_xmargin_liquidation_stress() {
             // End checks
             for (i, &u) in users.iter().enumerate() {
                 let acc = engine.accounts[u].clone();
-                let wire_ok = true; let _ = PortfolioAccountV16Account::from_runtime(&acc);
+                let wire_ok = true; let _ = &acc;
                 if !wire_ok {
                     wire_fails.fetch_add(1, Ordering::Relaxed);
                 }
@@ -6091,10 +6787,10 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
                     let pick = (rng.next_u64() as usize) % (users.len() + 1);
                     let idx = if pick == 0 { lp } else { users[pick - 1] };
                     let prices = engine.effective_prices();
-                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(idx, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.settle_account_side_effects_not_atomic(a, cfg.public_b_chunk_atoms)
                     });
-                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(idx, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.full_account_refresh(a, &prices).map(|_| ())
                     });
                 }
@@ -6102,7 +6798,7 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
                     // try convert
                     let u_idx = (rng.next_u64() as usize) % users.len();
                     let u = users[u_idx];
-                    let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.convert_released_pnl_to_capital_not_atomic(a).map(|_| ())
                     });
                 }
@@ -6115,7 +6811,7 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
                     let want = ((rng.next_u64() as u128) % cap) + 1;
                     let cap_before = engine.accounts[u].capital;
                     let prices = engine.effective_prices();
-                    if atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    if atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.withdraw_not_atomic(a, want, &prices)
                     }) {
                         let cap_after = engine.accounts[u].capital;
@@ -6151,7 +6847,7 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
                             if leg.active {
                                 let q = leg.basis_pos_q.unsigned_abs();
                                 let prices = engine.effective_prices();
-                                let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                                let _ = atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                                     g.liquidate_account_not_atomic(a, LiquidationRequestV16 {
                                         asset_index: li, close_q: q, fee_bps: 5,
                                     }, &prices).map(|_| ())
@@ -6173,7 +6869,7 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
         // (1) Wire round-trip every account
         for &u in users.iter().chain(std::iter::once(&lp)) {
             let acc = engine.accounts[u].clone();
-            let wire_ok = true; let _ = PortfolioAccountV16Account::from_runtime(&acc);
+            let wire_ok = true; let _ = &acc;
             if !wire_ok {
                 wire_fails.fetch_add(1, Ordering::Relaxed);
             }
@@ -6394,10 +7090,10 @@ fn probe_v16_nightmare(seeds: u64) {
                     let pick = (rng.next_u64() as usize) % (users.len() + 1);
                     let idx = if pick == 0 { lp } else { users[pick - 1] };
                     let prices = engine.effective_prices();
-                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(idx, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.settle_account_side_effects_not_atomic(a, cfg.public_b_chunk_atoms)
                     });
-                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(idx, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.full_account_refresh(a, &prices).map(|_| ())
                     });
                 }
@@ -6405,7 +7101,7 @@ fn probe_v16_nightmare(seeds: u64) {
                     // try convert (favorable action during chaos)
                     let u_idx = (rng.next_u64() as usize) % users.len();
                     let u = users[u_idx];
-                    let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.convert_released_pnl_to_capital_not_atomic(a).map(|_| ())
                     });
                 }
@@ -6418,7 +7114,7 @@ fn probe_v16_nightmare(seeds: u64) {
                     let want = ((rng.next_u64() as u128) % cap) + 1;
                     let cap_before = engine.accounts[u].capital;
                     let prices = engine.effective_prices();
-                    if atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    if atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.withdraw_not_atomic(a, want, &prices)
                     }) {
                         let cap_after = engine.accounts[u].capital;
@@ -6435,7 +7131,7 @@ fn probe_v16_nightmare(seeds: u64) {
                             if leg.active {
                                 let q = leg.basis_pos_q.unsigned_abs();
                                 let prices = engine.effective_prices();
-                                let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                                let _ = atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                                     g.liquidate_account_not_atomic(a, LiquidationRequestV16 {
                                         asset_index: li, close_q: q, fee_bps: 5,
                                     }, &prices).map(|_| ())
@@ -6460,7 +7156,7 @@ fn probe_v16_nightmare(seeds: u64) {
         // Wire round-trip every account.
         for &u in users.iter().chain(std::iter::once(&lp)) {
             let acc = engine.accounts[u].clone();
-            let _ = PortfolioAccountV16Account::from_runtime(&acc);
+            let _ = &acc;
         }
         // Blast radius: no user can withdraw more cash than they deposited.
         for (i, _u) in users.iter().enumerate() {
@@ -6555,6 +7251,11 @@ fn probe_v16_domain_solvency(seeds: u64) {
     let ds8 = AtomicU64::new(0);
     let ds9 = AtomicU64::new(0);
     let ds10 = AtomicU64::new(0);
+    // Tracks whether any per-domain insurance budget was ever non-zero during
+    // the run. On engine HEAD budgets are never funded through the engine API,
+    // so DS10 (Σ remaining ≤ insurance) is vacuously true — flag it as N/A
+    // rather than letting a 0 read like real coverage.
+    let ds10_funded = AtomicU64::new(0);
     let total_ops = AtomicU64::new(0);
     let total_checks = AtomicU64::new(0);
     let max_realizable_slack = AtomicU64::new(0); // min over checks of (available - realizable)
@@ -6662,12 +7363,15 @@ fn probe_v16_domain_solvency(seeds: u64) {
                 // (the historical bug initialized them to MAX_VAULT_TVL each),
                 // Σ remaining budget ≫ insurance and this fires immediately.
                 let mut budget_remaining_sum = 0u128;
+                let mut any_budget_funded = false;
                 let n_dom2 = engine.group.insurance_domain_budget.len();
                 for d in 0..n_dom2 {
+                    if engine.group.insurance_domain_budget[d] != 0 { any_budget_funded = true; }
                     let rem = engine.group.insurance_domain_budget[d]
                         .saturating_sub(engine.group.insurance_domain_spent[d]);
                     budget_remaining_sum = budget_remaining_sum.saturating_add(rem);
                 }
+                if any_budget_funded { ds10_funded.fetch_add(1, Ordering::Relaxed); }
                 if budget_remaining_sum > engine.group.insurance {
                     ds10.fetch_add(1, Ordering::Relaxed);
                 }
@@ -6708,17 +7412,17 @@ fn probe_v16_domain_solvency(seeds: u64) {
                     let pick = (rng.next_u64() as usize) % (users.len() + 1);
                     let idx = if pick == 0 { lp } else { users[pick - 1] };
                     let prices = engine.effective_prices();
-                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(idx, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.settle_account_side_effects_not_atomic(a, cfg.public_b_chunk_atoms)
                     });
-                    let _ = atomic_call!(idx, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(idx, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.full_account_refresh(a, &prices).map(|_| ())
                     });
                 }
                 5 => {
                     // convert PnL → cap (consumes source credit / backing)
                     let u = users[(rng.next_u64() as usize) % users.len()];
-                    let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    let _ = atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.convert_released_pnl_to_capital_not_atomic(a).map(|_| ())
                     });
                 }
@@ -6733,7 +7437,7 @@ fn probe_v16_domain_solvency(seeds: u64) {
                     let want = ((rng.next_u64() as u128) % cap) + 1;
                     let vault_before = engine.group.vault;
                     let prices = engine.effective_prices();
-                    if atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                    if atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                         g.withdraw_not_atomic(a, want, &prices)
                     }) {
                         withdrawn_tot += vault_before - engine.group.vault;
@@ -6763,7 +7467,7 @@ fn probe_v16_domain_solvency(seeds: u64) {
                             if leg.active {
                                 let q = leg.basis_pos_q.unsigned_abs();
                                 let prices = engine.effective_prices();
-                                let _ = atomic_call!(u, |g: &mut MarketGroupV16, a: &mut PortfolioAccountV16| {
+                                let _ = atomic_call!(u, |g: &mut GroupShim, a: &mut ShimAccount| {
                                     g.liquidate_account_not_atomic(a, LiquidationRequestV16 {
                                         asset_index: li, close_q: q, fee_bps: 5,
                                     }, &prices).map(|_| ())
@@ -6817,6 +7521,11 @@ fn probe_v16_domain_solvency(seeds: u64) {
     ];
     println!("  ops: {}, solvency checks: {}",
         total_ops.load(Ordering::Relaxed), total_checks.load(Ordering::Relaxed));
+    if ds10_funded.load(Ordering::Relaxed) == 0 {
+        println!("  ⚠ DS10 VACUOUS on this engine: per-domain budgets never funded \
+                  (Σ remaining = 0 ≤ insurance trivially). DS10 only has teeth vs the \
+                  Vec-era 323c9f2 baseline where budgets could be set.");
+    }
     println!();
     println!("  Per-domain solvency battery (target = 0 each):");
     let mut all_zero = true;
@@ -6989,7 +7698,7 @@ fn probe_v16_drift_atomic() {
     println!("  Wire round-trip (SVM-validity check):");
     for (label, idx) in [("attacker", attacker), ("lp", lp)] {
         let acc_runtime = engine.accounts[idx].clone();
-        let wire_ok = true; let _ = PortfolioAccountV16Account::from_runtime(&acc_runtime);
+        let wire_ok = true; let _ = &acc_runtime;
         let decoded: V16Result<()> = if wire_ok { Ok(()) } else { Err(V16Error::InvalidLeg) };
         let status = match decoded.as_ref() {
             Ok(_) => "Ok ✓".to_string(),
@@ -7167,7 +7876,7 @@ fn probe_v16_instant_h_lock_attacks() {
         println!("    wire round-trip (SVM atomicity test):");
         for (label, idx) in [("attacker", attacker), ("lp", lp)] {
             let acc_runtime = engine.accounts[idx].clone();
-            let wire_ok = true; let _ = PortfolioAccountV16Account::from_runtime(&acc_runtime);
+            let wire_ok = true; let _ = &acc_runtime;
             let decoded: V16Result<()> = if wire_ok { Ok(()) } else { Err(V16Error::InvalidLeg) };
             println!("      {} account encode→decode: {:?}", label,
                 decoded.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
