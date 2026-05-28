@@ -6689,6 +6689,16 @@ fn probe_v16_xmargin_liquidation_stress() {
         println!("    wire round-trip failures:              {}", wire_fails.load(Ordering::Relaxed));
         println!("    per-domain insurance budget overflows: {}", domain_overflows.load(Ordering::Relaxed));
         println!("    max user net cash extraction:          ${}", max_user_excess.load(Ordering::Relaxed) / 1_000_000);
+        // COVERAGE FLOOR: this probe's whole purpose is the cross-margin
+        // liquidation path. If liquidations stop firing (e.g. leverage/clamp
+        // drift makes accounts never go underwater), "no extraction" is
+        // vacuous — hard-fail so the regression is visible.
+        let liqs = total_liquidations.load(Ordering::Relaxed);
+        if liqs < 50 {
+            println!("    ✗ COVERAGE FAIL: only {} liquidations (floor 50) — liquidation path not exercised", liqs);
+        } else {
+            println!("    coverage ok: {} liquidations exercised (floor 50)", liqs);
+        }
     }
 }
 
@@ -6720,6 +6730,7 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
     let total_ops = AtomicU64::new(0);
     let total_rollbacks = AtomicU64::new(0);
     let any_user_excess = AtomicU64::new(0);
+    let committed_trades = AtomicU64::new(0);
 
     (0..seeds).into_par_iter().for_each(|seed| {
         let mut rng = Rng::new(seed.wrapping_mul(0xC0FFEE_BABE));
@@ -6783,11 +6794,12 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
                     let user_long = rng.next_u64() % 2 == 0;
                     let notional = 200u128 + (rng.next_u64() % 1500) as u128;
                     let size_q = usdc(notional) * POS_SCALE / engine.group.assets[a].effective_price as u128;
-                    let _ = if user_long {
+                    let tr = if user_long {
                         engine.trade(u, lp, a, size_q, engine.group.assets[a].effective_price, 1)
                     } else {
                         engine.trade(lp, u, a, size_q, engine.group.assets[a].effective_price, 1)
                     };
+                    if tr.is_ok() { committed_trades.fetch_add(1, Ordering::Relaxed); }
                 }
                 2 | 3 => {
                     // settle+refresh some account (LP or user)
@@ -6916,6 +6928,12 @@ fn probe_v16_atomic_fuzz(seeds: u64) {
     println!("  Stats:");
     println!("    total ops across all seeds: {}", total_ops.load(Ordering::Relaxed));
     println!("    total rollbacks:            {}", total_rollbacks.load(Ordering::Relaxed));
+    let ct = committed_trades.load(Ordering::Relaxed);
+    if ct < 1000 {
+        println!("    ✗ COVERAGE FAIL: only {} trades committed (floor 1000) — fuzz is vacuous", ct);
+    } else {
+        println!("    coverage ok: {} trades committed (floor 1000)", ct);
+    }
     println!();
     println!("  Safety invariants (target=0):");
     println!("    engine assert_public_invariants fails: {}", invariant_fails.load(Ordering::Relaxed));
@@ -6973,6 +6991,7 @@ fn probe_v16_nightmare(seeds: u64) {
     let total_rollbacks = AtomicU64::new(0);
     let recovery_entries = AtomicU64::new(0);
     let max_slot_gap = AtomicU64::new(0);
+    let committed_trades = AtomicU64::new(0);
 
     (0..seeds).into_par_iter().for_each(|seed| {
         let mut rng = Rng::new(seed.wrapping_mul(0xDEAD_C0DE_BEEF));
@@ -7071,11 +7090,12 @@ fn probe_v16_nightmare(seeds: u64) {
                     let notional = usdc(rng.range_u64(5_000, 100_000) as u128);
                     let p = engine.group.assets[a].effective_price;
                     let size_q = notional * POS_SCALE / p as u128;
-                    let _ = if long {
+                    let tr = if long {
                         engine.trade(whale, lp, a, size_q, p, 1)
                     } else {
                         engine.trade(lp, whale, a, size_q, p, 1)
                     };
+                    if tr.is_ok() { committed_trades.fetch_add(1, Ordering::Relaxed); }
                 }
                 3 => {
                     // mid user opens
@@ -7086,11 +7106,12 @@ fn probe_v16_nightmare(seeds: u64) {
                     let notional = usdc(rng.range_u64(200, 2_000) as u128);
                     let p = engine.group.assets[a].effective_price;
                     let size_q = notional * POS_SCALE / p as u128;
-                    let _ = if long {
+                    let tr = if long {
                         engine.trade(u, lp, a, size_q, p, 1)
                     } else {
                         engine.trade(lp, u, a, size_q, p, 1)
                     };
+                    if tr.is_ok() { committed_trades.fetch_add(1, Ordering::Relaxed); }
                 }
                 4 | 5 => {
                     // settle + refresh a random account under chaos
@@ -7196,6 +7217,12 @@ fn probe_v16_nightmare(seeds: u64) {
     println!("    total rollbacks:  {}", total_rollbacks.load(Ordering::Relaxed));
     println!("    seeds → Recovery: {}", recovery_entries.load(Ordering::Relaxed));
     println!("    max slot gap (dropped-slot congestion): {}", max_slot_gap.load(Ordering::Relaxed));
+    let ct = committed_trades.load(Ordering::Relaxed);
+    if ct < 1000 {
+        println!("    ✗ COVERAGE FAIL: only {} trades committed (floor 1000) — nightmare is vacuous", ct);
+    } else {
+        println!("    coverage ok: {} trades committed (floor 1000)", ct);
+    }
     println!();
     println!("  Safety battery (target = 0):");
     println!("    assert_public_invariants fails: {}", invariant_fails.load(Ordering::Relaxed));
@@ -7258,6 +7285,7 @@ fn probe_v16_domain_solvency(seeds: u64) {
     let ds8 = AtomicU64::new(0);
     let ds9 = AtomicU64::new(0);
     let ds10 = AtomicU64::new(0);
+    let committed_trades = AtomicU64::new(0);
     // Tracks whether any per-domain insurance budget was ever non-zero during
     // the run. On engine HEAD budgets are never funded through the engine API,
     // so DS10 (Σ remaining ≤ insurance) is vacuously true — flag it as N/A
@@ -7411,8 +7439,9 @@ fn probe_v16_domain_solvency(seeds: u64) {
                     let notional = usdc(rng.range_u64(200, 3_000) as u128);
                     let p = engine.group.assets[a].effective_price;
                     let size_q = notional * POS_SCALE / p as u128;
-                    let _ = if long { engine.trade(u, lp, a, size_q, p, 1) }
+                    let tr = if long { engine.trade(u, lp, a, size_q, p, 1) }
                             else { engine.trade(lp, u, a, size_q, p, 1) };
+                    if tr.is_ok() { committed_trades.fetch_add(1, Ordering::Relaxed); }
                 }
                 3 | 4 => {
                     // settle + refresh — materializes / consumes backing
@@ -7540,9 +7569,19 @@ fn probe_v16_domain_solvency(seeds: u64) {
         println!("    {:<54} {}", name, n);
         if *n != 0 { all_zero = false; }
     }
+    // COVERAGE FLOOR: the solvency checks are only meaningful if trades actually
+    // built source claims/backing. Hard-fail if the fuzz committed ~no trades.
+    let ct = committed_trades.load(Ordering::Relaxed);
+    let coverage_ok = ct >= 1000;
+    if !coverage_ok {
+        println!("    ✗ COVERAGE FAIL: only {} trades committed (floor 1000) — checks vacuous", ct);
+    } else {
+        println!("    coverage ok: {} trades committed (floor 1000)", ct);
+    }
     println!();
-    println!("  RESULT: {}  {}", all_zero,
-        if all_zero { "✓ no domain pays out more than users+insurance+backing accounted to it" }
+    println!("  RESULT: {}  {}", all_zero && coverage_ok,
+        if all_zero && coverage_ok { "✓ no domain pays out more than users+insurance+backing accounted to it" }
+        else if !coverage_ok { "✗ FAIL — coverage floor not met" }
         else { "✗ FAIL — per-domain over-withdrawal detected" });
 }
 
@@ -9086,6 +9125,14 @@ fn probe_v16_backing_fuzz(seeds: u64) {
     let me = max_excess_withdrawn.load(Ordering::Relaxed);
     if me > 0 {
         println!("    !! max single excess withdraw: ${}", me / 1_000_000);
+    }
+    // COVERAGE FLOOR: a 200k-op fuzz that commits ~no trades would report
+    // "0 invariant fails" vacuously. Hard-fail if the engine wasn't exercised.
+    let topen = trades_open.load(Ordering::Relaxed);
+    if topen < 1000 {
+        println!("    ✗ COVERAGE FAIL: only {} trades committed (floor 1000) — probe is vacuous", topen);
+    } else {
+        println!("    coverage ok: {} trades committed (floor 1000)", topen);
     }
 }
 
