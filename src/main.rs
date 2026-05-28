@@ -6578,12 +6578,15 @@ fn probe_v16_xmargin_liquidation_stress() {
             for a in 0..cfg.max_portfolio_assets as usize {
                 let _ = engine.accrue_asset(a, 1, oracle, 0);
             }
-            // Each user opens multiple legs across multiple assets (cross-margin)
+            // Each user opens multiple legs across multiple assets (cross-margin).
+            // Leverage is meaningful ($3k-$12k notional on $1k deposit = 3-12x) so
+            // a sustained adverse move actually pushes accounts into liq deficit —
+            // otherwise this "liquidation" fuzz never reaches the liquidation path.
             for (i, &u) in users.iter().enumerate() {
                 for a in 0..cfg.max_portfolio_assets as usize {
                     if rng.next_u64() % 2 == 0 {
                         let user_long = (i + a) % 2 == 0;
-                        let notional = 500u128 + (rng.next_u64() % 2000) as u128;
+                        let notional = 3_000u128 + (rng.next_u64() % 9_000) as u128;
                         let p = engine.group.assets[a].effective_price;
                         let sq = usdc(notional) * POS_SCALE / p as u128;
                         let _ = if user_long {
@@ -6595,12 +6598,16 @@ fn probe_v16_xmargin_liquidation_stress() {
                 }
             }
             let mut slot = 2u64;
+            // Per-seed directional trend (-1/0/+1): a sustained drift on top of
+            // the random walk so leveraged positions actually erode past
+            // maintenance and trigger liquidations (not just mean-revert).
+            let drift_bias: i64 = (seed % 3) as i64 - 1;
             for _step in 0..100u64 {
-                // Random price moves
+                // Random walk + directional trend
                 for a in 0..cfg.max_portfolio_assets as usize {
-                    let mv = (rng.next_u64() % 90) as i64 - 45;
+                    let mv = (rng.next_u64() % 90) as i64 - 45 + drift_bias * 35;
                     let cur = engine.group.assets[a].effective_price;
-                    let target = ((cur as i128) + (cur as i128 * mv as i128 / 10_000)) as u64;
+                    let target = ((cur as i128) + (cur as i128 * mv as i128 / 10_000)).max(1) as u64;
                     let _ = engine.accrue_asset(a, slot, clamp_oracle(target.max(1), cur, max_move, 1), 0);
                 }
                 let prices = engine.effective_prices();
