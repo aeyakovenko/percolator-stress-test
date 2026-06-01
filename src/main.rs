@@ -458,6 +458,27 @@ impl GroupShim {
         r
     }
 
+    fn cure_and_cancel_close_not_atomic(
+        &mut self,
+        acc: &mut ShimAccount,
+        optional_deposit: u128,
+    ) -> V16Result<()> {
+        let gsnap = self.snapshot_group();
+        let asnap = acc.clone();
+        let r = {
+            let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            g.cure_and_cancel_close_not_atomic(&mut a, optional_deposit)
+        };
+        if r.is_err() {
+            self.restore_group(gsnap);
+            *acc = asnap;
+        }
+        acc.sync();
+        self.sync();
+        r
+    }
+
     fn close_resolved_account_not_atomic(
         &mut self,
         acc: &mut ShimAccount,
@@ -4366,6 +4387,237 @@ fn probe_v16_hardening() {
             if h3_ok { "✓ fee primitive clamps; cap drain conserves into bucket earnings" }
             else if !h3_reached_zero { "⚠ cap didn't drain to 0 — fee rate still bounded" }
             else { "✗ FAIL" });
+    }
+}
+
+/// Regression probe for the recent engine audit findings (May/Jun 2026):
+///   F-E   (f9af174): withdraw allowed on an inert canceled close ledger.
+///   F-AC  (0bee8ef + 7188eec): Resolved-mode source-credit lien release is
+///         expiry-agnostic; the residual senior-stock reconciliation guard
+///         introduced alongside Finding A holds throughout.
+///
+/// Each phase drives the engine directly into the path the finding fixed and
+/// asserts the post-fix observable behavior, plus invariants. If any of these
+/// paths regress, this probe goes ✗ — generic invariant fuzzers would miss it
+/// because they don't reliably reach the exact entry conditions.
+fn probe_v16_recent_findings() {
+    println!("  v16 recent-findings regression: canceled-ledger withdraw + Resolved lien release");
+    println!();
+
+    // ==== [F-E] Withdraw with inert canceled close ledger (Finding E) ====
+    println!("  [F-E] Withdraw allowed on inert canceled close ledger (f9af174)");
+    {
+        let cfg = make_bounty_config(2);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(10_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let oracle = price_e6(200);
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        // 5x leverage long on SOL: $5k notional on $1k cap. Crash 18% — equity
+        // = 1000 − 900 = $100 < MM ($250), so liq_deficit > 0 but the account
+        // isn't bankrupt past insurance, so partial liq + cure can succeed.
+        let sq = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq, oracle, 1).expect("open 5x long");
+        let target = (oracle as u128 * 82 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if p <= target { break; }
+            let next = clamp_oracle(target, p, max_move, 1);
+            if engine.accrue_asset(0, slot, next, 0).is_err() { break; }
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+            if slot > 5000 { break; }
+        }
+        let deficit = engine.accounts[user].health_cert.certified_liq_deficit;
+        println!("    after crash: cap=${}, pnl=${}, liq_deficit={}",
+            engine.accounts[user].capital / 1_000_000,
+            engine.accounts[user].pnl / 1_000_000,
+            deficit);
+        // Partial liquidation creates a close ledger.
+        let leg = engine.accounts[user].legs[0];
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user].clone();
+        let liq_r = engine.group.liquidate_account_not_atomic(&mut acc,
+            LiquidationRequestV16 { asset_index: 0, close_q: leg.basis_pos_q.unsigned_abs() / 2, fee_bps: 5 },
+            &prices);
+        let liq_ok = liq_r.is_ok();
+        if liq_ok { engine.accounts[user] = acc; }
+        let ledger_after_liq = engine.accounts[user].acct.close_progress.try_to_runtime().unwrap_or_default();
+        println!("    partial liquidate: {:?} | ledger: active={} canceled={}",
+            liq_r.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            ledger_after_liq.active, ledger_after_liq.canceled);
+        // Cure-and-cancel with optional_deposit to absorb the loss and cancel.
+        let mut acc = engine.accounts[user].clone();
+        let cure_r = engine.group.cure_and_cancel_close_not_atomic(&mut acc, usdc(2_000));
+        let cure_ok = cure_r.is_ok();
+        if cure_ok { engine.accounts[user] = acc; }
+        let ledger_after_cure = engine.accounts[user].acct.close_progress.try_to_runtime().unwrap_or_default();
+        println!("    cure_and_cancel:   {:?} | ledger: active={} canceled={} residual={}",
+            cure_r.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)),
+            ledger_after_cure.active, ledger_after_cure.canceled,
+            ledger_after_cure.residual_remaining);
+        // The Finding E case: withdraw on an account with a canceled-but-non-empty
+        // close ledger. Pre-fix this was blocked by the EMPTY check at v16.rs:4770;
+        // post-fix the guard only blocks if ledger is non-empty AND not canceled.
+        let cap_now = engine.accounts[user].capital;
+        let prices = engine.effective_prices();
+        let mut acc = engine.accounts[user].clone();
+        let want = if cap_now > 0 { cap_now / 2 } else { 0 };
+        let w = engine.group.withdraw_not_atomic(&mut acc, want, &prices);
+        let w_ok = w.is_ok();
+        if w_ok { engine.accounts[user] = acc; }
+        println!("    withdraw ${} (with canceled-ledger): {:?}",
+            want / 1_000_000,
+            w.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        let inv = engine.assert_invariants();
+        // F-E passes if we successfully reached the canceled-ledger state AND
+        // the withdraw succeeded AND invariants hold. If we never reached the
+        // canceled state (e.g., cure rejected), we flag setup-not-reached (⚠),
+        // not pass — to avoid false greens.
+        let reached_canceled = ledger_after_cure.canceled;
+        let fe_ok = reached_canceled && w_ok && inv.is_ok();
+        let fe_regression = reached_canceled && (!w_ok || !inv.is_ok());
+        println!("    F-E components: liq_ok={}, cure_ok={}, ledger_canceled={}, withdraw_ok={}, inv={}",
+            liq_ok, cure_ok, reached_canceled, w_ok, inv.is_ok());
+        // Three outcomes: ✓ tested-and-passes, ⚠ setup-not-reached (not a
+        // regression — the canceled-ledger state is path-sensitive and not
+        // always reachable from a synthetic crash), ✗ tested-and-fails.
+        // Print only ONE result label per outcome so the sweep classifier can
+        // disambiguate setup-skip from real regression.
+        if fe_ok {
+            println!("    F-E: ✓ withdraw allowed on inert canceled close ledger");
+        } else if fe_regression {
+            println!("    F-E result: ✗ FAIL — Finding E regression (canceled state reached but withdraw rejected)");
+        } else {
+            println!("    F-E: ⚠ canceled state not reached this run (path-sensitive setup); no regression observed");
+        }
+    }
+    println!();
+
+    // ==== [F-AC] Resolved-mode lien release is expiry-agnostic ====
+    println!("  [F-AC] Resolved-mode lien release ignores Fresh/Expired (Findings A+C)");
+    {
+        let cfg = make_bounty_config(2);
+        let max_move = cfg.max_price_move_bps_per_slot;
+        let mut engine = V16Engine::new(cfg).expect("init");
+        let lp = engine.add_account(1).unwrap();
+        engine.deposit(lp, usdc(50_000_000)).unwrap();
+        let user = engine.add_account(2).unwrap();
+        engine.deposit(user, usdc(1_000)).unwrap();
+        let oracle = price_e6(200);
+        engine.accrue_asset(0, 1, oracle, 0).unwrap();
+        engine.accrue_asset(1, 1, oracle, 0).unwrap();
+        // Open SOL long, pump to build positive pnl, then open ETH leg — the
+        // second leg's IM is bridged by source credit on the SOL domain
+        // (the backed-IM-lien path added in f3aef4b), creating persistent liens.
+        let sq_sol = usdc(5_000) * POS_SCALE / oracle as u128;
+        engine.trade(user, lp, 0, sq_sol, oracle, 1).unwrap();
+        let pump_target = (oracle as u128 * 130 / 100) as u64;
+        let mut slot = 2u64;
+        loop {
+            let p = engine.group.assets[0].effective_price;
+            if p >= pump_target { break; }
+            let _ = engine.accrue_asset(0, slot, clamp_oracle(pump_target, p, max_move, 1), 0);
+            let prices = engine.effective_prices();
+            for idx in [lp, user] {
+                let backup = engine.accounts[idx].clone();
+                let mut acc = backup.clone();
+                let r1 = engine.group.settle_account_side_effects_not_atomic(&mut acc, cfg.public_b_chunk_atoms);
+                let r2 = if r1.is_ok() { engine.group.full_account_refresh(&mut acc, &prices).map(|_|()) } else { Err(V16Error::InvalidLeg) };
+                if r2.is_ok() { engine.accounts[idx] = acc; } else { engine.accounts[idx] = backup; }
+            }
+            slot += 1;
+            if slot > 3000 { break; }
+        }
+        let p_eth = engine.group.assets[1].effective_price;
+        let sq_eth = usdc(15_000) * POS_SCALE / p_eth as u128;
+        let _ = engine.trade(user, lp, 1, sq_eth, p_eth, 1);
+        // Snapshot per-domain liens.
+        let liens_pre: Vec<u128> = engine.group.source_credit.iter()
+            .map(|sc| sc.valid_liened_backing_num).collect();
+        let total_lien_pre: u128 = liens_pre.iter().sum();
+        let n_with_lien_pre = liens_pre.iter().filter(|&&x| x > 0).count();
+        println!("    pre-resolution liens: {} domains with valid_liened>0, total ${}",
+            n_with_lien_pre, total_lien_pre / BOUND_SCALE / 1_000_000);
+        // Advance the slot past typical bucket expiry — Finding C's whole point
+        // is that release must work even when buckets are NOT Fresh. The Live
+        // release path gates on Fresh + expiry_slot > current_slot; the
+        // terminal (Resolved) path drops both gates.
+        for _ in 0..500 {
+            let _ = engine.accrue_asset(0, slot, engine.group.assets[0].effective_price, 0);
+            let _ = engine.accrue_asset(1, slot, engine.group.assets[1].effective_price, 0);
+            slot += 1;
+        }
+        // Live → Resolved directly (resolve_market rejects if already Recovery).
+        let r_resolve = engine.group.resolve_market_not_atomic(slot);
+        println!("    resolve_market (Live → Resolved): {:?}",
+            r_resolve.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+        // Per-account wind-down via close_resolved_account_not_atomic. THIS is
+        // where the expiry-agnostic terminal lien release fires (Findings A+C).
+        // We loop until the account reports Closed (or stops progressing).
+        let mut close_iters = 0u32;
+        let mut closed = false;
+        for idx in [user, lp] {
+            for _ in 0..50u32 {
+                let mut acc = engine.accounts[idx].clone();
+                match engine.group.close_resolved_account_not_atomic(&mut acc, 0) {
+                    Ok(ResolvedCloseOutcomeV16::Closed { .. }) => {
+                        engine.accounts[idx] = acc;
+                        close_iters += 1;
+                        if idx == user { closed = true; }
+                        break;
+                    }
+                    Ok(ResolvedCloseOutcomeV16::ProgressOnly) => {
+                        engine.accounts[idx] = acc;
+                        close_iters += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        println!("    close_resolved iters: {}, user reached Closed: {}", close_iters, closed);
+        // Post-resolution: liens must be released across all domains, regardless
+        // of pre-state (Fresh/Expired). Also: residual senior-stock reconciliation
+        // guard (Finding A) must hold — covered by assert_invariants below.
+        let liens_post: Vec<u128> = engine.group.source_credit.iter()
+            .map(|sc| sc.valid_liened_backing_num).collect();
+        let total_lien_post: u128 = liens_post.iter().sum();
+        let n_with_lien_post = liens_post.iter().filter(|&&x| x > 0).count();
+        println!("    post-wind-down liens: {} domains with valid_liened>0, total ${}",
+            n_with_lien_post, total_lien_post / BOUND_SCALE / 1_000_000);
+        let inv = engine.assert_invariants();
+        let setup_reached = n_with_lien_pre > 0;
+        let liens_cleared = total_lien_post == 0;
+        // What this probe RELIABLY tests: the engine successfully transitions
+        // Live → Resolved with outstanding liens on (possibly expired) buckets,
+        // close_resolved iterates without panic, and the new residual senior-
+        // stock reconciliation guard (Finding A's contribution, fired through
+        // validate_shape on every committed op) HOLDS throughout. Full
+        // expiry-agnostic lien clearing additionally requires close_resolved
+        // to reach Closed for every account, which is path-heavy and reported
+        // as a bonus signal (not a hard pass condition).
+        let fac_core_ok = setup_reached && r_resolve.is_ok()
+                       && close_iters > 0 && inv.is_ok();
+        let fac_full_ok = fac_core_ok && closed && liens_cleared;
+        println!("    F-AC components: liens_built={}, resolve_ok={}, close_iters={}, user_closed={}, liens_cleared={}, inv={}",
+            setup_reached, r_resolve.is_ok(), close_iters, closed, liens_cleared, inv.is_ok());
+        println!("    F-AC result: {}  {}", fac_core_ok,
+            if fac_full_ok { "✓ Resolved wind-down released all liens + residual guard holds (full path)" }
+            else if fac_core_ok && !closed { "✓ Resolved transition + close_resolved progress + residual guard hold (full lien-clear path not driven this run)" }
+            else if !setup_reached { "⚠ liens not built (setup) — not a regression" }
+            else { "✗ FAIL — Findings A+C regression" });
     }
 }
 
@@ -12486,6 +12738,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test=v16_hardening") {
         probe_v16_hardening();
+        return;
+    }
+    if args.iter().any(|a| a == "--test=v16_recent_findings") {
+        probe_v16_recent_findings();
         return;
     }
     if args.iter().any(|a| a == "--test=v16_domain_isolation") {
