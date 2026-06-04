@@ -50,7 +50,6 @@ const SHIM_N_LEGS: usize = V16_MAX_PORTFOLIO_ASSETS_N;
 #[derive(Clone)]
 struct ShimAccount {
     acct: PortfolioAccountV16Account,
-    domains: Vec<PortfolioSourceDomainV16Account>,
     // --- mirror fields (public surface the probes read) ---
     capital: u128,
     pnl: i128,
@@ -59,17 +58,19 @@ struct ShimAccount {
     health_cert: HealthCertV16,
     active_bitmap: V16ActiveBitmap,
     stale_state: bool,
-    /// per-domain source-claim bound (mirror of domains[d].source_claim_bound_num)
+    /// per-domain source-claim bound (mirror of acct.source_domains[d]; index
+    /// d = asset*2 + side, 0=Long,1=Short). The engine moved per-account
+    /// domain state from a separate Vec into the fixed-size sparse pool inside
+    /// PortfolioAccountV16Account (commit 945f2db).
     source_claim_bound_num: Vec<u128>,
-    /// per-domain effective reserved backing lien
+    /// per-domain effective reserved backing lien (same indexing)
     source_lien_effective_reserved: Vec<u128>,
 }
 
 impl ShimAccount {
-    fn new(acct: PortfolioAccountV16Account, domains: Vec<PortfolioSourceDomainV16Account>) -> Self {
+    fn new(acct: PortfolioAccountV16Account) -> Self {
         let mut s = ShimAccount {
             acct,
-            domains,
             capital: 0,
             pnl: 0,
             reserved_pnl: 0,
@@ -102,13 +103,16 @@ impl ShimAccount {
             self.active_bitmap[w] = self.acct.active_bitmap[w].get();
         }
         self.stale_state = self.acct.stale_state != 0;
+        // Read per-domain mirrors from the sparse in-header pool.
         self.source_claim_bound_num = self
-            .domains
+            .acct
+            .source_domains
             .iter()
             .map(|d| d.source_claim_bound_num.get())
             .collect();
         self.source_lien_effective_reserved = self
-            .domains
+            .acct
+            .source_domains
             .iter()
             .map(|d| d.source_lien_effective_reserved.get())
             .collect();
@@ -265,7 +269,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.deposit_not_atomic(&mut a, amount)
         };
         if r.is_err() {
@@ -287,7 +291,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.withdraw_not_atomic(&mut a, amount)
         };
         if r.is_err() {
@@ -307,7 +311,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.convert_released_pnl_to_capital_not_atomic(&mut a)
         };
         if r.is_err() {
@@ -328,7 +332,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.full_account_refresh_not_atomic(&mut a)
         };
         if r.is_err() {
@@ -353,7 +357,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.full_account_refresh_not_atomic(&mut a).map(|_| ())
         };
         if r.is_err() {
@@ -375,7 +379,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.liquidate_account_not_atomic(&mut a, request)
         };
         if r.is_err() {
@@ -399,8 +403,8 @@ impl GroupShim {
         let ssnap = short.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut la = PortfolioV16ViewMut::new(&mut long.acct, &mut long.domains);
-            let mut sa = PortfolioV16ViewMut::new(&mut short.acct, &mut short.domains);
+            let mut la = PortfolioV16ViewMut::new(&mut long.acct);
+            let mut sa = PortfolioV16ViewMut::new(&mut short.acct);
             g.execute_trade_with_fee_in_place_not_atomic(&mut la, &mut sa, request)
         };
         if r.is_err() {
@@ -424,7 +428,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.rebalance_reduce_position_not_atomic(&mut a, request)
         };
         if r.is_err() {
@@ -446,7 +450,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.forfeit_recovery_leg_not_atomic(&mut a, asset_index, b_delta_budget)
         };
         if r.is_err() {
@@ -467,7 +471,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.cure_and_cancel_close_not_atomic(&mut a, optional_deposit)
         };
         if r.is_err() {
@@ -488,7 +492,7 @@ impl GroupShim {
         let asnap = acc.clone();
         let r = {
             let mut g = MarketGroupV16ViewMut::new(&mut self.header, &mut self.markets);
-            let mut a = PortfolioV16ViewMut::new(&mut acc.acct, &mut acc.domains);
+            let mut a = PortfolioV16ViewMut::new(&mut acc.acct);
             g.close_resolved_account_not_atomic(&mut a, fee_rate_per_slot)
         };
         if r.is_err() {
@@ -665,7 +669,7 @@ impl GroupShim {
     /// On HEAD the per-account shape validation lives on PortfolioV16View.
     fn validate_account_shape(&self, acc: &ShimAccount) -> V16Result<()> {
         let g = MarketGroupV16View::new(&self.header, &self.markets);
-        PortfolioV16View::new(&acc.acct, &acc.domains).validate_with_market(&g)
+        PortfolioV16View::new(&acc.acct).validate_with_market(&g)
     }
 
     /// `assert_public_invariants` is GONE on HEAD. Replace with group-shape
@@ -769,10 +773,11 @@ impl V16Engine {
             owner,
         ));
         let acct = PortfolioAccountV16Account::try_empty(ph)?;
-        let domain_count = v16_domain_count_for_market_slots(self.n_assets)?;
-        let domains = vec![PortfolioSourceDomainV16Account::default(); domain_count];
+        // Engine commit 945f2db moved per-account domain state from a separate
+        // Vec into a fixed-size sparse pool inside PortfolioAccountV16Account;
+        // try_empty already initializes it. No separate domains arg.
         let idx = self.accounts.len();
-        self.accounts.push(ShimAccount::new(acct, domains));
+        self.accounts.push(ShimAccount::new(acct));
         Ok(idx)
     }
 
@@ -801,9 +806,12 @@ impl V16Engine {
         let prices = self.effective_prices();
         let mut long_acc = self.accounts[long_idx].clone();
         let mut short_acc = self.accounts[short_idx].clone();
+        // Engine commit 05e6e98 made TradeRequestV16.size_q signed (i128) to
+        // support batch legs in either direction. The wrapper still takes u128
+        // (probes always pass positive long-side size); convert at the boundary.
         let req = TradeRequestV16 {
             asset_index,
-            size_q,
+            size_q: i128::try_from(size_q).map_err(|_| V16Error::ArithmeticOverflow)?,
             exec_price,
             fee_bps,
         };
